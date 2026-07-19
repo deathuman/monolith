@@ -4874,7 +4874,9 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddCompositeSegment(const
 	Composite->Modify();
 
 	FAnimSegment NewSeg;
-	NewSeg.SetAnimReference(Anim);
+	// Match editor-authored segment initialization so cached length and default range
+	// exist immediately after authoring.
+	NewSeg.SetAnimReference(Anim, true);
 	NewSeg.StartPos = StartPos;
 	NewSeg.AnimStartTime = 0.0f;
 	NewSeg.AnimEndTime = Anim->GetPlayLength();
@@ -9641,6 +9643,12 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddMontageAnimSegment(con
 
 	int32 NewIndex = Montage->SlotAnimTracks[SlotIndex].AnimTrack.AnimSegments.Add(NewSeg);
 
+	// Refresh the montage after segment insertion so its length is immediately valid
+	// for callers in the same editor session.
+	Montage->InvalidateRecursiveAsset();
+	Montage->UpdateLinkableElements(SlotIndex, NewIndex);
+	Montage->SetCompositeLength(Montage->CalculateSequenceLength());
+
 	GEditor->EndTransaction();
 	Montage->MarkPackageDirty();
 
@@ -10012,7 +10020,8 @@ FMonolithActionResult FMonolithAnimationActions::HandleCreateMontageFromSections
 				if (Anim)
 				{
 					FAnimSegment NewSeg;
-					NewSeg.SetAnimReference(Anim);
+					// Initialize cached segment length before finalizing montage length.
+					NewSeg.SetAnimReference(Anim, true);
 					NewSeg.StartPos = StartTime;
 					NewSeg.AnimStartTime = 0.0f;
 					NewSeg.AnimEndTime = Anim->GetPlayLength();
@@ -10107,6 +10116,11 @@ FMonolithActionResult FMonolithAnimationActions::HandleCreateMontageFromSections
 		Montage->RefreshCacheData();
 	}
 
+	// Finalize linkable elements and sequence length before returning the builder result.
+	Montage->InvalidateRecursiveAsset();
+	Montage->UpdateLinkableElements();
+	Montage->SetCompositeLength(Montage->CalculateSequenceLength());
+
 	GEditor->EndTransaction();
 	Montage->MarkPackageDirty();
 
@@ -10118,6 +10132,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleCreateMontageFromSections
 	Root->SetNumberField(TEXT("section_count"), Montage->CompositeSections.Num());
 	Root->SetNumberField(TEXT("slot_count"), Montage->SlotAnimTracks.Num());
 	Root->SetNumberField(TEXT("notify_count"), Montage->Notifies.Num());
+	Root->SetNumberField(TEXT("duration"), Montage->GetPlayLength());
 
 	if (Errors.Num() > 0)
 	{
