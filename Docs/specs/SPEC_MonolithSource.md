@@ -27,10 +27,14 @@
 **Important:** `monolith_reindex` is the **asset/project** indexer (Blueprints, materials, textures via `MonolithIndex`). It does NOT update the C++ source DB. Source-symbol freshness is owned by this module via:
 
 1. `source.trigger_reindex` — full clean rebuild (engine + shaders + project).
-2. `source.trigger_project_reindex` — incremental, project C++ only.
-3. **F17 auto-hook (2026-04-26):** `UMonolithSourceSubsystem` listens on `FCoreUObjectDelegates::ReloadCompleteDelegate`. After every Live Coding patch and after every UBT-driven editor restart that fires hot-reload, the subsystem auto-kicks `TriggerProjectReindex()` (async). Guarded by a 5-second cooldown and an in-flight `bIsIndexing` flag so multi-module reload bursts don't storm. Skips silently if `EngineSource.db` doesn't yet exist (first-install bootstrap requires a manual `source.trigger_reindex`).
+2. `source.trigger_project_reindex` — atomic project/project-plugin replacement; Engine rows are preserved and failures roll back.
+3. `source.get_index_status` — read-only status and migration polling (`schema_version` is actual; `expected_schema_version` is the current contract).
+4. **F17 auto-hook (2026-04-26):** `UMonolithSourceSubsystem` listens on `FCoreUObjectDelegates::ReloadCompleteDelegate`. After every Live Coding patch and after every UBT-driven editor restart that fires hot-reload, the subsystem may auto-kick `TriggerProjectReindex()` (async). Guarded by a 5-second cooldown and an in-flight `bIsIndexing` flag so multi-module reload bursts don't storm. Skips silently if `EngineSource.db` doesn't yet exist (first-install bootstrap requires a manual `source.trigger_reindex`).
 
-After F17, agents do not need to invoke any source-reindex action manually in the common dev loop — just run UBT or Live Coding and `source_query` reflects the new symbols within ~1 second.
+After F17, agents must poll `source.get_index_status` before relying on
+refreshed symbols. There is no guaranteed one-second freshness window; a
+manual full `source.trigger_reindex` remains required for incompatible generated
+databases.
 
 ### Actions (~20 — namespace: "source")
 
@@ -46,7 +50,8 @@ After F17, agents do not need to invoke any source-reindex action manually in th
 | `get_symbol_context` | `symbol`, `context_lines` | Definition with surrounding context |
 | `read_file` | `file_path`, `start_line`, `end_line` | Read source lines by path (absolute -> DB exact -> DB suffix match) |
 | `trigger_reindex` | none | Trigger full C++ engine source re-index (replaces entire EngineSource.db) |
-| `trigger_project_reindex` | none | Trigger incremental project-only C++ source re-index (updates project symbols in EngineSource.db without a full rebuild) |
+| `trigger_project_reindex` | none | Atomically replace project and project-plugin C++ rows; Engine rows are preserved and failures roll back |
+| `get_index_status` | none | Read-only/idempotent status snapshot with state, mode, generation, schema/migration, timestamps, counters, and last error |
 | `get_include_path` | `symbol` | Canonical `#include` form for a symbol, derived from its indexed file path (Phase 1). See contract below. |
 | `get_signature` | `symbol` | Exact overload signature(s) for a function/method. Declaration-read primary (Phase 1). See contract below. |
 | `check_deprecations` | `symbols[]` | Batch deprecation status for a symbol list, read from the `symbol_deprecations` index (Phase 1). See contract below. |
@@ -56,7 +61,27 @@ After F17, agents do not need to invoke any source-reindex action manually in th
 | `lint_header` | `file_path` | Regex-level UHT-gotcha lint of a single header (Phase 3). Works on UNINDEXED files. Structured findings `{rule_id, line, message, severity}`; clean header → zero findings. See contract below. |
 | `generate_class_stub` | `parent`, `class_name`, `module` | UCLASS-derived `.h`/`.cpp` stub pair returned as TEXT — never writes to disk (Phase 3, Decision 1). See contract below. |
 
-**DB Location:** `Plugins/Monolith/Saved/EngineSource.db`
+**DB Location:** `Plugins/Monolith/Saved/EngineSource.db` (generated local state; never Perforce content).
+
+### Source index migration and replacement contract (schema v4)
+
+Schema v4 uses deterministic path identity for modules/files and file-owned
+deprecation rows (including unresolved class-body declarations), and requires one
+explicit full `source.trigger_reindex` for older generated databases. Native
+project reindex is an atomic replacement: dependent references (including rows
+whose target symbol belongs to the project), inheritance, deprecations, symbols,
+includes, FTS chunks, files, and obsolete project modules are removed before the
+current host-project `Source` and project-plugin `Source` snapshot is built. Engine
+modules and files are not touched. Cancellation, an unreadable source file, or a
+database error rolls back the transaction and leaves the prior project snapshot
+queryable. Repeating the same reindex is idempotent and does not grow rows.
+
+`source.get_index_status` returns `state` (`idle`, `running`, `succeeded`,
+`failed`, `cancelled`), `mode` (`none`, `full`, `project`), `generation`,
+the actual `schema_version` plus `expected_schema_version`, `database_available`, `requires_full_reindex`, ISO
+`started_at`/`completed_at`, `discovered_files`, `processed_files`,
+`indexed_symbols`, `errors`, and `last_error`. Trigger responses retain their
+content envelope and add `accepted`, `mode`, `generation`, and `status_action`.
 
 ### Phase 1 Action Contracts (LLM C++ Ergonomics)
 
@@ -73,7 +98,7 @@ Three demand-proven lookups added so an agent can resolve an include, a signatur
 **`get_signature`** — declaration-read is the PRIMARY mechanism. The handler resolves the symbol via the owning class row + source-line FTS over `source_fts` (the same FTS fallback `read_source` uses), reads the declaration line(s) from the file (forward to the closing paren), and strips any trailing macro `\` and inline body. The indexed `symbols.signature` column is used as an opportunistic fast path ONLY when present AND body-free. The response reports which source was used in a `source` field: `"declaration_read"` | `"column"`. Overloads are returned as separate entries.
   - Rationale: `symbols.signature` is populated only for inline-defined functions and captures the body + macro continuations; class-body method declarations (`UGameplayStatics::ApplyDamage`, `UWorld::SpawnActor`, …) are not indexed as symbols at all, so column-only resolution would miss the bulk of the engine API.
 
-**`check_deprecations`** — accepts `symbols[]`, batch-reads `symbol_deprecations`, returns per-symbol `{deprecated, version, message, kind}`. When the table has zero rows (schema v2 landed but no reindex yet) it returns `{ index_state: "empty", hint: "run source.trigger_reindex" }` and OMITS per-symbol verdicts — never a false "no symbol is deprecated" clean bill.
+**`check_deprecations`** — accepts `symbols[]`, batch-reads `symbol_deprecations`, returns per-symbol `{deprecated, version, message, kind}`. When the table has zero rows (schema v4 landed but no reindex yet) it returns `{ index_state: "empty", hint: "run source.trigger_reindex" }` and OMITS per-symbol verdicts — never a false "no symbol is deprecated" clean bill.
 
 ### Phase 2 Action Contracts (Round-Trip Compression)
 
@@ -104,20 +129,21 @@ Two actions for header pre-flight + class scaffolding. Both are read-only / idem
 
 **`generate_class_stub`** — `parent`, `class_name`, `module` (all required). Resolves the parent's header + owning module via the source DB and returns a `.h`/`.cpp` pair as TEXT (fields: `header`, `cpp`, `parent_include`, `api_macro`, `uses_object_initializer`). **TEXT-RETURN-ONLY — NEVER writes to disk** (Decision 1): no `write_to_disk` param, no `target_dir` param, no `written_path` in the response. v1 supports **UCLASS-derived parents ONLY** (no USTRUCT/UENUM/UINTERFACE — rejected cleanly). The `.h` emits `<MODULE>_API`, the parent header include FIRST, `"<Class>.generated.h"` LAST, and `GENERATED_BODY()`. The `.cpp` emits a plain default constructor unless the parent's indexed constructor signature requires `FObjectInitializer&` (detected by an FObjectInitializer-only ctor with no plain alternative).
 
-### Deprecation Index (schema v2)
+### Deprecation Index (schema v4)
 
-`check_deprecations` reads a `symbol_deprecations` table added to `EngineSource.db` in schema v2 (`SchemaVersion` 1→2). Populated by the indexer during the normal index pass: it regex-scans for `UE_DEPRECATED` / `UE_DEPRECATED_FORENGINE` / `UE_DEPRECATED_FORGAME` (and the `DeprecatedFunction` UFUNCTION specifier), parses the symbol NAME from the declaration text following the macro, and inserts a row.
+`check_deprecations` reads a `symbol_deprecations` table whose current contract is schema v4. Populated by the indexer during the normal index pass: it regex-scans for `UE_DEPRECATED` / `UE_DEPRECATED_FORENGINE` / `UE_DEPRECATED_FORGAME` (and the `DeprecatedFunction` UFUNCTION specifier), parses the symbol NAME from the declaration text following the macro, and inserts a row owned by its source file.
 
 | Column | Note |
 |--------|------|
 | `id` | INTEGER PK AUTOINCREMENT |
 | `symbol_id` | **NULLABLE** — class-body methods have no `symbols` row; stored NULL when the name does not resolve. Lookups key on `symbol_name`, not this column. |
+| `file_id` | **NOT NULL for native indexer rows** — owning source file used for atomic project replacement; legacy callers may leave it NULL. |
 | `symbol_name` | NOT NULL — parsed identifier before `(` in the declaration |
 | `version` | e.g. `"5.4"` — may be empty |
 | `message` | the deprecation message string |
 | `kind` | `UE_DEPRECATED` \| `UE_DEPRECATED_FORENGINE` \| `UE_DEPRECATED_FORGAME` \| `DeprecatedFunction` |
 
-**Bootstrap requirement:** the table is created via `CREATE TABLE IF NOT EXISTS`, so it appears empty on the next index pass after schema v2 lands. **Engine deprecation rows require one FULL `source.trigger_reindex`** — the F17 project-only reindex (and `trigger_project_reindex`) covers project symbols only, not engine deprecations. Until that full pass runs, `check_deprecations` returns the `index_state: "empty"` state above.
+**Bootstrap requirement:** older generated databases are marked incompatible and require one explicit FULL `source.trigger_reindex`; the F17 project-only reindex (and `trigger_project_reindex`) covers project symbols only, not engine deprecations. Until that full pass runs, `check_deprecations` returns the `index_state: "empty"` state above. Repeated project replacement deletes deprecations by `file_id` (and linked `symbol_id`) before inserting the current snapshot, preserving Engine rows and avoiding stale NULL-linked rows.
 
 **`build_cs_path` backfill:** the same Phase 1 indexer change backfills the `modules.build_cs_path` column (previously inserted empty). `DiscoverProjectModules` / `DiscoverEngineModules` derive each module's `<Module>.Build.cs` path from its `Source/<Module>/` dir. `get_include_path`'s `build_cs_note` reads this populated column. Existing DBs pick up the value on the same full `trigger_reindex` bootstrap.
 

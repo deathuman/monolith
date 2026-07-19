@@ -1,11 +1,13 @@
 #include "MonolithSourceIndexer.h"
 #include "MonolithSourceDatabase.h"
+#include "MonolithSourceSchema.h"
 #include "MonolithCppParser.h"
 #include "MonolithShaderParser.h"
 #include "MonolithReferenceBuilder.h"
 #include "HAL/RunnableThread.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
 #include "Internationalization/Regex.h"
 
 namespace MonolithSourceIndexerDetail
@@ -77,8 +79,7 @@ bool FMonolithSourceIndexer::RunSynchronous()
 {
 	if (bIsRunning) return false;
 	Init();
-	Run();
-	return true;
+	return Run() == 0;
 }
 
 void FMonolithSourceIndexer::RequestStop()
@@ -114,23 +115,42 @@ void FMonolithSourceIndexer::Stop()
 uint32 FMonolithSourceIndexer::Run()
 {
 	bIsRunning = true;
+	bWasCancelled = false;
 
 	FMonolithSourceDatabase DB;
 	if (!DB.OpenForWriting(DbPath))
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("Indexer: Failed to open DB for writing: %s"), *DbPath);
 		bIsRunning = false;
+		OnComplete.Broadcast(0, 0, 1);
 		return 1;
 	}
+	DB.ClearOperationError();
 
 	if (bCleanBuild)
 	{
-		DB.ResetDatabase();
+		if (!DB.ResetDatabase() || DB.HasOperationError())
+		{
+			UE_LOG(LogMonolithSource, Error, TEXT("Indexer: failed to reset database"));
+			DB.Close();
+			bIsRunning = false;
+			OnComplete.Broadcast(0, 0, 1);
+			return 1;
+		}
 	}
 	else
 	{
-		DB.CreateTablesIfNeeded();
+		if (!DB.CreateTablesIfNeeded() || DB.HasOperationError() || DB.RequiresFullReindex())
+		{
+			UE_LOG(LogMonolithSource, Error, TEXT("Indexer: database schema is incompatible; run a full source.trigger_reindex first"));
+			DB.Close();
+			bIsRunning = false;
+			OnComplete.Broadcast(0, 0, 1);
+			return 2;
+		}
 	}
+
+	bool bProjectReplacementStarted = false;
 
 	// --- Engine phase ---
 	if (!SourcePath.IsEmpty())
@@ -140,7 +160,7 @@ uint32 FMonolithSourceIndexer::Run()
 
 		UE_LOG(LogMonolithSource, Log, TEXT("Indexer: Found %d engine modules"), EngineModules.Num());
 
-		for (int32 i = 0; i < EngineModules.Num() && !bShouldStop; ++i)
+		for (int32 i = 0; i < EngineModules.Num() && !bShouldStop && !DB.HasOperationError(); ++i)
 		{
 			IndexModule(EngineModules[i], DB);
 			OnProgress.Broadcast(EngineModules[i].Name, i + 1, EngineModules.Num(),
@@ -149,21 +169,38 @@ uint32 FMonolithSourceIndexer::Run()
 	}
 
 	// --- Project phase ---
-	if (bIndexProjectSource && !ProjectPath.IsEmpty() && !bShouldStop)
+	if (bIndexProjectSource && !ProjectPath.IsEmpty() && !bShouldStop && TotalErrors.Load() == 0 && !DB.HasOperationError())
 	{
-		// If NOT clean build, load existing engine symbols for cross-reference resolution
-		if (!bCleanBuild)
+		TArray<FModuleEntry> ProjectModules;
+		DiscoverProjectModules(ProjectModules);
+		if (!DB.BeginProjectReplacement(ProjectPath) || DB.HasOperationError())
 		{
-			UE_LOG(LogMonolithSource, Log, TEXT("Indexer: Loading existing symbols for incremental indexing..."));
+			UE_LOG(LogMonolithSource, Error, TEXT("Indexer: could not begin atomic project replacement"));
+			TotalErrors++;
+			DB.Close();
+			bIsRunning = false;
+			OnComplete.Broadcast(TotalFilesProcessed.Load(), TotalSymbolsExtracted.Load(), TotalErrors.Load());
+			return 3;
+		}
+		else
+		{
+			bProjectReplacementStarted = true;
+		}
+
+		// The replacement has removed every prior project/project-plugin row. Only
+		// load the rows that remain (Engine and Engine-plugin symbols) before adding
+		// the current project snapshot. Loading before BeginProjectReplacement leaves
+		// stale project IDs in these maps, which then corrupts parent IDs, inheritance,
+		// and reference edges on repeated project reindexes.
+		if (!bCleanBuild && bProjectReplacementStarted)
+		{
+			UE_LOG(LogMonolithSource, Log, TEXT("Indexer: Loading preserved Engine symbols for incremental indexing..."));
 			DB.LoadExistingSymbols(SymbolNameToId, ClassNameToId, SymbolSpans, ClassSpans);
 		}
 
-		TArray<FModuleEntry> ProjectModules;
-		DiscoverProjectModules(ProjectModules);
-
 		UE_LOG(LogMonolithSource, Log, TEXT("Indexer: Found %d project modules"), ProjectModules.Num());
 
-		for (int32 i = 0; i < ProjectModules.Num() && !bShouldStop; ++i)
+		for (int32 i = 0; i < ProjectModules.Num() && !bShouldStop && bProjectReplacementStarted && !DB.HasOperationError(); ++i)
 		{
 			IndexModule(ProjectModules[i], DB);
 			OnProgress.Broadcast(ProjectModules[i].Name, i + 1, ProjectModules.Num(),
@@ -172,12 +209,33 @@ uint32 FMonolithSourceIndexer::Run()
 	}
 
 	// --- Finalize ---
-	if (!bShouldStop)
+	if (!bShouldStop && TotalErrors.Load() == 0 && !DB.HasOperationError())
 	{
-		Finalize(DB);
+		if (!Finalize(DB))
+		{
+			TotalErrors++;
+		}
+	}
+	if (bProjectReplacementStarted)
+	{
+		if (bShouldStop || TotalErrors.Load() > 0 || DB.HasOperationError())
+		{
+			DB.RollbackTransaction();
+		}
+		else if (!DB.CommitTransaction())
+		{
+			UE_LOG(LogMonolithSource, Error, TEXT("Indexer: project replacement commit failed; rolling back"));
+			DB.RollbackTransaction();
+			TotalErrors++;
+		}
+	}
+	if (DB.HasOperationError() && TotalErrors.Load() == 0)
+	{
+		TotalErrors++;
 	}
 
 	DB.Close();
+	bWasCancelled = static_cast<bool>(bShouldStop);
 	bIsRunning = false;
 
 	const int32 Files = TotalFilesProcessed.Load();
@@ -187,7 +245,7 @@ uint32 FMonolithSourceIndexer::Run()
 	UE_LOG(LogMonolithSource, Log, TEXT("Indexer complete: %d files, %d symbols, %d errors"), Files, Symbols, Errors);
 	OnComplete.Broadcast(Files, Symbols, Errors);
 
-	return 0;
+	return (!bShouldStop && Errors == 0) ? 0 : 1;
 }
 
 // ============================================================
@@ -286,6 +344,10 @@ void FMonolithSourceIndexer::DiscoverProjectModules(TArray<FModuleEntry>& OutMod
 void FMonolithSourceIndexer::IndexModule(const FModuleEntry& Module, FMonolithSourceDatabase& DB)
 {
 	int64 ModuleId = DB.InsertModule(Module.Name, Module.Path, Module.Type, Module.BuildCsPath);
+	if (ModuleId == 0 || DB.HasOperationError())
+	{
+		return;
+	}
 
 	// Collect all source files for this module
 	TArray<FString> Files;
@@ -303,8 +365,12 @@ void FMonolithSourceIndexer::IndexModule(const FModuleEntry& Module, FMonolithSo
 		IFileManager::Get().FindFilesRecursive(Files, *Module.Path, TEXT("*.cpp"), true, false, false); // bClearFileNames=false!
 		IFileManager::Get().FindFilesRecursive(Files, *Module.Path, TEXT("*.inl"), true, false, false); // bClearFileNames=false!
 	}
+	TotalFilesDiscovered += Files.Num();
 
-	DB.BeginTransaction();
+	if (!DB.BeginTransaction())
+	{
+		return;
+	}
 
 	for (const FString& FilePath : Files)
 	{
@@ -326,7 +392,10 @@ void FMonolithSourceIndexer::IndexModule(const FModuleEntry& Module, FMonolithSo
 		TotalSymbolsExtracted += SymbolCount;
 	}
 
-	DB.CommitTransaction();
+	if (!DB.CommitTransaction())
+	{
+		UE_LOG(LogMonolithSource, Error, TEXT("Indexer: module transaction commit failed for %s"), *Module.Name);
+	}
 }
 
 // ============================================================
@@ -335,6 +404,13 @@ void FMonolithSourceIndexer::IndexModule(const FModuleEntry& Module, FMonolithSo
 
 int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 ModuleId, FMonolithSourceDatabase& DB)
 {
+	FString ReadabilityProbe;
+	if (!IFileManager::Get().FileExists(*FilePath) || !FFileHelper::LoadFileToString(ReadabilityProbe, *FilePath))
+	{
+		UE_LOG(LogMonolithSource, Error, TEXT("Indexer: source file disappeared while indexing: %s"), *FilePath);
+		TotalErrors++;
+		return 0;
+	}
 	FMonolithCppParser Parser;
 	FParsedFileResult ParseResult = Parser.ParseFile(FilePath);
 
@@ -349,6 +425,10 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 	double LastModified = static_cast<double>(ModTime.ToUnixTimestamp());
 
 	int64 FileId = DB.InsertFile(FilePath, ModuleId, FileType, ParseResult.SourceLines.Num(), LastModified);
+	if (FileId == 0 || DB.HasOperationError())
+	{
+		return 0;
+	}
 	NewFileIds.Add(FileId);
 
 	// Includes
@@ -364,6 +444,10 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 			}
 		}
 		DB.InsertInclude(FileId, IncPath, IncLine);
+		if (DB.HasOperationError())
+		{
+			return 0;
+		}
 	}
 
 	// Symbols
@@ -392,6 +476,10 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 			ParentSymbolId, Sym.Access, Sym.Signature, Sym.Docstring,
 			Sym.bIsUEMacro
 		);
+		if (SymId == 0 || DB.HasOperationError())
+		{
+			return SymbolCount;
+		}
 
 		// Update symbol maps
 		UpdateSymbolMap(Sym.Name, SymId, Sym.LineStart, Sym.LineEnd);
@@ -549,7 +637,11 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 				LinkedSymId = *Found;
 			}
 
-			DB.InsertDeprecation(LinkedSymId, SymbolName, Version, Message, Kind);
+			DB.InsertDeprecation(LinkedSymId, FileId, SymbolName, Version, Message, Kind);
+			if (DB.HasOperationError())
+			{
+				return SymbolCount;
+			}
 		}
 	}
 
@@ -561,6 +653,13 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 
 int32 FMonolithSourceIndexer::IndexShaderFile(const FString& FilePath, int64 ModuleId, FMonolithSourceDatabase& DB)
 {
+	FString ReadabilityProbe;
+	if (!IFileManager::Get().FileExists(*FilePath) || !FFileHelper::LoadFileToString(ReadabilityProbe, *FilePath))
+	{
+		UE_LOG(LogMonolithSource, Error, TEXT("Indexer: shader file disappeared while indexing: %s"), *FilePath);
+		TotalErrors++;
+		return 0;
+	}
 	FMonolithShaderParser Parser;
 	FParsedFileResult ParseResult = Parser.ParseFile(FilePath);
 
@@ -571,6 +670,10 @@ int32 FMonolithSourceIndexer::IndexShaderFile(const FString& FilePath, int64 Mod
 	double LastModified = static_cast<double>(ModTime.ToUnixTimestamp());
 
 	int64 FileId = DB.InsertFile(FilePath, ModuleId, FileType, ParseResult.SourceLines.Num(), LastModified);
+	if (FileId == 0 || DB.HasOperationError())
+	{
+		return 0;
+	}
 	NewFileIds.Add(FileId);
 
 	// Includes
@@ -586,6 +689,10 @@ int32 FMonolithSourceIndexer::IndexShaderFile(const FString& FilePath, int64 Mod
 			}
 		}
 		DB.InsertInclude(FileId, IncPath, IncLine);
+		if (DB.HasOperationError())
+		{
+			return 0;
+		}
 	}
 
 	// Symbols — shader symbols do NOT go into SymbolNameToId (prevents false cross-references)
@@ -600,12 +707,16 @@ int32 FMonolithSourceIndexer::IndexShaderFile(const FString& FilePath, int64 Mod
 			QualifiedName = Sym.ParentClass + TEXT("::") + Sym.Name;
 		}
 
-		DB.InsertSymbol(
+		const int64 SymId = DB.InsertSymbol(
 			Sym.Name, QualifiedName, Sym.Kind,
 			FileId, Sym.LineStart, Sym.LineEnd,
 			0, Sym.Access, Sym.Signature, Sym.Docstring,
 			Sym.bIsUEMacro
 		);
+		if (SymId == 0 || DB.HasOperationError())
+		{
+			return SymbolCount;
+		}
 
 		SymbolCount++;
 	}
@@ -664,12 +775,19 @@ void FMonolithSourceIndexer::UpdateClassMap(const FString& Name, int64 SymId, in
 // Finalization — inheritance resolution + reference extraction
 // ============================================================
 
-void FMonolithSourceIndexer::Finalize(FMonolithSourceDatabase& DB)
+bool FMonolithSourceIndexer::Finalize(FMonolithSourceDatabase& DB)
 {
 	UE_LOG(LogMonolithSource, Log, TEXT("Indexer: Finalizing — resolving inheritance..."));
+	if (DB.HasOperationError())
+	{
+		return false;
+	}
 
 	// Phase 1: Resolve inheritance
-	DB.BeginTransaction();
+	if (!DB.BeginTransaction())
+	{
+		return false;
+	}
 	for (const auto& Pair : PendingBaseClasses)
 	{
 		const FString& ChildName = Pair.Key;
@@ -689,6 +807,11 @@ void FMonolithSourceIndexer::Finalize(FMonolithSourceDatabase& DB)
 			if (ParentId)
 			{
 				DB.InsertInheritance(*ChildId, *ParentId);
+				if (DB.HasOperationError())
+				{
+					DB.RollbackTransaction();
+					return false;
+				}
 				FScopeLock Lock(&DiagLock);
 				Diagnostics.InheritanceResolved++;
 			}
@@ -699,14 +822,20 @@ void FMonolithSourceIndexer::Finalize(FMonolithSourceDatabase& DB)
 			}
 		}
 	}
-	DB.CommitTransaction();
+	if (!DB.CommitTransaction())
+	{
+		return false;
+	}
 
 	// Phase 2: Reference extraction (only new files)
 	UE_LOG(LogMonolithSource, Log, TEXT("Indexer: Extracting references from %d new files..."), NewFileIds.Num());
 
 	FMonolithReferenceBuilder RefBuilder(DB, SymbolNameToId);
 
-	DB.BeginTransaction();
+	if (!DB.BeginTransaction())
+	{
+		return false;
+	}
 	int32 RefCount = 0;
 	int32 FilesProcessed = 0;
 
@@ -722,24 +851,37 @@ void FMonolithSourceIndexer::Finalize(FMonolithSourceDatabase& DB)
 		if (Ext != TEXT("h") && Ext != TEXT("cpp") && Ext != TEXT("inl")) continue;
 
 		int32 Refs = RefBuilder.ExtractReferences(Path, FileId);
+		if (DB.HasOperationError())
+		{
+			DB.RollbackTransaction();
+			return false;
+		}
 		RefCount += Refs;
 		FilesProcessed++;
 
 		// Periodic commit every 500 files to keep WAL size manageable
 		if (FilesProcessed % 500 == 0)
 		{
-			DB.CommitTransaction();
-			DB.BeginTransaction();
+			if (!DB.CommitTransaction() || !DB.BeginTransaction())
+			{
+				DB.RollbackTransaction();
+				return false;
+			}
 			UE_LOG(LogMonolithSource, Log, TEXT("  References: %d files processed, %d refs found"), FilesProcessed, RefCount);
 		}
 	}
-	DB.CommitTransaction();
+	if (!DB.CommitTransaction())
+	{
+		return false;
+	}
 
 	UE_LOG(LogMonolithSource, Log, TEXT("Indexer: Reference extraction complete — %d refs from %d files"), RefCount, FilesProcessed);
 
 	// Set meta
-	DB.SetMeta(TEXT("schema_version"), FString::FromInt(1));
+	DB.SetMeta(TEXT("schema_version"), FString::FromInt(MonolithSourceSchema::SchemaVersion));
+	DB.SetMeta(TEXT("requires_full_reindex"), TEXT("0"));
 	DB.SetMeta(TEXT("index_timestamp"), FString::FromInt(FDateTime::UtcNow().ToUnixTimestamp()));
 	DB.SetMeta(TEXT("total_files"), FString::FromInt(TotalFilesProcessed.Load()));
 	DB.SetMeta(TEXT("total_symbols"), FString::FromInt(TotalSymbolsExtracted.Load()));
+	return !DB.HasOperationError();
 }

@@ -803,9 +803,18 @@ Unreal Engine C++ source code navigation. 1M+ symbols indexed. **12 actions** (1
 | `start_line` | integer | optional | Default: `1` |
 | `end_line` | integer | optional | Default: end of file |
 
-### `source.trigger_reindex` · `source.trigger_project_reindex`
+### `source.trigger_reindex` · `source.trigger_project_reindex` · `source.get_index_status`
 
-`trigger_reindex` does a full clean build (engine + shaders + project). `trigger_project_reindex` is incremental (project Source/ + Plugins/ only). Both take *no parameters*.
+All three actions take no parameters. `trigger_reindex` does a full clean build
+(engine + shaders + project) and is the required migration from an older source
+DB schema. `trigger_project_reindex` atomically replaces project Source and
+project-plugin Source rows while preserving Engine data; dependent references,
+inheritance, deprecations, symbols, includes, FTS chunks, files, and obsolete
+modules are pruned in the same transaction. A cancellation, unreadable source,
+or write error rolls back to the previous project snapshot. Repeated runs are
+idempotent. `get_index_status` is read-only/idempotent and reports state/mode,
+generation, actual and expected schema versions, migration requirement, timestamps, file/symbol/error
+counters, and the last error.
 
 ### `source.audit_module_dep_reality`
 

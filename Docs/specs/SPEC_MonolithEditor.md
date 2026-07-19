@@ -199,13 +199,19 @@ The `run_pie_smoke` / `capture_pie_movement_clip` `marker` param defaults to a g
 
 ### Module-Level Modal Watcher
 
-`FMonolithEditorModule::StartupModule` subscribes a watcher to `FCoreDelegates::PreSlateModal`. Immediately before the engine enters any blocking modal loop, the watcher emits, on the game thread, a single structured log line:
+`FMonolithEditorModule::StartupModule` subscribes to Unreal's pre-modal and modal-loop events. On UE 5.8+, `FCoreDelegates::PreSlateModalWithContext` distinguishes transient slow-task progress windows from genuine blocking dialogs. Slow tasks emit an informational instruction and do not request dismissal:
+
+```
+LogMonolith: Display: SLOW_TASK_OPEN ts=<timestamp> blocking=false action='wait_for_completion'
+```
+
+For a genuine dialog, the watcher waits until the first modal-loop tick, when Slate has pushed the actual window onto its active-modal stack, and then emits:
 
 ```
 LogMonolith: Warning: MODAL_OPEN ts=<timestamp> title=<window-title> text=<message-text>
 ```
 
-The purpose is recovery: when a blocking modal opens, the in-process MCP server is the strangled thread and cannot respond, but an external agent tailing the editor log can read this line and recover context (what dialog opened, when). `title` and `text` are **best-effort** — they are empty when the modal window is not yet on the modal stack at broadcast time.
+The purpose is recovery: when a blocking modal opens, the in-process MCP server is the strangled thread and cannot respond, but an external agent tailing the editor log can read this line and recover context. The watcher never falls back to the active editor window, so unrelated docking text cannot be misreported as modal content. UE 5.7 keeps the context-free pre-modal hook for source compatibility and also defers capture to the first modal-loop tick; because UE 5.7 does not expose slow-task classification, only UE 5.8+ can emit `SLOW_TASK_OPEN`.
 
 **Honest scope limitation:** this watcher provides notification only. Synchronous live modal-read and programmatic modal dismissal are **NOT** provided and are architecturally unsound here — the in-process server is the very thread the modal blocks, so it cannot service a request to read or close the dialog while the modal loop owns the thread. Prevention (`run_pie_smoke`'s `on_compile_errors="refuse"`, `list_errored_blueprints`) is the supported path; the watcher is the fallback for modals that open despite prevention.
 

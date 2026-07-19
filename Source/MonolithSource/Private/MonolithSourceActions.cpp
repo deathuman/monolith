@@ -114,6 +114,12 @@ void FMonolithSourceActions::RegisterAll()
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleTriggerProjectReindex),
 		MakeShared<FJsonObject>());
 
+	Registry.RegisterAction(TEXT("source"), TEXT("get_index_status"),
+		TEXT("Read the current native source-index state and migration status. Idempotent and read-only."),
+		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleGetIndexStatus),
+		MakeShared<FJsonObject>());
+	Registry.SetActionAnnotations(TEXT("source"), TEXT("get_index_status"), true, false, true, TEXT("Get source index status"));
+
 	// --- Phase 1: LLM C++ authoring ergonomics (items 1-3) ---
 
 	Registry.RegisterAction(TEXT("source"), TEXT("get_include_path"),
@@ -209,7 +215,11 @@ FMonolithSourceDatabase* FMonolithSourceActions::GetDB()
 	if (!GEditor) return nullptr;
 	UMonolithSourceSubsystem* Subsystem = Cast<UMonolithSourceSubsystem>(GEditor->GetEditorSubsystemBase(UMonolithSourceSubsystem::StaticClass()));
 	if (!Subsystem) return nullptr;
-	return Subsystem->GetDatabase();
+	FMonolithSourceDatabase* DB = Subsystem->GetDatabase();
+	// Never serve stale rows from an incompatible generated DB. Callers surface
+	// the explicit source.trigger_reindex recovery message when this is null.
+	if (!DB || DB->RequiresFullReindex()) return nullptr;
+	return DB;
 }
 
 FString FMonolithSourceActions::ShortPath(const FString& FullPath)
@@ -697,7 +707,7 @@ FMonolithActionResult FMonolithSourceActions::HandleReadSource(const TSharedPtr<
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	FString Symbol = Params->GetStringField(TEXT("symbol"));
@@ -820,7 +830,7 @@ FMonolithActionResult FMonolithSourceActions::HandleFindReferences(const TShared
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	FString Symbol = Params->GetStringField(TEXT("symbol"));
@@ -868,7 +878,7 @@ FMonolithActionResult FMonolithSourceActions::HandleFindCallers(const TSharedPtr
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	FString Function = Params->GetStringField(TEXT("symbol"));
@@ -929,7 +939,7 @@ FMonolithActionResult FMonolithSourceActions::HandleFindCallees(const TSharedPtr
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	FString Function = Params->GetStringField(TEXT("symbol"));
@@ -997,7 +1007,7 @@ FMonolithActionResult FMonolithSourceActions::HandleSearchSource(const TSharedPt
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	const FString Query = Params->GetStringField(TEXT("query"));
@@ -1256,7 +1266,7 @@ FMonolithActionResult FMonolithSourceActions::HandleGetClassHierarchy(const TSha
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	FString ClassName = Params->HasField(TEXT("symbol")) ? Params->GetStringField(TEXT("symbol")) : Params->GetStringField(TEXT("class_name"));
@@ -1347,7 +1357,7 @@ FMonolithActionResult FMonolithSourceActions::HandleGetModuleInfo(const TSharedP
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	FString ModuleName = Params->GetStringField(TEXT("module_name"));
@@ -1408,7 +1418,7 @@ FMonolithActionResult FMonolithSourceActions::HandleGetSymbolContext(const TShar
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	FString Symbol = Params->GetStringField(TEXT("symbol"));
@@ -1471,7 +1481,7 @@ FMonolithActionResult FMonolithSourceActions::HandleReadFile(const TSharedPtr<FJ
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	FString Path = Params->GetStringField(TEXT("file_path"));
@@ -1556,7 +1566,10 @@ FMonolithActionResult FMonolithSourceActions::HandleTriggerReindex(const TShared
 		return FMonolithActionResult::Error(TEXT("Indexing already in progress."));
 	}
 
-	Subsystem->TriggerReindex();
+	if (!Subsystem->TriggerReindex())
+	{
+		return FMonolithActionResult::Error(TEXT("Full source indexing was not accepted; poll source.get_index_status for the failure and recovery action."));
+	}
 
 	auto ResultObj = MakeShared<FJsonObject>();
 	TArray<TSharedPtr<FJsonValue>> ContentArr;
@@ -1565,6 +1578,10 @@ FMonolithActionResult FMonolithSourceActions::HandleTriggerReindex(const TShared
 	ContentItem->SetStringField(TEXT("text"), TEXT("Full source indexing started (engine + project). This runs in the background — check editor log for progress."));
 	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
 	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	ResultObj->SetBoolField(TEXT("accepted"), true);
+	ResultObj->SetStringField(TEXT("mode"), TEXT("full"));
+	ResultObj->SetNumberField(TEXT("generation"), Subsystem->GetIndexStatus()->GetNumberField(TEXT("generation")));
+	ResultObj->SetStringField(TEXT("status_action"), TEXT("source.get_index_status"));
 	return FMonolithActionResult::Success(ResultObj);
 }
 
@@ -1589,8 +1606,16 @@ FMonolithActionResult FMonolithSourceActions::HandleTriggerProjectReindex(const 
 	{
 		return FMonolithActionResult::Error(TEXT("Indexing already in progress."));
 	}
+	TSharedPtr<FJsonObject> Before = Subsystem->GetIndexStatus();
+	if (Before->GetBoolField(TEXT("requires_full_reindex")))
+	{
+		return FMonolithActionResult::Error(TEXT("Project reindex rejected: source DB requires one explicit full source.trigger_reindex; poll source.get_index_status after it completes."));
+	}
 
-	Subsystem->TriggerProjectReindex();
+	if (!Subsystem->TriggerProjectReindex())
+	{
+		return FMonolithActionResult::Error(TEXT("Project source indexing was not accepted; poll source.get_index_status for the failure and recovery action."));
+	}
 
 	auto ResultObj = MakeShared<FJsonObject>();
 	TArray<TSharedPtr<FJsonValue>> ContentArr;
@@ -1599,7 +1624,25 @@ FMonolithActionResult FMonolithSourceActions::HandleTriggerProjectReindex(const 
 	ContentItem->SetStringField(TEXT("text"), TEXT("Project source indexing started (incremental). This runs in the background — check editor log for progress."));
 	ContentArr.Add(MakeShared<FJsonValueObject>(ContentItem));
 	ResultObj->SetArrayField(TEXT("content"), ContentArr);
+	ResultObj->SetBoolField(TEXT("accepted"), true);
+	ResultObj->SetStringField(TEXT("mode"), TEXT("project"));
+	ResultObj->SetNumberField(TEXT("generation"), Subsystem->GetIndexStatus()->GetNumberField(TEXT("generation")));
+	ResultObj->SetStringField(TEXT("status_action"), TEXT("source.get_index_status"));
 	return FMonolithActionResult::Success(ResultObj);
+}
+
+FMonolithActionResult FMonolithSourceActions::HandleGetIndexStatus(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor)
+	{
+		return FMonolithActionResult::Error(TEXT("Editor not available."));
+	}
+	UMonolithSourceSubsystem* Subsystem = Cast<UMonolithSourceSubsystem>(GEditor->GetEditorSubsystemBase(UMonolithSourceSubsystem::StaticClass()));
+	if (!Subsystem)
+	{
+		return FMonolithActionResult::Error(TEXT("MonolithSourceSubsystem not available."));
+	}
+	return FMonolithActionResult::Success(Subsystem->GetIndexStatus());
 }
 
 // ============================================================================
@@ -1611,7 +1654,7 @@ FMonolithActionResult FMonolithSourceActions::HandleGetIncludePath(const TShared
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	const FString Symbol = Params->GetStringField(TEXT("symbol"));
@@ -1760,7 +1803,7 @@ FMonolithActionResult FMonolithSourceActions::HandleGetSignature(const TSharedPt
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	const FString Symbol = Params->GetStringField(TEXT("symbol"));
@@ -1895,7 +1938,7 @@ FMonolithActionResult FMonolithSourceActions::HandleCheckDeprecations(const TSha
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	// Collect the requested symbol names (array of strings).
@@ -1985,7 +2028,7 @@ FMonolithActionResult FMonolithSourceActions::HandleVerifySymbols(const TSharedP
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	TArray<FString> SymbolNames;
@@ -2120,7 +2163,7 @@ FMonolithActionResult FMonolithSourceActions::HandleFindExampleUsage(const TShar
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	const FString Symbol = Params->GetStringField(TEXT("symbol"));
@@ -2758,7 +2801,7 @@ FMonolithActionResult FMonolithSourceActions::HandleGenerateClassStub(const TSha
 	FMonolithSourceDatabase* DB = GetDB();
 	if (!DB || !DB->IsOpen())
 	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available. Run source.trigger_reindex first."));
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	const FString ParentClass = Params->GetStringField(TEXT("parent"));

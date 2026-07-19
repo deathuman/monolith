@@ -6,6 +6,7 @@
 #include "MonolithSourceSubsystem.generated.h"
 
 class FMonolithSourceIndexer;
+class FJsonObject;
 // UE 5.7: declared without underlying type at UObject/UObjectGlobals.h:3216 — match exactly.
 enum class EReloadCompleteReason;
 
@@ -25,21 +26,34 @@ public:
 	/** Get the source database (read-only). May be null if DB doesn't exist. */
 	FMonolithSourceDatabase* GetDatabase() { return Database.IsValid() ? Database.Get() : nullptr; }
 
-	/** Full reindex: engine + shaders + project source (clean build). */
-	void TriggerReindex();
+	/** Full reindex: engine + shaders + project source (clean build). Returns false when startup is rejected. */
+	bool TriggerReindex();
 
-	/** Incremental project-only reindex: loads existing engine symbols, indexes only project C++ source. */
-	void TriggerProjectReindex();
+	/** Incremental project-only reindex: loads preserved engine symbols, indexes only project C++ source. */
+	bool TriggerProjectReindex();
 
 	/** Is indexing currently running? */
 	bool IsIndexing() const { return bIsIndexing; }
+
+	/** Read-only status snapshot for source.get_index_status. */
+	TSharedPtr<FJsonObject> GetIndexStatus() const;
+
+#if WITH_DEV_AUTOMATION_TESTS
+	/** Test seam for deterministic startup-failure coverage; never used in production builds. */
+	static void SetStartAsyncOverrideForTests(TFunction<bool(FMonolithSourceIndexer*)> Override);
+	/** Test seam for deterministic completion/reopen failure coverage. */
+	static void SetReopenDatabaseOverrideForTests(TFunction<bool(const FString&)> Override);
+	void CompleteIndexForTests(const FString& DbPath, int32 Files, int32 Symbols, int32 Errors, bool bCancelled, int32 Discovered);
+#endif
 
 private:
 	FString GetDatabasePath() const;
 	FString GetEngineSourcePath() const;
 	FString GetEngineShaderPath() const;
 	FString GetProjectPath() const;
-	void ReopenDatabase(const FString& DbPath);
+	bool ReopenDatabase(const FString& DbPath);
+	void HandleIndexComplete(const FString& DbPath, int32 Files, int32 Symbols, int32 Errors, bool bCancelled, int32 Discovered);
+	void MarkIndexFailure(const FString& Mode, const FString& Error);
 
 	/**
 	 * F17 (2026-04-26): Auto-reindex hook. Fires when Live Coding / hot-reload completes.
@@ -60,4 +74,18 @@ private:
 
 	/** F17: FPlatformTime::Seconds() at last successful auto-kick — used for the 5s cooldown. */
 	double LastReindexTimeSeconds = 0.0;
+
+	mutable FCriticalSection StatusLock;
+	FString IndexState = TEXT("idle");
+	FString IndexMode = TEXT("none");
+	int64 IndexGeneration = 0;
+	int32 IndexSchemaVersion = 0;
+	bool bRequiresFullReindex = true;
+	FString IndexStartedAt;
+	FString IndexCompletedAt;
+	int32 IndexDiscoveredFiles = 0;
+	int32 IndexProcessedFiles = 0;
+	int32 IndexSymbols = 0;
+	int32 IndexErrors = 0;
+	FString IndexLastError;
 };

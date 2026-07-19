@@ -11,7 +11,10 @@
  */
 namespace MonolithSourceSchema
 {
-	static const int32 SchemaVersion = 2;
+	// v4: deterministic path identity, atomic project replacement semantics, and
+	// file ownership for every deprecation row (including unresolved symbols).
+	// Older generated databases must be explicitly rebuilt with trigger_reindex.
+	static const int32 SchemaVersion = 4;
 
 	// ----------------------------------------------------------------
 	// Core tables + indexes
@@ -92,6 +95,7 @@ namespace MonolithSourceSchema
 		TEXT("CREATE TABLE IF NOT EXISTS symbol_deprecations (")
 		TEXT("    id          INTEGER PRIMARY KEY AUTOINCREMENT,")
 		TEXT("    symbol_id   INTEGER REFERENCES symbols(id),")
+		TEXT("    file_id     INTEGER REFERENCES files(id),")
 		TEXT("    symbol_name TEXT NOT NULL,")
 		TEXT("    version     TEXT,")
 		TEXT("    message     TEXT,")
@@ -99,6 +103,7 @@ namespace MonolithSourceSchema
 		TEXT(");")
 
 		TEXT("CREATE INDEX IF NOT EXISTS idx_deprecations_name ON symbol_deprecations(symbol_name);")
+		TEXT("CREATE INDEX IF NOT EXISTS idx_deprecations_file_id ON symbol_deprecations(file_id);")
 
 		TEXT("CREATE TABLE IF NOT EXISTS meta (")
 		TEXT("    key   TEXT PRIMARY KEY,")

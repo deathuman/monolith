@@ -5,7 +5,7 @@ description: Use when writing or debugging Unreal Engine C++ code via Monolith M
 
 # Unreal C++ Development Workflows
 
-**~18+ source actions** via `source_query()`, **6 config actions** via `config_query()`.
+**~19+ source actions** via `source_query()`, **6 config actions** via `config_query()`.
 
 ```
 monolith_discover({ namespace: "source" })
@@ -33,8 +33,33 @@ monolith_discover({ namespace: "config" })
 | `suggest_build_cs_deps` | `file_path` | Required Build.cs modules + missing deps for a file (works on uncommitted files) |
 | `lint_header` | `file_path` | Regex UHT-gotcha lint of a header (works on UNINDEXED files); findings `{rule_id, line, message, severity}` |
 | `generate_class_stub` | `parent`, `class_name`, `module` | UCLASS-derived `.h`/`.cpp` stub pair as TEXT (never writes; generated.h last, `<MODULE>_API`) |
-| `trigger_reindex` | -- | Full engine source re-index |
-| `trigger_project_reindex` | -- | Incremental project-only re-index |
+| `trigger_reindex` | -- | Full engine + shader + project source re-index |
+| `trigger_project_reindex` | -- | Atomic project/project-plugin source replacement; Engine rows are preserved |
+| `get_index_status` | -- | Read-only index state, migration, generation, counters, and errors |
+
+## Source index lifecycle
+
+The native C++ source index is asynchronous and has an explicit migration contract. Poll
+`source.get_index_status` (no parameters) after every trigger and before relying on
+newly changed symbols. A successful status is the authority for source freshness; the
+presence of `EngineSource.db`, a reload event, or an old cached result is not.
+
+- `source.trigger_reindex` performs a full clean rebuild of Engine, shaders, project
+  source, and project-plugin source. It is the only recovery action when
+  `requires_full_reindex` is `true` or `schema_version` differs from
+  `expected_schema_version`.
+- `source.trigger_project_reindex` performs one transactionally atomic replacement of
+  the current project and project-plugin rows. It removes deleted/renamed project
+  files and dependent symbols, references, inheritance, deprecations, includes, and
+  full-text chunks while preserving Engine rows. A cancellation, unreadable source,
+  database error, or commit failure rolls the replacement back.
+- Project-only indexing is rejected while migration is required, and source queries
+  are rejected rather than served from an incompatible/stale database. Run the full
+  trigger once, then poll until `state` is `succeeded` and `requires_full_reindex` is
+  `false`.
+- Trigger responses keep their existing human-readable `content` and add
+  `accepted`, `mode`, `generation`, and `status_action` so clients can poll without
+  guessing.
 
 ## Common Workflows
 
@@ -91,9 +116,10 @@ Call `list_class_specifiers` first to learn what `find_class_specifier` can matc
 
 - **Never guess** `#include` paths or signatures -- always verify with `source_query`
 - Search action is `search_source` (not `search`)
-- Source index: engine Runtime/Editor/Developer + plugins + shaders (1M+ symbols)
+- Source index: engine Runtime/Editor/Developer + plugins + shaders (1M+ symbols),
+  plus the host project and project plugins after a successful project pass
 - Use `find_callers` for idiomatic usage, `get_symbol_context` for quick definition lookup
 - `cppreflect_query` for the structural reflected view; `source_query` for symbol-level source
 - `cppreflect` `source_line` is `0` (UHT drops it) — round-trip through `source_query("search_source")` for real line numbers
 - Use `config_query("explain_setting")` before changing unfamiliar CVars
-- `check_deprecations` needs a full `source.trigger_reindex` once for engine deprecation rows; before that it returns `index_state: "empty"`
+- `check_deprecations` needs a successful full `source.trigger_reindex` for engine deprecation rows; before that, or while migration is required, it reports an unavailable/empty index rather than a false clean result

@@ -179,6 +179,8 @@ public:
 	bool BeginTransaction();
 	bool CommitTransaction();
 	bool RollbackTransaction();
+	/** Atomically replace all project-owned source rows while preserving Engine data. */
+	bool BeginProjectReplacement(const FString& ProjectRoot);
 
 	int64 InsertModule(const FString& Name, const FString& Path, const FString& ModuleType, const FString& BuildCsPath = TEXT(""));
 	int64 InsertFile(const FString& FilePath, int64 ModuleId, const FString& FileType, int32 LineCount, double LastModified);
@@ -193,8 +195,10 @@ public:
 
 	// --- Deprecation queries (item 3) ---
 	// symbol_id is NULLABLE: pass 0 to store NULL (class-body methods have no
-	// symbols row — Step-0 finding). Lookups key on symbol_name.
+	// symbols row — Step-0 finding). file_id identifies the owning source file
+	// so project replacement can remove unresolved rows without touching Engine.
 	void InsertDeprecation(int64 SymbolId, const FString& SymbolName, const FString& Version, const FString& Message, const FString& Kind);
+	void InsertDeprecation(int64 SymbolId, int64 FileId, const FString& SymbolName, const FString& Version, const FString& Message, const FString& Kind);
 	/** Returns the deprecation row for the first matching symbol, or unset when not deprecated. */
 	TOptional<FMonolithDeprecationRow> GetDeprecation(const FString& SymbolName);
 	/** Batch lookup: maps each input symbol name that IS deprecated to its row. Absent keys = not deprecated. */
@@ -202,15 +206,32 @@ public:
 	/** Total rows in symbol_deprecations (used to detect the "index empty" state — Decision 3). */
 	int32 GetDeprecationCount();
 
+	/** Write-failure state for the native indexer; cleared at the start of each run. */
+	void ClearOperationError();
+	bool HasOperationError() const;
+	FString GetOperationError() const;
+
+#if WITH_DEV_AUTOMATION_TESTS
+	/** Deterministic commit-failure seam for source replacement rollback tests. */
+	static void SetCommitFailureForTests(bool bFailNextCommit);
+#endif
+
 	// --- Incremental indexing support ---
 	int32 LoadExistingSymbols(TMap<FString, int64>& OutSymbolNameToId, TMap<FString, int64>& OutClassNameToId,
 		TMap<FString, TPair<int32,int32>>& OutSymbolSpans, TMap<FString, TPair<int32,int32>>& OutClassSpans);
 
+	/** True when the database was created by an incompatible older indexer. */
+	bool RequiresFullReindex() const;
+
 private:
 	FMonolithSourceSymbol ReadSymbolFromStatement(FSQLitePreparedStatement& Stmt);
 	FMonolithSourceReference ReadReferenceFromStatement(FSQLitePreparedStatement& Stmt, bool bIsRefTo);
+	void MarkOperationErrorLocked(const FString& Context);
 
 	FSQLiteDatabase* Database = nullptr;
 	FString CachedDbPath;
 	mutable FCriticalSection DbLock;
+	int32 TransactionDepth = 0;
+	bool bOperationError = false;
+	FString OperationError;
 };

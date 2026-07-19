@@ -18,7 +18,9 @@
 #include "MonolithSourceActions.h"
 #include "MonolithSourceDatabase.h"
 #include "MonolithSourceIndexer.h"
+#include "MonolithSourceSubsystem.h"
 #include "MonolithCursorCodec.h"
+#include "MonolithSettings.h"
 
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -58,7 +60,7 @@ namespace MonolithCppErgoTestDetail
 
 // ---------------------------------------------------------------------------
 // Test 1: DeprecationSchemaBootstrap — empty-DB CreateTablesIfNeeded() creates
-// symbol_deprecations and stamps SchemaVersion 2.
+// symbol_deprecations and stamps the current schema version.
 // ---------------------------------------------------------------------------
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FCppErgoDeprecationSchemaBootstrapTest,
@@ -75,8 +77,8 @@ bool FCppErgoDeprecationSchemaBootstrapTest::RunTest(const FString& /*Parameters
 		TestTrue(TEXT("OpenForWriting"), DB.OpenForWriting(DbPath));
 		TestTrue(TEXT("CreateTablesIfNeeded"), DB.CreateTablesIfNeeded());
 
-		// schema_version meta == 2
-		TestEqual(TEXT("schema_version stamped to 2"), DB.GetMeta(TEXT("schema_version")), FString(TEXT("2")));
+		// schema_version meta == 4 (file-owned deprecations + replacement semantics)
+		TestEqual(TEXT("schema_version stamped to 4"), DB.GetMeta(TEXT("schema_version")), FString(TEXT("4")));
 
 		// Inserting a deprecation row succeeds (table exists) and counts.
 		DB.InsertDeprecation(/*SymbolId=*/0, TEXT("Foo"), TEXT("5.4"), TEXT("Use Bar"), TEXT("UE_DEPRECATED"));
@@ -93,6 +95,373 @@ bool FCppErgoDeprecationSchemaBootstrapTest::RunTest(const FString& /*Parameters
 		DB.Close();
 	}
 	IFileManager::Get().Delete(*DbPath, /*bRequireExists=*/false, /*bEvenReadOnly=*/true);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCppErgoDeterministicIdentityAndMigrationTest,
+	"Monolith.Source.Incremental.DeterministicIdentityAndMigration",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCppErgoDeterministicIdentityAndMigrationTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithCppErgoTestDetail;
+	const FString DbPath = MakeTempDbPath();
+	{
+		FMonolithSourceDatabase DB;
+		TestTrue(TEXT("OpenForWriting"), DB.OpenForWriting(DbPath));
+		TestTrue(TEXT("CreateTablesIfNeeded"), DB.CreateTablesIfNeeded());
+		const int64 FirstModule = DB.InsertModule(TEXT("Fixture"), TEXT("C:/Project/Source/Fixture"), TEXT("Project"));
+		const int64 SecondModule = DB.InsertModule(TEXT("Other"), TEXT("C:/Project/Source/Other"), TEXT("Project"));
+		const int64 RepeatedModule = DB.InsertModule(TEXT("Fixture"), TEXT("C:/Project/Source/Fixture"), TEXT("Project"));
+		TestTrue(TEXT("path identity is stable"), FirstModule != 0 && FirstModule == RepeatedModule);
+		const int64 FirstFile = DB.InsertFile(TEXT("C:/Project/Source/Fixture/Foo.cpp"), FirstModule, TEXT("source"), 1, 1.0);
+		DB.InsertFile(TEXT("C:/Project/Source/Other/Bar.cpp"), SecondModule, TEXT("source"), 1, 1.0);
+		const int64 RepeatedFile = DB.InsertFile(TEXT("C:/Project/Source/Fixture/Foo.cpp"), FirstModule, TEXT("source"), 2, 2.0);
+		TestTrue(TEXT("file path identity is stable"), FirstFile != 0 && FirstFile == RepeatedFile);
+		TestFalse(TEXT("new schema is usable"), DB.RequiresFullReindex());
+		DB.SetMeta(TEXT("schema_version"), TEXT("2"));
+		DB.CreateTablesIfNeeded();
+		TestTrue(TEXT("old schema requires explicit full reindex"), DB.RequiresFullReindex());
+		DB.Close();
+	}
+	IFileManager::Get().Delete(*DbPath, /*bRequireExists=*/false, /*bEvenReadOnly=*/true);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FProjectReplacementCleanupAndRollbackTest,
+	"Monolith.Source.Incremental.ProjectReplacementCleanupAndRollback",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FProjectReplacementCleanupAndRollbackTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithCppErgoTestDetail;
+	const FString DbPath = MakeTempDbPath();
+	{
+		FMonolithSourceDatabase DB;
+		TestTrue(TEXT("OpenForWriting"), DB.OpenForWriting(DbPath));
+		TestTrue(TEXT("CreateTablesIfNeeded"), DB.CreateTablesIfNeeded());
+
+		const int64 EngineModule = DB.InsertModule(TEXT("Engine"), TEXT("C:/Engine/Source/Runtime/Engine"), TEXT("Engine"));
+		const int64 EngineFile = DB.InsertFile(TEXT("C:/Engine/Source/Runtime/Engine/Engine.cpp"), EngineModule, TEXT("source"), 1, 1.0);
+		const int64 EngineSymbol = DB.InsertSymbol(TEXT("EngineToken"), TEXT("UE::EngineToken"), TEXT("class"), EngineFile, 1, 1, 0, TEXT("public"), TEXT("class EngineToken"), TEXT(""), false);
+		DB.InsertDeprecation(EngineSymbol, EngineFile, TEXT("EngineToken"), TEXT("5.0"), TEXT("engine retained"), TEXT("UE_DEPRECATED"));
+		const int64 ProjectModule = DB.InsertModule(TEXT("Gameplay"), TEXT("C:/HostProject/Source/Gameplay"), TEXT("Project"));
+		const int64 OldFile = DB.InsertFile(TEXT("C:/HostProject/Source/Gameplay/Old.cpp"), ProjectModule, TEXT("source"), 1, 1.0);
+		const int64 OldSymbol = DB.InsertSymbol(TEXT("OldToken"), TEXT("Gameplay::OldToken"), TEXT("class"), OldFile, 1, 1, 0, TEXT("public"), TEXT("class OldToken"), TEXT(""), false);
+		DB.InsertInheritance(OldSymbol, EngineSymbol);
+		DB.InsertReference(EngineSymbol, OldSymbol, TEXT("call"), EngineFile, 1);
+		DB.InsertDeprecation(OldSymbol, TEXT("OldToken"), TEXT("5.0"), TEXT("renamed"), TEXT("UE_DEPRECATED"));
+		DB.InsertDeprecation(0, OldFile, TEXT("OldUnresolved"), TEXT("5.0"), TEXT("old unresolved"), TEXT("UE_DEPRECATED"));
+		DB.InsertSourceChunks(OldFile, { TEXT("OldToken OLD_TOKEN") });
+		TestTrue(TEXT("old symbol inserted"), DB.GetSymbolsByName(TEXT("OldToken")).Num() == 1);
+
+		TestTrue(TEXT("begin replacement"), DB.BeginProjectReplacement(TEXT("C:/HostProject")));
+		const int64 NewModule = DB.InsertModule(TEXT("Gameplay"), TEXT("C:/HostProject/Source/Gameplay"), TEXT("Project"));
+		const int64 NewFile = DB.InsertFile(TEXT("C:/HostProject/Source/Gameplay/New.cpp"), NewModule, TEXT("source"), 2, 2.0);
+		DB.InsertSymbol(TEXT("NewToken"), TEXT("Gameplay::NewToken"), TEXT("class"), NewFile, 1, 2, 0, TEXT("public"), TEXT("class NewToken"), TEXT(""), false);
+		DB.InsertDeprecation(0, NewFile, TEXT("CurrentUnresolved"), TEXT("5.1"), TEXT("current unresolved"), TEXT("UE_DEPRECATED"));
+		DB.InsertSourceChunks(NewFile, { TEXT("NewToken NEW_TOKEN") });
+		TestTrue(TEXT("commit replacement"), DB.CommitTransaction());
+
+		TestEqual(TEXT("renamed source removed"), DB.GetSymbolsByName(TEXT("OldToken")).Num(), 0);
+		TestEqual(TEXT("new source indexed"), DB.GetSymbolsByName(TEXT("NewToken")).Num(), 1);
+		TestEqual(TEXT("engine source preserved"), DB.GetSymbolsByName(TEXT("EngineToken")).Num(), 1);
+		TestFalse(TEXT("old path removed"), DB.FindFileByPath(TEXT("C:/HostProject/Source/Gameplay/Old.cpp")).IsSet());
+		TestTrue(TEXT("new path present"), DB.FindFileByPath(TEXT("C:/HostProject/Source/Gameplay/New.cpp")).IsSet());
+		TestEqual(TEXT("engine and current project deprecations retained"), DB.GetDeprecationCount(), 2);
+		TOptional<FMonolithDeprecationRow> Current = DB.GetDeprecation(TEXT("CurrentUnresolved"));
+		TestTrue(TEXT("current unresolved deprecation is queryable"), Current.IsSet());
+		if (Current.IsSet())
+		{
+			TestEqual(TEXT("current deprecation message"), Current.GetValue().Message, FString(TEXT("current unresolved")));
+		}
+		TestEqual(TEXT("cross-attribution references removed"), DB.GetReferencesFrom(EngineSymbol).Num(), 0);
+		TestEqual(TEXT("old FTS text removed"), DB.SearchSourceFTS(TEXT("OLD_TOKEN")).Num(), 0);
+		TestTrue(TEXT("new FTS text present"), DB.SearchSourceFTS(TEXT("NEW_TOKEN")).Num() > 0);
+
+		TestTrue(TEXT("begin repeated replacement"), DB.BeginProjectReplacement(TEXT("C:/HostProject")));
+		const int64 RepeatModule = DB.InsertModule(TEXT("Gameplay"), TEXT("C:/HostProject/Source/Gameplay"), TEXT("Project"));
+		const int64 RepeatFile = DB.InsertFile(TEXT("C:/HostProject/Source/Gameplay/New.cpp"), RepeatModule, TEXT("source"), 2, 3.0);
+		DB.InsertSymbol(TEXT("NewToken"), TEXT("Gameplay::NewToken"), TEXT("class"), RepeatFile, 1, 2, 0, TEXT("public"), TEXT("class NewToken"), TEXT(""), false);
+		DB.InsertDeprecation(0, RepeatFile, TEXT("CurrentUnresolved"), TEXT("5.2"), TEXT("current unresolved v2"), TEXT("UE_DEPRECATED"));
+		TestTrue(TEXT("commit repeated replacement"), DB.CommitTransaction());
+		TestEqual(TEXT("repeated replacement has no deprecation growth"), DB.GetDeprecationCount(), 2);
+		Current = DB.GetDeprecation(TEXT("CurrentUnresolved"));
+		TestTrue(TEXT("repeated current unresolved deprecation is queryable"), Current.IsSet());
+		if (Current.IsSet())
+		{
+			TestEqual(TEXT("repeated deprecation message"), Current.GetValue().Message, FString(TEXT("current unresolved v2")));
+		}
+
+		TestTrue(TEXT("begin rollback replacement"), DB.BeginProjectReplacement(TEXT("C:/HostProject")));
+		const int64 TempModule = DB.InsertModule(TEXT("Temporary"), TEXT("C:/HostProject/Source/Temporary"), TEXT("Project"));
+		DB.InsertFile(TEXT("C:/HostProject/Source/Temporary/Temp.cpp"), TempModule, TEXT("source"), 1, 1.0);
+		TestTrue(TEXT("rollback replacement"), DB.RollbackTransaction());
+		TestEqual(TEXT("rollback preserves prior project"), DB.GetSymbolsByName(TEXT("NewToken")).Num(), 1);
+		Current = DB.GetDeprecation(TEXT("CurrentUnresolved"));
+		TestTrue(TEXT("rollback preserves current deprecation"), Current.IsSet());
+		TestEqual(TEXT("rollback removes uncommitted replacement"), DB.GetModuleStats(TEXT("Temporary")).IsSet(), false);
+		DB.Close();
+	}
+	IFileManager::Get().Delete(*DbPath, /*bRequireExists=*/false, /*bEvenReadOnly=*/true);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FIndexerProjectReplacementIdentityTest,
+	"Monolith.Source.Incremental.IndexerProjectReplacementIdentity",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FIndexerProjectReplacementIdentityTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithCppErgoTestDetail;
+	const FString ProjectRoot = FPaths::AutomationTransientDir() / FString::Printf(TEXT("source-index-project-%s"), *FGuid::NewGuid().ToString());
+	const FString ModuleDir = ProjectRoot / TEXT("Source") / TEXT("FixtureModule");
+	const FString DbPath = MakeTempDbPath();
+	IFileManager::Get().MakeDirectory(*ModuleDir, /*Tree=*/true);
+
+	const FString HeaderText =
+		TEXT("#pragma once\n")
+		TEXT("class FFixtureBase\n")
+		TEXT("{\npublic:\n\tvoid Base();\n};\n")
+		TEXT("class FFixtureDerived : public FFixtureBase\n")
+		TEXT("{\npublic:\n\tvoid Derived();\n};\n");
+	const FString SourceText =
+		TEXT("#include \"Fixture.h\"\n")
+		TEXT("void UseFixture(FFixtureDerived* Value) {\n")
+		TEXT("\tValue->Derived();\n}\n");
+	TestTrue(TEXT("write fixture header"), FFileHelper::SaveStringToFile(HeaderText, *(ModuleDir / TEXT("Fixture.h"))));
+	TestTrue(TEXT("write fixture source"), FFileHelper::SaveStringToFile(SourceText, *(ModuleDir / TEXT("Use.cpp"))));
+
+	auto RunIndexer = [&](bool bCleanBuild) -> bool
+	{
+		FMonolithSourceIndexer Indexer;
+		Indexer.SetSourcePath(TEXT(""));
+		Indexer.SetShaderPath(TEXT(""));
+		Indexer.SetProjectPath(ProjectRoot);
+		Indexer.SetDatabasePath(DbPath);
+		Indexer.SetCleanBuild(bCleanBuild);
+		Indexer.SetIndexProjectSource(true);
+		return Indexer.RunSynchronous();
+	};
+
+	auto Scalar = [&](FMonolithSourceDatabase& DB, const TCHAR* Sql, int64 Bind = 0, bool bBind = false) -> int64
+	{
+		FScopeLock Lock(&DB.GetLock());
+		FSQLiteDatabase* Raw = DB.GetRawHandle();
+		if (!Raw) return -1;
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(*Raw, Sql)) return -1;
+		if (bBind) Stmt.SetBindingValueByIndex(1, Bind);
+		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) return -1;
+		int64 Value = -1;
+		Stmt.GetColumnValueByIndex(0, Value);
+		return Value;
+	};
+
+	TestTrue(TEXT("first project index succeeds"), RunIndexer(true));
+	FMonolithSourceDatabase DB;
+	TestTrue(TEXT("open first indexed DB"), DB.Open(DbPath));
+	TArray<FMonolithSourceSymbol> BaseRows = DB.GetSymbolsByName(TEXT("FFixtureBase"), TEXT("class"));
+	TArray<FMonolithSourceSymbol> DerivedRows = DB.GetSymbolsByName(TEXT("FFixtureDerived"), TEXT("class"));
+	TArray<FMonolithSourceSymbol> UseRows = DB.GetSymbolsByName(TEXT("UseFixture"), TEXT("function"));
+	TArray<FMonolithSourceSymbol> MethodRows = DB.GetSymbolsByName(TEXT("Derived"), TEXT("function"));
+	TestEqual(TEXT("one base class after first index"), BaseRows.Num(), 1);
+	TestEqual(TEXT("one derived class after first index"), DerivedRows.Num(), 1);
+	TestEqual(TEXT("one caller after first index"), UseRows.Num(), 1);
+	TestTrue(TEXT("derived method indexed"), MethodRows.Num() > 0);
+	if (BaseRows.Num() != 1 || DerivedRows.Num() != 1 || UseRows.Num() != 1 || MethodRows.Num() == 0)
+	{
+		DB.Close();
+		IFileManager::Get().DeleteDirectory(*ProjectRoot, false, true);
+		IFileManager::Get().Delete(*DbPath, false, true);
+		return false;
+	}
+
+	const int64 FirstBaseId = BaseRows[0].Id;
+	const int64 FirstDerivedId = DerivedRows[0].Id;
+	const int64 FirstMethodId = MethodRows[0].Id;
+	const int64 FirstReferenceCount = Scalar(DB, TEXT("SELECT COUNT(*) FROM \"references\";"));
+	const int64 FirstInheritanceCount = Scalar(DB, TEXT("SELECT COUNT(*) FROM inheritance;"));
+	const int64 FirstOrphanInheritance = Scalar(DB, TEXT("SELECT COUNT(*) FROM inheritance i LEFT JOIN symbols c ON c.id=i.child_id LEFT JOIN symbols p ON p.id=i.parent_id WHERE c.id IS NULL OR p.id IS NULL;"));
+	const int64 FirstOrphanReferences = Scalar(DB, TEXT("SELECT COUNT(*) FROM \"references\" r LEFT JOIN symbols f ON f.id=r.from_symbol_id LEFT JOIN symbols t ON t.id=r.to_symbol_id WHERE (r.from_symbol_id != 0 AND f.id IS NULL) OR t.id IS NULL;"));
+	TArray<FMonolithSourceInheritance> FirstParents = DB.GetParents(FirstDerivedId);
+	TestEqual(TEXT("first inheritance edge count"), FirstParents.Num(), 1);
+	if (FirstParents.Num() == 1)
+	{
+		TestEqual(TEXT("first inheritance parent is current base"), FirstParents[0].Id, FirstBaseId);
+	}
+	TArray<FMonolithSourceReference> FirstReferences = DB.GetReferencesFrom(UseRows[0].Id, TEXT("call"));
+	bool bFirstCurrentReference = false;
+	for (const FMonolithSourceReference& Ref : FirstReferences)
+	{
+		bFirstCurrentReference |= Ref.ToSymbolId == FirstMethodId;
+	}
+	TestTrue(TEXT("first call reference targets current method"), bFirstCurrentReference);
+	DB.Close();
+
+	TestTrue(TEXT("repeated project index succeeds"), RunIndexer(false));
+	TestTrue(TEXT("reopen repeated indexed DB"), DB.Open(DbPath));
+	BaseRows = DB.GetSymbolsByName(TEXT("FFixtureBase"), TEXT("class"));
+	DerivedRows = DB.GetSymbolsByName(TEXT("FFixtureDerived"), TEXT("class"));
+	UseRows = DB.GetSymbolsByName(TEXT("UseFixture"), TEXT("function"));
+	MethodRows = DB.GetSymbolsByName(TEXT("Derived"), TEXT("function"));
+	TestEqual(TEXT("one base class after repeated index"), BaseRows.Num(), 1);
+	TestEqual(TEXT("one derived class after repeated index"), DerivedRows.Num(), 1);
+	TestEqual(TEXT("one caller after repeated index"), UseRows.Num(), 1);
+	TestTrue(TEXT("derived method remains indexed"), MethodRows.Num() > 0);
+	if (BaseRows.Num() == 1 && DerivedRows.Num() == 1 && UseRows.Num() == 1 && MethodRows.Num() > 0)
+	{
+		const int64 SecondBaseId = BaseRows[0].Id;
+		const int64 SecondDerivedId = DerivedRows[0].Id;
+		const int64 SecondMethodId = MethodRows[0].Id;
+		TArray<FMonolithSourceInheritance> Parents = DB.GetParents(SecondDerivedId);
+		TestEqual(TEXT("repeated inheritance edge count"), Parents.Num(), 1);
+		if (Parents.Num() == 1)
+		{
+			TestEqual(TEXT("repeated inheritance parent is current base"), Parents[0].Id, SecondBaseId);
+		}
+		TArray<FMonolithSourceReference> References = DB.GetReferencesFrom(UseRows[0].Id, TEXT("call"));
+		bool bCurrentReference = false;
+		for (const FMonolithSourceReference& Ref : References)
+		{
+			bCurrentReference |= Ref.ToSymbolId == SecondMethodId;
+		}
+		TestTrue(TEXT("repeated call reference targets current method"), bCurrentReference);
+		TestEqual(TEXT("reference rows do not grow"), Scalar(DB, TEXT("SELECT COUNT(*) FROM \"references\";")), FirstReferenceCount);
+		TestEqual(TEXT("inheritance rows do not grow"), Scalar(DB, TEXT("SELECT COUNT(*) FROM inheritance;")), FirstInheritanceCount);
+		TestEqual(TEXT("no orphan inheritance edges"), Scalar(DB, TEXT("SELECT COUNT(*) FROM inheritance i LEFT JOIN symbols c ON c.id=i.child_id LEFT JOIN symbols p ON p.id=i.parent_id WHERE c.id IS NULL OR p.id IS NULL;")), FirstOrphanInheritance);
+		TestEqual(TEXT("no orphan reference edges"), Scalar(DB, TEXT("SELECT COUNT(*) FROM \"references\" r LEFT JOIN symbols f ON f.id=r.from_symbol_id LEFT JOIN symbols t ON t.id=r.to_symbol_id WHERE (r.from_symbol_id != 0 AND f.id IS NULL) OR t.id IS NULL;")), FirstOrphanReferences);
+	}
+	DB.Close();
+	IFileManager::Get().DeleteDirectory(*ProjectRoot, false, true);
+	IFileManager::Get().Delete(*DbPath, false, true);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FIndexerCommitFailurePropagationTest,
+	"Monolith.Source.Incremental.CommitFailurePropagation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FIndexerCommitFailurePropagationTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithCppErgoTestDetail;
+	const FString ProjectRoot = FPaths::AutomationTransientDir() / FString::Printf(TEXT("source-index-commit-failure-%s"), *FGuid::NewGuid().ToString());
+	const FString ModuleDir = ProjectRoot / TEXT("Source") / TEXT("FailureModule");
+	const FString DbPath = MakeTempDbPath();
+	IFileManager::Get().MakeDirectory(*ModuleDir, /*Tree=*/true);
+	TestTrue(TEXT("write commit-failure fixture"), FFileHelper::SaveStringToFile(TEXT("class FCommitFailure {};\n"), *(ModuleDir / TEXT("Failure.cpp"))));
+
+	FMonolithSourceDatabase::SetCommitFailureForTests(true);
+	FMonolithSourceIndexer Indexer;
+	Indexer.SetSourcePath(TEXT(""));
+	Indexer.SetShaderPath(TEXT(""));
+	Indexer.SetProjectPath(ProjectRoot);
+	Indexer.SetDatabasePath(DbPath);
+	Indexer.SetCleanBuild(true);
+	Indexer.SetIndexProjectSource(true);
+	AddExpectedError(TEXT("Indexer: project replacement commit failed; rolling back"), EAutomationExpectedErrorFlags::Contains);
+	TestFalse(TEXT("injected commit failure propagates from RunSynchronous"), Indexer.RunSynchronous());
+	TestFalse(TEXT("commit failure clears indexer running state"), Indexer.IsRunning());
+	FMonolithSourceDatabase::SetCommitFailureForTests(false);
+
+	IFileManager::Get().DeleteDirectory(*ProjectRoot, false, true);
+	IFileManager::Get().Delete(*DbPath, false, true);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FSourceIndexerStartupFailureStatusTest,
+	"Monolith.Source.Incremental.StartupFailureStatus",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FSourceIndexerStartupFailureStatusTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithCppErgoTestDetail;
+
+	// A directory path cannot be opened as a SQLite database. The indexer must
+	// report completion with an error and leave its worker state cleared instead
+	// of returning silently with a permanently running subsystem status.
+	int32 CompletionErrors = -1;
+	FMonolithSourceIndexer Indexer;
+	Indexer.SetDatabasePath(FPaths::AutomationTransientDir());
+	AddExpectedError(TEXT("OpenForWriting: failed to open/create DB"), EAutomationExpectedErrorFlags::Contains);
+	AddExpectedError(TEXT("Indexer: Failed to open DB for writing"), EAutomationExpectedErrorFlags::Contains);
+	Indexer.OnComplete.AddLambda([&CompletionErrors](int32, int32, int32 Errors)
+	{
+		CompletionErrors = Errors;
+	});
+	TestFalse(TEXT("RunSynchronous reports DB open failure"), Indexer.RunSynchronous());
+	TestFalse(TEXT("DB open failure clears indexer running state"), Indexer.IsRunning());
+	TestEqual(TEXT("DB open failure broadcasts one error"), CompletionErrors, 1);
+
+	UMonolithSettings* Settings = GetMutableDefault<UMonolithSettings>();
+	const FString PreviousOverride = Settings->EngineSourceDBPathOverride.Path;
+	const FString OverrideDir = FPaths::AutomationTransientDir() / FString::Printf(TEXT("source-status-%s"), *FGuid::NewGuid().ToString());
+	IFileManager::Get().MakeDirectory(*OverrideDir, /*Tree=*/true);
+	const FString OverrideDb = OverrideDir / TEXT("EngineSource.db");
+	{
+		FMonolithSourceDatabase Seed;
+		TestTrue(TEXT("create disposable status DB"), Seed.OpenForWriting(OverrideDb));
+		TestTrue(TEXT("initialize disposable status DB"), Seed.CreateTablesIfNeeded());
+		Seed.Close();
+	}
+	Settings->EngineSourceDBPathOverride.Path = OverrideDir;
+	AddExpectedError(TEXT("Full source indexing failed to start"), EAutomationExpectedErrorFlags::Contains);
+	AddExpectedError(TEXT("Project source indexing failed to start"), EAutomationExpectedErrorFlags::Contains);
+	UMonolithSourceSubsystem::SetStartAsyncOverrideForTests(
+		[](FMonolithSourceIndexer*)
+		{
+			return false;
+		});
+
+	UMonolithSourceSubsystem* FullSubsystem = NewObject<UMonolithSourceSubsystem>();
+	TestFalse(TEXT("full trigger rejects failed StartAsync"), FullSubsystem->TriggerReindex());
+	TSharedPtr<FJsonObject> FullStatus = FullSubsystem->GetIndexStatus();
+	TestEqual(TEXT("full startup failure state"), FullStatus->GetStringField(TEXT("state")), FString(TEXT("failed")));
+	TestEqual(TEXT("full startup failure mode"), FullStatus->GetStringField(TEXT("mode")), FString(TEXT("full")));
+	TestFalse(TEXT("full startup failure clears bIsIndexing"), FullSubsystem->IsIndexing());
+	TestTrue(TEXT("full startup failure has completion timestamp"), !FullStatus->GetStringField(TEXT("completed_at")).IsEmpty());
+	TestTrue(TEXT("full startup failure has error"), FullStatus->GetNumberField(TEXT("errors")) > 0 && !FullStatus->GetStringField(TEXT("last_error")).IsEmpty());
+
+	UMonolithSourceSubsystem* ProjectSubsystem = NewObject<UMonolithSourceSubsystem>();
+	TestFalse(TEXT("project trigger rejects failed StartAsync"), ProjectSubsystem->TriggerProjectReindex());
+	TSharedPtr<FJsonObject> ProjectStatus = ProjectSubsystem->GetIndexStatus();
+	TestEqual(TEXT("project startup failure state"), ProjectStatus->GetStringField(TEXT("state")), FString(TEXT("failed")));
+	TestEqual(TEXT("project startup failure mode"), ProjectStatus->GetStringField(TEXT("mode")), FString(TEXT("project")));
+	TestFalse(TEXT("project startup failure clears bIsIndexing"), ProjectSubsystem->IsIndexing());
+	TestTrue(TEXT("project startup failure has completion timestamp"), !ProjectStatus->GetStringField(TEXT("completed_at")).IsEmpty());
+	TestTrue(TEXT("project startup failure has error"), ProjectStatus->GetNumberField(TEXT("errors")) > 0 && !ProjectStatus->GetStringField(TEXT("last_error")).IsEmpty());
+
+	// Completion must not report success when the freshly-written DB cannot be
+	// reopened. This uses the completion seam so the failure is deterministic and
+	// does not depend on filesystem races.
+	UMonolithSourceSubsystem::SetStartAsyncOverrideForTests(
+		[](FMonolithSourceIndexer*)
+		{
+			return true;
+		});
+	UMonolithSourceSubsystem::SetReopenDatabaseOverrideForTests(
+		[](const FString&)
+		{
+			return false;
+		});
+	UMonolithSourceSubsystem* ReopenSubsystem = NewObject<UMonolithSourceSubsystem>();
+	TestTrue(TEXT("reopen-failure trigger starts"), ReopenSubsystem->TriggerReindex());
+	ReopenSubsystem->CompleteIndexForTests(FPaths::AutomationTransientDir() / TEXT("missing-source-index.db"), 3, 4, 0, false, 3);
+	TSharedPtr<FJsonObject> ReopenStatus = ReopenSubsystem->GetIndexStatus();
+	TestEqual(TEXT("reopen failure state"), ReopenStatus->GetStringField(TEXT("state")), FString(TEXT("failed")));
+	TestTrue(TEXT("reopen failure reports an error"), ReopenStatus->GetNumberField(TEXT("errors")) > 0);
+	TestTrue(TEXT("reopen failure requires full recovery"), ReopenStatus->GetBoolField(TEXT("requires_full_reindex")));
+	TestFalse(TEXT("reopen failure clears bIsIndexing"), ReopenSubsystem->IsIndexing());
+
+	UMonolithSourceSubsystem::SetStartAsyncOverrideForTests({});
+	UMonolithSourceSubsystem::SetReopenDatabaseOverrideForTests({});
+	Settings->EngineSourceDBPathOverride.Path = PreviousOverride;
+	IFileManager::Get().DeleteDirectory(*OverrideDir, false, true);
 	return true;
 }
 

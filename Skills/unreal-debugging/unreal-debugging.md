@@ -47,9 +47,30 @@ editor_query({ action: "search_logs", params: { pattern: "MyActor", category: "L
 ## Common Error Patterns
 
 - **LNK2019/LNK2001:** Missing module in `.Build.cs`. `DeveloperSettings` is separate from `Engine`.
-- **Include path errors:** Use `source_query("search_source", ...)` to find correct header. Note: `get_include_path` does NOT exist as an action.
+- **Include path errors:** `source.get_include_path` is a native source action. Resolve the symbol with `get_include_path` first; it returns the canonical include and whether a Private header is cross-module includable. Use `search_source` as the fallback when the source index is unavailable or the symbol is not indexed.
 - **Live Coding limits:** Header changes (new members, class layout) require editor restart + UBT build. Only `.cpp` body changes work.
 - **Package errors:** `CreatePackage` with same path returns existing in-memory package.
+
+### Source versus asset reindexing
+
+Monolith has separate indexes with separate freshness contracts:
+
+- `source.trigger_reindex` rebuilds the native C++ source database (Engine, shaders,
+  project, and project plugins). `source.trigger_project_reindex` atomically replaces
+  only project/project-plugin source and preserves Engine rows; it is rejected until a
+  required schema migration has completed.
+- `source.get_index_status` is the read-only authority for source indexing. Poll it
+  until `state` is `succeeded` and `requires_full_reindex` is `false`; do not infer
+  current symbols from database existence, a reload event, or an earlier query.
+  Reload/Live Coding may request an asynchronous project pass, but does not promise a
+  freshness deadline.
+- `monolith_reindex` rebuilds the project **asset** index (Blueprints, materials,
+  textures, and related content). It does not refresh C++ symbols, and a source
+  trigger does not refresh asset metadata.
+
+When a source query reports an incompatible or unavailable database, run one explicit
+full `source.trigger_reindex`, then poll `source.get_index_status`; do not attempt a
+project-only repair or rely on stale results.
 
 ## Reflection Intelligence (context while root-causing)
 

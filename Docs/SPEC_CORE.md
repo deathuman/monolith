@@ -176,7 +176,16 @@ Each module has its own spec file under `specs/`. The table below is the index.
 The engine source indexer is a native C++ implementation within `MonolithSource`. `UMonolithSourceSubsystem` builds and maintains `EngineSource.db` in-process. Indexing is triggered via:
 
 - **`trigger_reindex`** — full engine source re-index
-- **`trigger_project_reindex`** — incremental project-only C++ re-index (faster; only updates project symbols)
+- **`trigger_project_reindex`** — atomic project/project-plugin C++ replacement (Engine rows preserved; failures roll back)
+- **`get_index_status`** — read-only progress and migration status (`schema_version` is actual; `expected_schema_version` is the current contract)
+
+Schema-v4 databases use deterministic path identity and file-owned deprecation
+rows. Older generated databases
+are incompatible and require one explicit full `trigger_reindex`; project-only
+indexing is rejected while that migration is required. Poll `get_index_status`
+for completion rather than assuming a freshness window. The native indexer
+preserves the prior project snapshot on cancellation, unreadable source, or
+database failure.
 
 ### 4.2 Python Source Indexer (legacy)
 
@@ -252,7 +261,9 @@ python Scripts/monolith_offline.py <namespace> <action> [args...]
 
 ### Namespaces and Actions
 
-**Source (9 actions)** — mirrors `source_query` MCP tool:
+**Source (9 offline read actions)** — the legacy `monolith_offline.py` surface.
+Live `source_query` additionally exposes the native-only `trigger_reindex`,
+`trigger_project_reindex`, and `get_index_status` actions documented above.
 
 | Action | Positional | Key Options | Description |
 |--------|-----------|-------------|-------------|

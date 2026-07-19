@@ -6,6 +6,43 @@
 
 DEFINE_LOG_CATEGORY(LogMonolithSource);
 
+#if WITH_DEV_AUTOMATION_TESTS
+static bool GFailNextCommitForTests = false;
+#endif
+
+void FMonolithSourceDatabase::MarkOperationErrorLocked(const FString& Context)
+{
+	bOperationError = true;
+	const FString DbError = Database ? Database->GetLastError() : FString();
+	OperationError = DbError.IsEmpty() ? Context : FString::Printf(TEXT("%s: %s"), *Context, *DbError);
+}
+
+void FMonolithSourceDatabase::ClearOperationError()
+{
+	FScopeLock Lock(&DbLock);
+	bOperationError = false;
+	OperationError.Empty();
+}
+
+bool FMonolithSourceDatabase::HasOperationError() const
+{
+	FScopeLock Lock(&DbLock);
+	return bOperationError;
+}
+
+FString FMonolithSourceDatabase::GetOperationError() const
+{
+	FScopeLock Lock(&DbLock);
+	return OperationError;
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+void FMonolithSourceDatabase::SetCommitFailureForTests(bool bFailNextCommit)
+{
+	GFailNextCommitForTests = bFailNextCommit;
+}
+#endif
+
 // ============================================================
 // Helper: execute a multi-statement SQL string statement-by-statement.
 // FSQLiteDatabase::Execute() only runs the first statement when given
@@ -148,6 +185,7 @@ bool FMonolithSourceDatabase::Open(const FString& DbPath)
 void FMonolithSourceDatabase::Close()
 {
 	FScopeLock Lock(&DbLock);
+	TransactionDepth = 0;
 	if (Database)
 	{
 		Database->Close();
@@ -979,31 +1017,76 @@ bool FMonolithSourceDatabase::CreateTablesIfNeeded()
 	if (!Database || !Database->IsValid())
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("CreateTablesIfNeeded: DB not open"));
+		MarkOperationErrorLocked(TEXT("CreateTablesIfNeeded: database unavailable"));
 		return false;
 	}
 
 	if (!ExecuteMulti(*Database, MonolithSourceSchema::DDL_Tables))
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("CreateTablesIfNeeded: DDL_Tables failed — %s"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("CreateTablesIfNeeded: DDL_Tables failed"));
 		return false;
 	}
 	if (!ExecuteMulti(*Database, MonolithSourceSchema::DDL_FTS))
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("CreateTablesIfNeeded: DDL_FTS failed — %s"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("CreateTablesIfNeeded: DDL_FTS failed"));
 		return false;
 	}
 	if (!ExecuteMulti(*Database, MonolithSourceSchema::DDL_Triggers))
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("CreateTablesIfNeeded: DDL_Triggers failed — %s"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("CreateTablesIfNeeded: DDL_Triggers failed"));
 		return false;
 	}
 
-	// Stamp the schema version into meta
-	FSQLitePreparedStatement MetaStmt;
-	MetaStmt.Create(*Database, TEXT("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?);"));
-	MetaStmt.SetBindingValueByIndex(1, FString(TEXT("schema_version")));
-	MetaStmt.SetBindingValueByIndex(2, FString::FromInt(MonolithSourceSchema::SchemaVersion));
-	MetaStmt.Step();
+	// Do not silently upgrade an existing generated DB. The v4 write semantics
+	// require one explicit full reindex; retain the old marker and expose the
+	// recovery requirement to source actions/status callers.
+	FString ExistingVersion;
+	FSQLitePreparedStatement ExistingMeta;
+	if (!ExistingMeta.Create(*Database, TEXT("SELECT value FROM meta WHERE key='schema_version';")))
+	{
+		MarkOperationErrorLocked(TEXT("CreateTablesIfNeeded: prepare schema lookup"));
+		return false;
+	}
+	const ESQLitePreparedStatementStepResult ExistingMetaResult = ExistingMeta.Step();
+	if (ExistingMetaResult == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("CreateTablesIfNeeded: schema lookup failed"));
+		return false;
+	}
+	if (ExistingMetaResult == ESQLitePreparedStatementStepResult::Row)
+	{
+		ExistingMeta.GetColumnValueByIndex(0, ExistingVersion);
+	}
+	if (ExistingVersion.IsEmpty() || FCString::Atoi(*ExistingVersion) == MonolithSourceSchema::SchemaVersion)
+	{
+		FSQLitePreparedStatement MetaStmt;
+		if (!MetaStmt.Create(*Database, TEXT("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?);")))
+		{
+			MarkOperationErrorLocked(TEXT("CreateTablesIfNeeded: prepare schema metadata"));
+			return false;
+		}
+		MetaStmt.SetBindingValueByIndex(1, FString(TEXT("schema_version")));
+		MetaStmt.SetBindingValueByIndex(2, FString::FromInt(MonolithSourceSchema::SchemaVersion));
+		if (MetaStmt.Step() == ESQLitePreparedStatementStepResult::Error)
+		{
+			MarkOperationErrorLocked(TEXT("CreateTablesIfNeeded: write schema metadata"));
+			return false;
+		}
+	}
+	else
+	{
+		FSQLitePreparedStatement RequiredStmt;
+		if (!RequiredStmt.Create(*Database, TEXT("INSERT OR REPLACE INTO meta (key, value) VALUES ('requires_full_reindex', '1');"))
+			|| RequiredStmt.Step() == ESQLitePreparedStatementStepResult::Error)
+		{
+			MarkOperationErrorLocked(TEXT("CreateTablesIfNeeded: write migration marker"));
+			return false;
+		}
+		UE_LOG(LogMonolithSource, Warning, TEXT("Schema version %s is incompatible with %d; run source.trigger_reindex"), *ExistingVersion, MonolithSourceSchema::SchemaVersion);
+	}
 
 	UE_LOG(LogMonolithSource, Log, TEXT("Schema created/verified (version %d)"), MonolithSourceSchema::SchemaVersion);
 	return true;
@@ -1015,12 +1098,14 @@ bool FMonolithSourceDatabase::ResetDatabase()
 	if (!Database || !Database->IsValid())
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("ResetDatabase: DB not open"));
+		MarkOperationErrorLocked(TEXT("ResetDatabase: database unavailable"));
 		return false;
 	}
 
 	if (!ExecuteMulti(*Database, MonolithSourceSchema::DDL_Drop))
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("ResetDatabase: drop failed — %s"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("ResetDatabase: drop failed"));
 		return false;
 	}
 
@@ -1030,24 +1115,42 @@ bool FMonolithSourceDatabase::ResetDatabase()
 	if (!ExecuteMulti(*Database, MonolithSourceSchema::DDL_Tables))
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("ResetDatabase: DDL_Tables failed — %s"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("ResetDatabase: DDL_Tables failed"));
 		return false;
 	}
 	if (!ExecuteMulti(*Database, MonolithSourceSchema::DDL_FTS))
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("ResetDatabase: DDL_FTS failed — %s"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("ResetDatabase: DDL_FTS failed"));
 		return false;
 	}
 	if (!ExecuteMulti(*Database, MonolithSourceSchema::DDL_Triggers))
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("ResetDatabase: DDL_Triggers failed — %s"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("ResetDatabase: DDL_Triggers failed"));
 		return false;
 	}
 
 	FSQLitePreparedStatement MetaStmt;
-	MetaStmt.Create(*Database, TEXT("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?);"));
+	if (!MetaStmt.Create(*Database, TEXT("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("ResetDatabase: prepare schema metadata"));
+		return false;
+	}
 	MetaStmt.SetBindingValueByIndex(1, FString(TEXT("schema_version")));
 	MetaStmt.SetBindingValueByIndex(2, FString::FromInt(MonolithSourceSchema::SchemaVersion));
-	MetaStmt.Step();
+	if (MetaStmt.Step() == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("ResetDatabase: write schema metadata"));
+		return false;
+	}
+	FSQLitePreparedStatement RequiredStmt;
+	if (!RequiredStmt.Create(*Database, TEXT("INSERT OR REPLACE INTO meta (key, value) VALUES ('requires_full_reindex', '1');"))
+		|| RequiredStmt.Step() == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("ResetDatabase: write migration marker"));
+		return false;
+	}
 
 	UE_LOG(LogMonolithSource, Log, TEXT("ResetDatabase: schema recreated successfully"));
 	return true;
@@ -1060,22 +1163,169 @@ bool FMonolithSourceDatabase::ResetDatabase()
 bool FMonolithSourceDatabase::BeginTransaction()
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return false;
-	return Database->Execute(TEXT("BEGIN;"));
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("BeginTransaction: database unavailable"));
+		return false;
+	}
+	if (TransactionDepth++ > 0)
+	{
+		return true;
+	}
+	if (!Database->Execute(TEXT("BEGIN;")))
+	{
+		TransactionDepth = 0;
+		MarkOperationErrorLocked(TEXT("BeginTransaction: BEGIN failed"));
+		return false;
+	}
+	return true;
 }
 
 bool FMonolithSourceDatabase::CommitTransaction()
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return false;
-	return Database->Execute(TEXT("COMMIT;"));
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("CommitTransaction: database unavailable"));
+		return false;
+	}
+	if (TransactionDepth <= 0) return true;
+	if (TransactionDepth > 1)
+	{
+		--TransactionDepth;
+		return true;
+	}
+#if WITH_DEV_AUTOMATION_TESTS
+	if (GFailNextCommitForTests)
+	{
+		GFailNextCommitForTests = false;
+		MarkOperationErrorLocked(TEXT("CommitTransaction: injected failure"));
+		return false;
+	}
+#endif
+	--TransactionDepth;
+	if (!Database->Execute(TEXT("COMMIT;")))
+	{
+		MarkOperationErrorLocked(TEXT("CommitTransaction: COMMIT failed"));
+		return false;
+	}
+	return true;
 }
 
 bool FMonolithSourceDatabase::RollbackTransaction()
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return false;
-	return Database->Execute(TEXT("ROLLBACK;"));
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("RollbackTransaction: database unavailable"));
+		return false;
+	}
+	TransactionDepth = 0;
+	if (!Database->Execute(TEXT("ROLLBACK;")))
+	{
+		MarkOperationErrorLocked(TEXT("RollbackTransaction: ROLLBACK failed"));
+		return false;
+	}
+	return true;
+}
+
+bool FMonolithSourceDatabase::BeginProjectReplacement(const FString& ProjectRoot)
+{
+	FScopeLock Lock(&DbLock);
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("BeginProjectReplacement: database unavailable"));
+		return false;
+	}
+	if (TransactionDepth++ == 0 && !Database->Execute(TEXT("BEGIN;")))
+	{
+		TransactionDepth = 0;
+		MarkOperationErrorLocked(TEXT("BeginProjectReplacement: BEGIN failed"));
+		return false;
+	}
+
+	FString Root = ProjectRoot;
+	while (Root.EndsWith(TEXT("/"))) Root.LeftChopInline(1);
+	const FString SourcePrefix = Root + TEXT("/Source/%");
+	const FString PluginsPrefix = Root + TEXT("/Plugins/%/Source/%");
+	const FString SourcePrefixWin = SourcePrefix.Replace(TEXT("/"), TEXT("\\"));
+	const FString PluginsPrefixWin = PluginsPrefix.Replace(TEXT("/"), TEXT("\\"));
+	const TCHAR* ProjectModuleWhere =
+		TEXT("m.path LIKE ? OR m.path LIKE ? OR m.path LIKE ? OR m.path LIKE ?");
+
+	// Delete dependent rows before files/modules. The symbols delete trigger keeps
+	// symbols_fts consistent, while source_fts is contentless and needs explicit
+	// cleanup. All statements run inside the same replacement transaction.
+	const FString DeleteRefs = FString::Printf(
+		TEXT("DELETE FROM \"references\" WHERE file_id IN (SELECT f.id FROM files f JOIN modules m ON m.id=f.module_id WHERE %s) OR from_symbol_id IN (SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id JOIN modules m ON m.id=f.module_id WHERE %s) OR to_symbol_id IN (SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere, ProjectModuleWhere, ProjectModuleWhere);
+	const FString DeleteInheritance = FString::Printf(
+		TEXT("DELETE FROM inheritance WHERE child_id IN (SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id JOIN modules m ON m.id=f.module_id WHERE %s) OR parent_id IN (SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere, ProjectModuleWhere);
+	const FString DeleteDeprecations = FString::Printf(
+		TEXT("DELETE FROM symbol_deprecations WHERE file_id IN (SELECT f.id FROM files f JOIN modules m ON m.id=f.module_id WHERE %s) OR symbol_id IN (SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere, ProjectModuleWhere);
+	const FString DeleteFts = FString::Printf(
+		TEXT("DELETE FROM source_fts WHERE file_id IN (SELECT f.id FROM files f JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere);
+	const FString DeleteIncludes = FString::Printf(
+		TEXT("DELETE FROM includes WHERE file_id IN (SELECT f.id FROM files f JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere);
+	const FString DeleteSymbols = FString::Printf(
+		TEXT("DELETE FROM symbols WHERE file_id IN (SELECT f.id FROM files f JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere);
+	const FString DeleteFiles = FString::Printf(
+		TEXT("DELETE FROM files WHERE module_id IN (SELECT m.id FROM modules m WHERE %s);"), ProjectModuleWhere);
+	const FString DeleteModules = FString::Printf(
+		TEXT("DELETE FROM modules WHERE path LIKE ? OR path LIKE ? OR path LIKE ? OR path LIKE ?;"));
+
+	const TArray<FString> Statements = { DeleteRefs, DeleteInheritance, DeleteDeprecations,
+		DeleteFts, DeleteIncludes, DeleteSymbols, DeleteFiles, DeleteModules };
+	for (const FString& Sql : Statements)
+	{
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(*Database, *Sql))
+		{
+			TransactionDepth = 0;
+			Database->Execute(TEXT("ROLLBACK;"));
+			MarkOperationErrorLocked(TEXT("BeginProjectReplacement: prepare cleanup statement"));
+			return false;
+		}
+		const int32 PredicateCount = Sql.Contains(TEXT("OR parent_id")) ? 2
+			: (Sql.Contains(TEXT("OR from_symbol_id")) ? 3
+			: (Sql.Contains(TEXT("OR symbol_id")) ? 2 : 1));
+		const TArray<FString> Patterns = { SourcePrefix, PluginsPrefix, SourcePrefixWin, PluginsPrefixWin };
+		int32 Index = 1;
+		const int32 PatternCount = PredicateCount * Patterns.Num();
+		for (; Index <= PatternCount; ++Index)
+		{
+			Stmt.SetBindingValueByIndex(Index, Patterns[(Index - 1) % Patterns.Num()]);
+		}
+		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Error)
+		{
+			TransactionDepth = 0;
+			Database->Execute(TEXT("ROLLBACK;"));
+			MarkOperationErrorLocked(TEXT("BeginProjectReplacement: cleanup statement failed"));
+			return false;
+		}
+	}
+	return true;
+}
+
+bool FMonolithSourceDatabase::RequiresFullReindex() const
+{
+	FScopeLock Lock(&DbLock);
+	if (!Database || !Database->IsValid()) return true;
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*Database, TEXT("SELECT key, value FROM meta WHERE key IN ('schema_version','requires_full_reindex');"))) return true;
+	FString SchemaValue;
+	FString RequiredValue;
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString Key;
+		FString Value;
+		Stmt.GetColumnValueByIndex(0, Key);
+		Stmt.GetColumnValueByIndex(1, Value);
+		if (Key == TEXT("schema_version")) SchemaValue = Value;
+		else if (Key == TEXT("requires_full_reindex")) RequiredValue = Value;
+	}
+	return SchemaValue.IsEmpty()
+		|| FCString::Atoi(*SchemaValue) != MonolithSourceSchema::SchemaVersion
+		|| RequiredValue == TEXT("1");
 }
 
 // ============================================================
@@ -1085,29 +1335,80 @@ bool FMonolithSourceDatabase::RollbackTransaction()
 int64 FMonolithSourceDatabase::InsertModule(const FString& Name, const FString& Path, const FString& ModuleType, const FString& BuildCsPath)
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return 0;
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("InsertModule: database unavailable"));
+		return 0;
+	}
 
-	// INSERT OR IGNORE — if UNIQUE(name,path) already exists, this is a no-op
+	// Resolve the path identity directly. Do not use GetLastInsertRowId after an
+	// INSERT OR IGNORE: SQLite leaves it pointing at an unrelated prior insert.
+	FSQLitePreparedStatement ExistingStmt;
+	if (!ExistingStmt.Create(*Database, TEXT("SELECT id FROM modules WHERE name = ? AND path = ?;")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertModule: prepare identity lookup"));
+		return 0;
+	}
+	ExistingStmt.SetBindingValueByIndex(1, Name);
+	ExistingStmt.SetBindingValueByIndex(2, Path);
+	const ESQLitePreparedStatementStepResult ExistingResult = ExistingStmt.Step();
+	if (ExistingResult == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("InsertModule: identity lookup failed"));
+		return 0;
+	}
+	if (ExistingResult == ESQLitePreparedStatementStepResult::Row)
+	{
+		int64 ExistingId = 0;
+		ExistingStmt.GetColumnValueByIndex(0, ExistingId);
+		FSQLitePreparedStatement UpdateStmt;
+		if (!UpdateStmt.Create(*Database, TEXT("UPDATE modules SET module_type = ?, build_cs_path = ? WHERE id = ?;")))
+		{
+			MarkOperationErrorLocked(TEXT("InsertModule: prepare metadata update"));
+			return 0;
+		}
+		UpdateStmt.SetBindingValueByIndex(1, ModuleType);
+		UpdateStmt.SetBindingValueByIndex(2, BuildCsPath);
+		UpdateStmt.SetBindingValueByIndex(3, ExistingId);
+		if (UpdateStmt.Step() == ESQLitePreparedStatementStepResult::Error)
+		{
+			MarkOperationErrorLocked(TEXT("InsertModule: metadata update failed"));
+			return 0;
+		}
+		return ExistingId;
+	}
+
 	FSQLitePreparedStatement InsStmt;
-	InsStmt.Create(*Database, TEXT("INSERT OR IGNORE INTO modules (name, path, module_type, build_cs_path) VALUES (?, ?, ?, ?);"));
+	if (!InsStmt.Create(*Database, TEXT("INSERT INTO modules (name, path, module_type, build_cs_path) VALUES (?, ?, ?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertModule: prepare insert"));
+		return 0;
+	}
 	InsStmt.SetBindingValueByIndex(1, Name);
 	InsStmt.SetBindingValueByIndex(2, Path);
 	InsStmt.SetBindingValueByIndex(3, ModuleType);
 	InsStmt.SetBindingValueByIndex(4, BuildCsPath);
-	InsStmt.Step();
-
-	int64 RowId = Database->GetLastInsertRowId();
-	if (RowId != 0)
+	if (InsStmt.Step() == ESQLitePreparedStatementStepResult::Error)
 	{
-		return RowId;
+		MarkOperationErrorLocked(TEXT("InsertModule: insert failed"));
+		return 0;
 	}
 
-	// Already existed — fetch its id
 	FSQLitePreparedStatement SelStmt;
-	SelStmt.Create(*Database, TEXT("SELECT id FROM modules WHERE name = ? AND path = ?;"));
+	if (!SelStmt.Create(*Database, TEXT("SELECT id FROM modules WHERE name = ? AND path = ?;")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertModule: prepare inserted identity lookup"));
+		return 0;
+	}
 	SelStmt.SetBindingValueByIndex(1, Name);
 	SelStmt.SetBindingValueByIndex(2, Path);
-	if (SelStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	const ESQLitePreparedStatementStepResult SelectResult = SelStmt.Step();
+	if (SelectResult == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("InsertModule: inserted identity lookup failed"));
+		return 0;
+	}
+	if (SelectResult == ESQLitePreparedStatementStepResult::Row)
 	{
 		int64 ExistingId = 0;
 		SelStmt.GetColumnValueByIndex(0, ExistingId);
@@ -1121,28 +1422,81 @@ int64 FMonolithSourceDatabase::InsertModule(const FString& Name, const FString& 
 int64 FMonolithSourceDatabase::InsertFile(const FString& FilePath, int64 ModuleId, const FString& FileType, int32 LineCount, double LastModified)
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return 0;
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("InsertFile: database unavailable"));
+		return 0;
+	}
+
+	// Resolve the unique path first. This prevents a failed INSERT OR IGNORE from
+	// returning the last row id belonging to another file.
+	FSQLitePreparedStatement ExistingStmt;
+	if (!ExistingStmt.Create(*Database, TEXT("SELECT id FROM files WHERE path = ?;")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertFile: prepare identity lookup"));
+		return 0;
+	}
+	ExistingStmt.SetBindingValueByIndex(1, FilePath);
+	const ESQLitePreparedStatementStepResult ExistingResult = ExistingStmt.Step();
+	if (ExistingResult == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("InsertFile: identity lookup failed"));
+		return 0;
+	}
+	if (ExistingResult == ESQLitePreparedStatementStepResult::Row)
+	{
+		int64 ExistingId = 0;
+		ExistingStmt.GetColumnValueByIndex(0, ExistingId);
+		FSQLitePreparedStatement UpdateStmt;
+		if (!UpdateStmt.Create(*Database, TEXT("UPDATE files SET module_id = ?, file_type = ?, line_count = ?, last_modified = ? WHERE id = ?;")))
+		{
+			MarkOperationErrorLocked(TEXT("InsertFile: prepare metadata update"));
+			return 0;
+		}
+		UpdateStmt.SetBindingValueByIndex(1, ModuleId);
+		UpdateStmt.SetBindingValueByIndex(2, FileType);
+		UpdateStmt.SetBindingValueByIndex(3, static_cast<int64>(LineCount));
+		UpdateStmt.SetBindingValueByIndex(4, LastModified);
+		UpdateStmt.SetBindingValueByIndex(5, ExistingId);
+		if (UpdateStmt.Step() == ESQLitePreparedStatementStepResult::Error)
+		{
+			MarkOperationErrorLocked(TEXT("InsertFile: metadata update failed"));
+			return 0;
+		}
+		return ExistingId;
+	}
 
 	FSQLitePreparedStatement InsStmt;
-	InsStmt.Create(*Database, TEXT("INSERT OR IGNORE INTO files (path, module_id, file_type, line_count, last_modified) VALUES (?, ?, ?, ?, ?);"));
+	if (!InsStmt.Create(*Database, TEXT("INSERT INTO files (path, module_id, file_type, line_count, last_modified) VALUES (?, ?, ?, ?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertFile: prepare insert"));
+		return 0;
+	}
 	InsStmt.SetBindingValueByIndex(1, FilePath);
 	InsStmt.SetBindingValueByIndex(2, ModuleId);
 	InsStmt.SetBindingValueByIndex(3, FileType);
 	InsStmt.SetBindingValueByIndex(4, static_cast<int64>(LineCount));
 	InsStmt.SetBindingValueByIndex(5, LastModified);
-	InsStmt.Step();
-
-	int64 RowId = Database->GetLastInsertRowId();
-	if (RowId != 0)
+	if (InsStmt.Step() == ESQLitePreparedStatementStepResult::Error)
 	{
-		return RowId;
+		MarkOperationErrorLocked(TEXT("InsertFile: insert failed"));
+		return 0;
 	}
 
-	// Already existed — fetch its id
 	FSQLitePreparedStatement SelStmt;
-	SelStmt.Create(*Database, TEXT("SELECT id FROM files WHERE path = ?;"));
+	if (!SelStmt.Create(*Database, TEXT("SELECT id FROM files WHERE path = ?;")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertFile: prepare inserted identity lookup"));
+		return 0;
+	}
 	SelStmt.SetBindingValueByIndex(1, FilePath);
-	if (SelStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	const ESQLitePreparedStatementStepResult SelectResult = SelStmt.Step();
+	if (SelectResult == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("InsertFile: inserted identity lookup failed"));
+		return 0;
+	}
+	if (SelectResult == ESQLitePreparedStatementStepResult::Row)
 	{
 		int64 ExistingId = 0;
 		SelStmt.GetColumnValueByIndex(0, ExistingId);
@@ -1161,12 +1515,20 @@ int64 FMonolithSourceDatabase::InsertSymbol(
 	bool bIsUEMacro)
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return 0;
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("InsertSymbol: database unavailable"));
+		return 0;
+	}
 
 	FSQLitePreparedStatement Stmt;
-	Stmt.Create(*Database,
+	if (!Stmt.Create(*Database,
 		TEXT("INSERT INTO symbols (name, qualified_name, kind, file_id, line_start, line_end, parent_symbol_id, access, signature, docstring, is_ue_macro) ")
-		TEXT("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"));
+		TEXT("VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertSymbol: prepare insert"));
+		return 0;
+	}
 
 	Stmt.SetBindingValueByIndex(1, Name);
 	Stmt.SetBindingValueByIndex(2, QualifiedName);
@@ -1194,7 +1556,11 @@ int64 FMonolithSourceDatabase::InsertSymbol(
 	Stmt.SetBindingValueByIndex(10, Docstring);
 	Stmt.SetBindingValueByIndex(11, static_cast<int64>(bIsUEMacro ? 1 : 0));
 
-	Stmt.Step();
+	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("InsertSymbol: insert failed"));
+		return 0;
+	}
 
 	return Database->GetLastInsertRowId();
 }
@@ -1202,25 +1568,44 @@ int64 FMonolithSourceDatabase::InsertSymbol(
 void FMonolithSourceDatabase::InsertInheritance(int64 ChildId, int64 ParentId)
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return;
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("InsertInheritance: database unavailable"));
+		return;
+	}
 
 	// OR IGNORE — silent on unique constraint violation, mirrors Python IntegrityError catch
 	FSQLitePreparedStatement Stmt;
-	Stmt.Create(*Database, TEXT("INSERT OR IGNORE INTO inheritance (child_id, parent_id) VALUES (?, ?);"));
+	if (!Stmt.Create(*Database, TEXT("INSERT OR IGNORE INTO inheritance (child_id, parent_id) VALUES (?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertInheritance: prepare insert"));
+		return;
+	}
 	Stmt.SetBindingValueByIndex(1, ChildId);
 	Stmt.SetBindingValueByIndex(2, ParentId);
-	Stmt.Step();
+	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("InsertInheritance: insert failed"));
+	}
 }
 
 void FMonolithSourceDatabase::InsertReference(int64 FromSymbolId, int64 ToSymbolId, const FString& RefKind, int64 FileId, int32 Line)
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return;
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("InsertReference: database unavailable"));
+		return;
+	}
 
 	FSQLitePreparedStatement Stmt;
-	Stmt.Create(*Database,
+	if (!Stmt.Create(*Database,
 		TEXT("INSERT INTO \"references\" (from_symbol_id, to_symbol_id, ref_kind, file_id, line) ")
-		TEXT("VALUES (?, ?, ?, ?, ?);"));
+		TEXT("VALUES (?, ?, ?, ?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertReference: prepare insert"));
+		return;
+	}
 	Stmt.SetBindingValueByIndex(1, FromSymbolId);
 	Stmt.SetBindingValueByIndex(2, ToSymbolId);
 	Stmt.SetBindingValueByIndex(3, RefKind);
@@ -1231,26 +1616,44 @@ void FMonolithSourceDatabase::InsertReference(int64 FromSymbolId, int64 ToSymbol
 	}
 
 	Stmt.SetBindingValueByIndex(5, static_cast<int64>(Line));
-	Stmt.Step();
+	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("InsertReference: insert failed"));
+	}
 }
 
 void FMonolithSourceDatabase::InsertInclude(int64 FileId, const FString& IncludedPath, int32 Line)
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return;
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("InsertInclude: database unavailable"));
+		return;
+	}
 
 	FSQLitePreparedStatement Stmt;
-	Stmt.Create(*Database, TEXT("INSERT INTO includes (file_id, included_path, line) VALUES (?, ?, ?);"));
+	if (!Stmt.Create(*Database, TEXT("INSERT INTO includes (file_id, included_path, line) VALUES (?, ?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertInclude: prepare insert"));
+		return;
+	}
 	Stmt.SetBindingValueByIndex(1, FileId);
 	Stmt.SetBindingValueByIndex(2, IncludedPath);
 	Stmt.SetBindingValueByIndex(3, static_cast<int64>(Line));
-	Stmt.Step();
+	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("InsertInclude: insert failed"));
+	}
 }
 
 void FMonolithSourceDatabase::InsertSourceChunks(int64 FileId, const TArray<FString>& Lines)
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return;
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("InsertSourceChunks: database unavailable"));
+		return;
+	}
 	if (Lines.Num() == 0) return;
 
 	// Batch lines in groups of 10, matching Python _insert_source_lines()
@@ -1258,7 +1661,11 @@ void FMonolithSourceDatabase::InsertSourceChunks(int64 FileId, const TArray<FStr
 	static const int32 ChunkSize = 10;
 
 	FSQLitePreparedStatement Stmt;
-	Stmt.Create(*Database, TEXT("INSERT INTO source_fts (file_id, line_number, text) VALUES (?, ?, ?);"));
+	if (!Stmt.Create(*Database, TEXT("INSERT INTO source_fts (file_id, line_number, text) VALUES (?, ?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertSourceChunks: prepare insert"));
+		return;
+	}
 
 	for (int32 BatchStart = 0; BatchStart < Lines.Num(); BatchStart += ChunkSize)
 	{
@@ -1281,7 +1688,11 @@ void FMonolithSourceDatabase::InsertSourceChunks(int64 FileId, const TArray<FStr
 		Stmt.SetBindingValueByIndex(1, FileId);
 		Stmt.SetBindingValueByIndex(2, ChunkLineNumber);
 		Stmt.SetBindingValueByIndex(3, JoinedText);
-		Stmt.Step();
+		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Error)
+		{
+			MarkOperationErrorLocked(TEXT("InsertSourceChunks: insert failed"));
+			return;
+		}
 	}
 }
 
@@ -1292,13 +1703,24 @@ void FMonolithSourceDatabase::InsertSourceChunks(int64 FileId, const TArray<FStr
 void FMonolithSourceDatabase::SetMeta(const FString& Key, const FString& Value)
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return;
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("SetMeta: database unavailable"));
+		return;
+	}
 
 	FSQLitePreparedStatement Stmt;
-	Stmt.Create(*Database, TEXT("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?);"));
+	if (!Stmt.Create(*Database, TEXT("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("SetMeta: prepare insert"));
+		return;
+	}
 	Stmt.SetBindingValueByIndex(1, Key);
 	Stmt.SetBindingValueByIndex(2, Value);
-	Stmt.Step();
+	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("SetMeta: write failed"));
+	}
 }
 
 FString FMonolithSourceDatabase::GetMeta(const FString& Key)
@@ -1326,25 +1748,98 @@ FString FMonolithSourceDatabase::GetMeta(const FString& Key)
 void FMonolithSourceDatabase::InsertDeprecation(int64 SymbolId, const FString& SymbolName, const FString& Version, const FString& Message, const FString& Kind)
 {
 	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid()) return;
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("InsertDeprecation: database unavailable"));
+		return;
+	}
+
+	int64 FileId = 0;
+	if (SymbolId != 0)
+	{
+		FSQLitePreparedStatement FileStmt;
+		if (!FileStmt.Create(*Database, TEXT("SELECT file_id FROM symbols WHERE id = ?;")))
+		{
+			MarkOperationErrorLocked(TEXT("InsertDeprecation: prepare file ownership lookup"));
+			return;
+		}
+		FileStmt.SetBindingValueByIndex(1, SymbolId);
+		const ESQLitePreparedStatementStepResult FileResult = FileStmt.Step();
+		if (FileResult == ESQLitePreparedStatementStepResult::Error)
+		{
+			MarkOperationErrorLocked(TEXT("InsertDeprecation: file ownership lookup failed"));
+			return;
+		}
+		if (FileResult == ESQLitePreparedStatementStepResult::Row)
+		{
+			FileStmt.GetColumnValueByIndex(0, FileId);
+		}
+	}
 
 	FSQLitePreparedStatement Stmt;
-	Stmt.Create(*Database,
-		TEXT("INSERT INTO symbol_deprecations (symbol_id, symbol_name, version, message, kind) ")
-		TEXT("VALUES (?, ?, ?, ?, ?);"));
+	if (!Stmt.Create(*Database,
+		TEXT("INSERT INTO symbol_deprecations (symbol_id, file_id, symbol_name, version, message, kind) ")
+		TEXT("VALUES (?, ?, ?, ?, ?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertDeprecation: prepare insert"));
+		return;
+	}
 
-	// symbol_id — bind NULL if 0 (class-body methods have no symbols row)
+	// Nullable ownership links intentionally remain NULL when the caller has no
+	// source file. The native indexer always supplies FileId for class-body rows.
 	if (SymbolId != 0)
 	{
 		Stmt.SetBindingValueByIndex(1, SymbolId);
 	}
-	// else: leave unbound — SQLite defaults to NULL
+	if (FileId != 0)
+	{
+		Stmt.SetBindingValueByIndex(2, FileId);
+	}
+	Stmt.SetBindingValueByIndex(3, SymbolName);
+	Stmt.SetBindingValueByIndex(4, Version);
+	Stmt.SetBindingValueByIndex(5, Message);
+	Stmt.SetBindingValueByIndex(6, Kind);
+	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("InsertDeprecation: insert failed"));
+	}
+}
 
-	Stmt.SetBindingValueByIndex(2, SymbolName);
-	Stmt.SetBindingValueByIndex(3, Version);
-	Stmt.SetBindingValueByIndex(4, Message);
-	Stmt.SetBindingValueByIndex(5, Kind);
-	Stmt.Step();
+void FMonolithSourceDatabase::InsertDeprecation(int64 SymbolId, int64 FileId, const FString& SymbolName, const FString& Version, const FString& Message, const FString& Kind)
+{
+	FScopeLock Lock(&DbLock);
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("InsertDeprecation: database unavailable"));
+		return;
+	}
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*Database,
+		TEXT("INSERT INTO symbol_deprecations (symbol_id, file_id, symbol_name, version, message, kind) ")
+		TEXT("VALUES (?, ?, ?, ?, ?, ?);")))
+	{
+		MarkOperationErrorLocked(TEXT("InsertDeprecation: prepare insert"));
+		return;
+	}
+
+	// Nullable links are represented by unbound SQLite parameters (NULL).
+	if (SymbolId != 0)
+	{
+		Stmt.SetBindingValueByIndex(1, SymbolId);
+	}
+	if (FileId != 0)
+	{
+		Stmt.SetBindingValueByIndex(2, FileId);
+	}
+	Stmt.SetBindingValueByIndex(3, SymbolName);
+	Stmt.SetBindingValueByIndex(4, Version);
+	Stmt.SetBindingValueByIndex(5, Message);
+	Stmt.SetBindingValueByIndex(6, Kind);
+	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Error)
+	{
+		MarkOperationErrorLocked(TEXT("InsertDeprecation: insert failed"));
+	}
 }
 
 TOptional<FMonolithDeprecationRow> FMonolithSourceDatabase::GetDeprecation(const FString& SymbolName)
@@ -1353,7 +1848,7 @@ TOptional<FMonolithDeprecationRow> FMonolithSourceDatabase::GetDeprecation(const
 	if (!Database || !Database->IsValid()) return {};
 
 	FSQLitePreparedStatement Stmt;
-	Stmt.Create(*Database, TEXT("SELECT version, message, kind FROM symbol_deprecations WHERE symbol_name = ? LIMIT 1;"));
+	Stmt.Create(*Database, TEXT("SELECT version, message, kind FROM symbol_deprecations WHERE symbol_name = ? ORDER BY (file_id IS NULL) ASC, file_id DESC, id DESC;"));
 	Stmt.SetBindingValueByIndex(1, SymbolName);
 
 	if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
@@ -1375,7 +1870,7 @@ TMap<FString, FMonolithDeprecationRow> FMonolithSourceDatabase::GetDeprecationsB
 
 	// One prepared statement reused per name — symbol counts are typically small.
 	FSQLitePreparedStatement Stmt;
-	Stmt.Create(*Database, TEXT("SELECT version, message, kind FROM symbol_deprecations WHERE symbol_name = ? LIMIT 1;"));
+	Stmt.Create(*Database, TEXT("SELECT version, message, kind FROM symbol_deprecations WHERE symbol_name = ? ORDER BY (file_id IS NULL) ASC, file_id DESC, id DESC;"));
 
 	for (const FString& Name : SymbolNames)
 	{

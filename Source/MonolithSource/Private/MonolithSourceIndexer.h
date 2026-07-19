@@ -45,6 +45,8 @@ public:
 	void RequestStop();
 
 	bool IsRunning() const;
+	bool WasCancelled() const { return bWasCancelled; }
+	int32 GetDiscoveredFiles() const { return TotalFilesDiscovered.Load(); }
 
 	/** Thread-safe — locks DiagLock before reading. */
 	FSourceIndexDiagnostics GetDiagnostics() const;
@@ -71,7 +73,7 @@ private:
 	void IndexModule(const FModuleEntry& Module, FMonolithSourceDatabase& DB);
 	int32 IndexCppFile(const FString& FilePath, int64 ModuleId, FMonolithSourceDatabase& DB);
 	int32 IndexShaderFile(const FString& FilePath, int64 ModuleId, FMonolithSourceDatabase& DB);
-	void Finalize(FMonolithSourceDatabase& DB);
+	bool Finalize(FMonolithSourceDatabase& DB);
 
 	// Symbol tracking (accumulated during indexing)
 	void UpdateSymbolMap(const FString& Name, int64 SymId, int32 LineStart, int32 LineEnd);
@@ -88,6 +90,7 @@ private:
 	// Thread state
 	FThreadSafeBool bShouldStop;
 	FThreadSafeBool bIsRunning;
+	FThreadSafeBool bWasCancelled;
 	FRunnableThread* Thread = nullptr;
 
 	// Symbol maps
@@ -102,6 +105,7 @@ private:
 	mutable FCriticalSection DiagLock;
 	FSourceIndexDiagnostics Diagnostics;
 	TAtomic<int32> TotalFilesProcessed{0};
+	TAtomic<int32> TotalFilesDiscovered{0};
 	TAtomic<int32> TotalSymbolsExtracted{0};
 	TAtomic<int32> TotalErrors{0};
 };

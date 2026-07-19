@@ -111,6 +111,7 @@ private:
 	static FMonolithActionResult HandleReadFile(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleTriggerReindex(const TSharedPtr<FJsonObject>& Params);
 	static FMonolithActionResult HandleTriggerProjectReindex(const TSharedPtr<FJsonObject>& Params);
+	static FMonolithActionResult HandleGetIndexStatus(const TSharedPtr<FJsonObject>& Params);
 
 	// Phase 1 — demand-proven lookups (LLM C++ authoring ergonomics)
 	static FMonolithActionResult HandleGetIncludePath(const TSharedPtr<FJsonObject>& Params);    // item 1
