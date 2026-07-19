@@ -25,8 +25,7 @@ namespace
 {
 	// Recursively walk a Slate widget subtree, appending the text of every STextBlock
 	// found to OutText (newline-joined). Best-effort and depth-bounded so a pathological
-	// tree can't stall the broadcast. The broadcasting thread is the game thread; this
-	// runs before the modal's nested loop starts.
+	// tree can't stall the first modal-loop tick.
 	void HarvestTextBlocks(const TSharedPtr<SWidget>& Widget, FString& OutText, int32 Depth)
 	{
 		if (!Widget.IsValid() || Depth > 12)
@@ -88,17 +87,55 @@ void FMonolithEditorModule::StartupModule()
 	const int32 EditorActionCount = FMonolithToolRegistry::Get().GetActions(TEXT("editor")).Num();
 	UE_LOG(LogMonolith, Log, TEXT("Monolith — Editor module loaded (%d editor actions)"), EditorActionCount);
 
-	// PART C — subscribe to the pre-Slate-modal broadcast so we can log modal context
-	// just before the blocking nested loop starves the in-process MCP server.
+	// PART C — classify modal events before the nested loop, then harvest genuine
+	// blocking modal context on the first modal-loop tick after Slate has registered
+	// the incoming window. Never scrape the unrelated active editor window.
 #if WITH_EDITOR
-	PreSlateModalHandle = FCoreDelegates::PreSlateModal.AddRaw(this, &FMonolithEditorModule::OnPreSlateModal);
+	if (FSlateApplication::IsInitialized())
+	{
+		ModalLoopTickHandle = FSlateApplication::Get().GetOnModalLoopTickEvent().AddRaw(
+			this, &FMonolithEditorModule::OnModalLoopTick);
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
+		PreSlateModalHandle = FCoreDelegates::PreSlateModalWithContext.AddRaw(
+			this, &FMonolithEditorModule::OnPreSlateModal);
+#else
+		PreSlateModalHandle = FCoreDelegates::PreSlateModal.AddRaw(this, &FMonolithEditorModule::OnPreSlateModal);
+#endif
+	}
 #endif
 }
 
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
+void FMonolithEditorModule::OnPreSlateModal(const FCoreDelegates::FModalWindowContext& Context)
+{
+	if (Context.bIsSlowTaskWindow.Get(false))
+	{
+		UE_LOG(LogMonolith, Display,
+			TEXT("SLOW_TASK_OPEN ts='%s' blocking=false action='wait_for_completion' — transient progress window; no dismissal is required."),
+			*FDateTime::Now().ToString(TEXT("%Y-%m-%dT%H:%M:%S")));
+		return;
+	}
+
+	bBlockingModalLogPending = true;
+}
+#else
 void FMonolithEditorModule::OnPreSlateModal()
 {
-	// Always emit at least a timestamped "modal opening" line — text extraction below
-	// is best-effort (the window may not yet be on the modal stack at broadcast time).
+	// UE 5.7 has no slow-task classification. Defer capture until the first modal
+	// loop tick so the actual modal window is on Slate's active-modal stack.
+	bBlockingModalLogPending = true;
+}
+#endif
+
+void FMonolithEditorModule::OnModalLoopTick(float DeltaTime)
+{
+	(void)DeltaTime;
+	if (!bBlockingModalLogPending)
+	{
+		return;
+	}
+
+	bBlockingModalLogPending = false;
 	FString Title;
 	FString Text;
 
@@ -106,10 +143,6 @@ void FMonolithEditorModule::OnPreSlateModal()
 	{
 		FSlateApplication& Slate = FSlateApplication::Get();
 		TSharedPtr<SWindow> Window = Slate.GetActiveModalWindow();
-		if (!Window.IsValid())
-		{
-			Window = Slate.GetActiveTopLevelWindow();
-		}
 		if (Window.IsValid())
 		{
 			Title = Window->GetTitle().ToString();
@@ -118,7 +151,7 @@ void FMonolithEditorModule::OnPreSlateModal()
 	}
 
 	UE_LOG(LogMonolith, Warning,
-		TEXT("MODAL_OPEN ts='%s' title='%s' text='%s' — game thread is about to enter a blocking modal loop; MCP will be unresponsive until dismissed."),
+		TEXT("MODAL_OPEN ts='%s' title='%s' text='%s' — game thread is in a blocking modal loop; MCP will be unresponsive until dismissed."),
 		*FDateTime::Now().ToString(TEXT("%Y-%m-%dT%H:%M:%S")), *Title, *Text);
 }
 
@@ -127,8 +160,17 @@ void FMonolithEditorModule::ShutdownModule()
 #if WITH_EDITOR
 	if (PreSlateModalHandle.IsValid())
 	{
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
+		FCoreDelegates::PreSlateModalWithContext.Remove(PreSlateModalHandle);
+#else
 		FCoreDelegates::PreSlateModal.Remove(PreSlateModalHandle);
+#endif
 		PreSlateModalHandle.Reset();
+	}
+	if (ModalLoopTickHandle.IsValid() && FSlateApplication::IsInitialized())
+	{
+		FSlateApplication::Get().GetOnModalLoopTickEvent().Remove(ModalLoopTickHandle);
+		ModalLoopTickHandle.Reset();
 	}
 #endif
 

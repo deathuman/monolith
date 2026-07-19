@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Misc/CoreDelegates.h"
+#include "Misc/EngineVersionComparison.h"
 #include "Modules/ModuleManager.h"
 #include "Delegates/IDelegateInstance.h"
 
@@ -14,13 +16,17 @@ public:
 private:
 	FMonolithLogCapture* LogCapture = nullptr;
 
-	// PART C — passive modal watcher. Subscribed to FCoreDelegates::PreSlateModal so
-	// that, right before a blocking Slate modal runs its nested game-thread loop (which
-	// starves the in-process MCP HTTP server), we emit a structured log line. An external
-	// agent tailing the log can recover the modal's context mid-hang to decide kill/relaunch.
+	// PART C — passive modal watcher. UE 5.8+ classifies slow-task windows before
+	// they enter their nested loop; genuine blocking modals are harvested on the
+	// first modal-loop tick, after Slate has pushed the actual window onto its stack.
 	FDelegateHandle PreSlateModalHandle;
+	FDelegateHandle ModalLoopTickHandle;
+	bool bBlockingModalLogPending = false;
 
-	// Best-effort harvest of the about-to-open modal's title + message text, then emit
-	// the MODAL_OPEN log line. Always emits at least a timestamped "modal opening" line.
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
+	void OnPreSlateModal(const FCoreDelegates::FModalWindowContext& Context);
+#else
 	void OnPreSlateModal();
+#endif
+	void OnModalLoopTick(float DeltaTime);
 };

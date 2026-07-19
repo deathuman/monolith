@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Transient editor slow tasks no longer masquerade as blocking dialogs.** On UE 5.8+, the modal watcher classifies slow-task windows as informational and harvests genuine blocking dialogs on the first modal-loop tick, after Slate has registered the actual window. UE 5.7 retains the legacy hook while using the same deferred capture.
 - **Montage authoring now reports duration immediately.** New segments initialize their cached length, and montage builders refresh linkable elements and composite length before returning so same-session callers can validate the authored result.
 - **Optional-plugin detection no longer false-positives on plugins sharing a name prefix** (e.g. `BlueprintRetarget` was wrongly detected as BlueprintAssist, hard-linking an absent module and breaking the user's build). Tightened the disk-presence globs in MonolithBABridge/MonolithGAS/MonolithLogicDriver/MonolithComboGraph from truncated prefixes (`Blueprin*`, `Gameplaya*`, `LogicDri*`, `ComboGra*`) to full plugin names (`BlueprintAssist*`, `GameplayAbilities*`, `LogicDriver*`, `ComboGraph*`); the trailing `*` still matches versioned install folders. Reported by @k-s-s (#66).
 
