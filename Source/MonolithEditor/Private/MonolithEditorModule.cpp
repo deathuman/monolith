@@ -203,7 +203,7 @@ void FMonolithEditorModule::OnPostSlateModal(const FCoreDelegates::FModalWindowC
 #else
 void FMonolithEditorModule::OnPostSlateModal()
 {
-	UE_LOG(LogMonolith, Warning,
+	UE_LOG(LogMonolith, Display,
 		TEXT("MODAL_CLOSE ts='%s' id=0 slow_task=unknown title='' open_age_s=unknown — modal dismissed; game thread resumed."),
 		*FDateTime::Now().ToString(TEXT("%Y-%m-%dT%H:%M:%S")));
 }

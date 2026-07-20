@@ -1184,19 +1184,13 @@ uint32 UMonolithIndexSubsystem::FIndexingTask::Run()
 
 	UE_LOG(LogMonolithIndex, Log, TEXT("Post-pass indexers complete"));
 
-	// Write index timestamp to meta (only if not cancelled and asset count looks valid)
+	// The enumeration above explicitly calls SearchAllAssets + WaitForCompletion on the
+	// Asset Registry, so a small project is still a complete index. The former fixed
+	// 500-asset threshold caused valid small projects to re-index on every launch.
 	if (!bShouldStop)
 	{
-		constexpr int32 MinAssetCountThreshold = 500;
-		if (Indexed < MinAssetCountThreshold)
-		{
-			UE_LOG(LogMonolithIndex, Warning, TEXT("Index only found %d assets — Asset Registry may not have been fully loaded. Skipping last_full_index write so next launch will re-index."), Indexed);
-		}
-		else
-		{
-			DB->WriteMeta(TEXT("last_full_index"), FDateTime::UtcNow().ToString());
-			UE_LOG(LogMonolithIndex, Log, TEXT("Wrote last_full_index timestamp (%d assets indexed)"), Indexed);
-		}
+		DB->WriteMeta(TEXT("last_full_index"), FDateTime::UtcNow().ToString());
+		UE_LOG(LogMonolithIndex, Log, TEXT("Wrote last_full_index timestamp (%d assets indexed)"), Indexed);
 	}
 
 	if (bLogMemory)
