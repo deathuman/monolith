@@ -196,7 +196,7 @@ void FMonolithEditorModule::OnPostSlateModal(const FCoreDelegates::FModalWindowC
 		OpenModals.Remove(Id);
 	}
 
-	UE_LOG(LogMonolith, Warning,
+	UE_LOG(LogMonolith, Display,
 		TEXT("MODAL_CLOSE ts='%s' id=%lld slow_task=%s title='%s' open_age_s=%s — modal dismissed; game thread resumed."),
 		*FDateTime::Now().ToString(TEXT("%Y-%m-%dT%H:%M:%S")), Id, *SlowTask, *Title, *OpenAge);
 }
