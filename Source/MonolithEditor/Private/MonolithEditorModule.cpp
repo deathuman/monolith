@@ -14,6 +14,7 @@
 
 // PART C — passive modal watcher.
 #include "Misc/CoreDelegates.h"
+#include "Misc/EngineVersionComparison.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Widgets/SWindow.h"
 #include "Widgets/Text/STextBlock.h"
@@ -87,19 +88,20 @@ void FMonolithEditorModule::StartupModule()
 	const int32 EditorActionCount = FMonolithToolRegistry::Get().GetActions(TEXT("editor")).Num();
 	UE_LOG(LogMonolith, Log, TEXT("Monolith — Editor module loaded (%d editor actions)"), EditorActionCount);
 
-	// PART C — classify modal events before the nested loop, then harvest genuine
-	// blocking modal context on the first modal-loop tick after Slate has registered
-	// the incoming window. Never scrape the unrelated active editor window.
+	// PART C — classify slow tasks before the nested loop, defer genuine modal
+	// harvesting until Slate has registered the incoming window, and emit paired
+	// MODAL_OPEN/MODAL_CLOSE records with the upstream window identity.
 #if WITH_EDITOR
 	if (FSlateApplication::IsInitialized())
 	{
 		ModalLoopTickHandle = FSlateApplication::Get().GetOnModalLoopTickEvent().AddRaw(
 			this, &FMonolithEditorModule::OnModalLoopTick);
 #if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
-		PreSlateModalHandle = FCoreDelegates::PreSlateModalWithContext.AddRaw(
-			this, &FMonolithEditorModule::OnPreSlateModal);
+		PreSlateModalHandle = FCoreDelegates::PreSlateModalWithContext.AddRaw(this, &FMonolithEditorModule::OnPreSlateModal);
+		PostSlateModalHandle = FCoreDelegates::PostSlateModalWithContext.AddRaw(this, &FMonolithEditorModule::OnPostSlateModal);
 #else
 		PreSlateModalHandle = FCoreDelegates::PreSlateModal.AddRaw(this, &FMonolithEditorModule::OnPreSlateModal);
+		PostSlateModalHandle = FCoreDelegates::PostSlateModal.AddRaw(this, &FMonolithEditorModule::OnPostSlateModal);
 #endif
 	}
 #endif
@@ -108,15 +110,24 @@ void FMonolithEditorModule::StartupModule()
 #if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
 void FMonolithEditorModule::OnPreSlateModal(const FCoreDelegates::FModalWindowContext& Context)
 {
-	if (Context.bIsSlowTaskWindow.Get(false))
+	const int64 Id = static_cast<int64>(Context.WindowIdentifier);
+	const bool bSlowTask = Context.bIsSlowTaskWindow.Get(false);
+	FOpenModalRecord Record;
+	Record.SlowTask = bSlowTask ? TEXT("true") : TEXT("false");
+	Record.OpenedAt = FDateTime::Now();
+	OpenModals.Add(Id, Record);
+
+	if (bSlowTask)
 	{
 		UE_LOG(LogMonolith, Display,
 			TEXT("SLOW_TASK_OPEN ts='%s' blocking=false action='wait_for_completion' — transient progress window; no dismissal is required."),
-			*FDateTime::Now().ToString(TEXT("%Y-%m-%dT%H:%M:%S")));
+			*Record.OpenedAt.ToString(TEXT("%Y-%m-%dT%H:%M:%S")));
 		return;
 	}
 
-	bBlockingModalLogPending = true;
+	// Do not inspect Slate here: the incoming genuine modal is not reliably on the
+	// active-modal stack until the first modal-loop tick.
+	PendingModalIdentifiers.Add(Id);
 }
 #else
 void FMonolithEditorModule::OnPreSlateModal()
@@ -130,15 +141,24 @@ void FMonolithEditorModule::OnPreSlateModal()
 void FMonolithEditorModule::OnModalLoopTick(float DeltaTime)
 {
 	(void)DeltaTime;
+	int64 Id = 0;
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
+	if (PendingModalIdentifiers.Num() == 0)
+	{
+		return;
+	}
+	Id = PendingModalIdentifiers[0];
+	PendingModalIdentifiers.RemoveAt(0);
+#else
 	if (!bBlockingModalLogPending)
 	{
 		return;
 	}
-
 	bBlockingModalLogPending = false;
+#endif
+
 	FString Title;
 	FString Text;
-
 	if (FSlateApplication::IsInitialized())
 	{
 		FSlateApplication& Slate = FSlateApplication::Get();
@@ -150,10 +170,44 @@ void FMonolithEditorModule::OnModalLoopTick(float DeltaTime)
 		}
 	}
 
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
+	if (FOpenModalRecord* Record = OpenModals.Find(Id))
+	{
+		Record->Title = Title;
+	}
+#endif
 	UE_LOG(LogMonolith, Warning,
-		TEXT("MODAL_OPEN ts='%s' title='%s' text='%s' — game thread is in a blocking modal loop; MCP will be unresponsive until dismissed."),
-		*FDateTime::Now().ToString(TEXT("%Y-%m-%dT%H:%M:%S")), *Title, *Text);
+		TEXT("MODAL_OPEN ts='%s' id=%lld slow_task=false title='%s' text='%s' — game thread is in a blocking modal loop; MCP will be unresponsive until dismissed."),
+		*FDateTime::Now().ToString(TEXT("%Y-%m-%dT%H:%M:%S")), Id, *Title, *Text);
 }
+
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
+void FMonolithEditorModule::OnPostSlateModal(const FCoreDelegates::FModalWindowContext& Context)
+{
+	const int64 Id = static_cast<int64>(Context.WindowIdentifier);
+	FString Title;
+	FString SlowTask = TEXT("unknown");
+	FString OpenAge = TEXT("unknown");
+	if (const FOpenModalRecord* Record = OpenModals.Find(Id))
+	{
+		Title = Record->Title;
+		SlowTask = Record->SlowTask;
+		OpenAge = FString::Printf(TEXT("%.1f"), (FDateTime::Now() - Record->OpenedAt).GetTotalSeconds());
+		OpenModals.Remove(Id);
+	}
+
+	UE_LOG(LogMonolith, Warning,
+		TEXT("MODAL_CLOSE ts='%s' id=%lld slow_task=%s title='%s' open_age_s=%s — modal dismissed; game thread resumed."),
+		*FDateTime::Now().ToString(TEXT("%Y-%m-%dT%H:%M:%S")), Id, *SlowTask, *Title, *OpenAge);
+}
+#else
+void FMonolithEditorModule::OnPostSlateModal()
+{
+	UE_LOG(LogMonolith, Warning,
+		TEXT("MODAL_CLOSE ts='%s' id=0 slow_task=unknown title='' open_age_s=unknown — modal dismissed; game thread resumed."),
+		*FDateTime::Now().ToString(TEXT("%Y-%m-%dT%H:%M:%S")));
+}
+#endif
 
 void FMonolithEditorModule::ShutdownModule()
 {
@@ -167,11 +221,26 @@ void FMonolithEditorModule::ShutdownModule()
 #endif
 		PreSlateModalHandle.Reset();
 	}
+	if (PostSlateModalHandle.IsValid())
+	{
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
+		FCoreDelegates::PostSlateModalWithContext.Remove(PostSlateModalHandle);
+#else
+		FCoreDelegates::PostSlateModal.Remove(PostSlateModalHandle);
+#endif
+		PostSlateModalHandle.Reset();
+	}
 	if (ModalLoopTickHandle.IsValid() && FSlateApplication::IsInitialized())
 	{
 		FSlateApplication::Get().GetOnModalLoopTickEvent().Remove(ModalLoopTickHandle);
 		ModalLoopTickHandle.Reset();
 	}
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
+	OpenModals.Empty();
+	PendingModalIdentifiers.Empty();
+#else
+	bBlockingModalLogPending = false;
+#endif
 #endif
 
 	// Gap 4: drop the PIE-end hook + any residual held-rotation / repeated-input / spectator state.

@@ -98,6 +98,11 @@ static const TMap<FString, FNodeAlias>& GetNodeAliases()
 		// SpawnActorFromClass aliases
 		Aliases.Add(TEXT("spawn_actor"),    {TEXT("SpawnActorFromClass"), {}});
 		Aliases.Add(TEXT("spawn"),          {TEXT("SpawnActorFromClass"), {}});
+		// Bare "SpawnActor" must NOT reach the generic fallback: it resolves to the LEGACY
+		// UK2Node_SpawnActor, whose GetNodeTitle() null-derefs on an unconfigured node
+		// (BlueprintPin->DefaultObject->GetName() with no null check, K2Node_SpawnActor.cpp:284)
+		// — an editor-killing EXCEPTION_ACCESS_VIOLATION at 0x18.
+		Aliases.Add(TEXT("spawnactor"),     {TEXT("SpawnActorFromClass"), {}});
 
 		// DynamicCast aliases
 		Aliases.Add(TEXT("cast"),           {TEXT("DynamicCast"), {}});
@@ -617,6 +622,7 @@ void FMonolithBlueprintNodeActions::RegisterActions(FMonolithToolRegistry& Regis
 			.Required(TEXT("operations"),          TEXT("array"),   TEXT("Array of operation objects: { op, ...params }"))
 			.Optional(TEXT("compile_on_complete"), TEXT("boolean"), TEXT("Compile the Blueprint after all operations complete (default: false)"))
 			.Optional(TEXT("stop_on_error"),       TEXT("boolean"), TEXT("Stop processing on first failed operation (default: false)"))
+			.Optional(TEXT("graph_name"),          TEXT("string"),  TEXT("Default graph for all operations; an op's own graph_name overrides it (default: the EventGraph)"))
 			.Build());
 
 	// ---- Wave 4 ----
@@ -1488,7 +1494,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddNode(const TShared
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
 
-	TSharedPtr<FJsonObject> Root = MonolithBlueprintInternal::SerializeNode(NewNode);
+	TSharedPtr<FJsonObject> Root = MonolithBlueprintInternal::SerializeNode(NewNode, bGenericFallback);
 	Root->SetStringField(TEXT("asset_path"), AssetPath);
 	Root->SetStringField(TEXT("graph"), Graph->GetName());
 	if (bGenericFallback)
@@ -2251,6 +2257,13 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TS
 	bool bCompileOnComplete = false;
 	Params->TryGetBoolField(TEXT("compile_on_complete"), bCompileOnComplete);
 
+	// A top-level graph_name applies to every op that doesn't specify its own.
+	// Previously it was silently dropped (unknown-param warning) while every graph op
+	// ran against the default EventGraph — which has severed function bodies whose
+	// author believed the ops were targeting the named function graph.
+	FString TopLevelGraphName;
+	Params->TryGetStringField(TEXT("graph_name"), TopLevelGraphName);
+
 	GEditor->BeginTransaction(NSLOCTEXT("Monolith", "BPBatchExec", "BP Batch Execute"));
 
 	TArray<TSharedPtr<FJsonValue>> Results;
@@ -2297,6 +2310,10 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleBatchExecute(const TS
 		for (auto& Pair : Op->Values)
 		{
 			SubParams->SetField(Pair.Key, Pair.Value);
+		}
+		if (!TopLevelGraphName.IsEmpty() && !SubParams->HasField(TEXT("graph_name")))
+		{
+			SubParams->SetStringField(TEXT("graph_name"), TopLevelGraphName);
 		}
 
 		FMonolithActionResult SubResult = FMonolithActionResult::Error(FString::Printf(TEXT("Unknown op: %s"), *OpName));
@@ -2432,6 +2449,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 	}
 
 	TArray<FString> Warnings;
+	bool bGenericFallback = false;
 
 	// Create a transient Blueprint + graph so AllocateDefaultPins() can find an
 	// owning Blueprint via the outer chain.  Without this, nodes like
@@ -2682,6 +2700,26 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 			OwnerClass, DelegateProp, bSelfContext);
 		if (!Resolved.bSuccess) return Resolved;
 
+		// Delegate-node pins are not built from DelegateProp directly: AllocateDefaultPins
+		// RE-resolves the member reference against the node's owning Blueprint class
+		// (UK2Node::GetBlueprintClassFromNode). Against the dummy Actor TempBP the
+		// self-context lookup finds no such delegate, so the node silently allocates
+		// only its base pins (execute/then/self) — every signature parameter is dropped
+		// and self types as plain Actor. Point the transient BP at the real owner so
+		// the dry-run resolves the same signature a real add_node would; prefer the
+		// owner's skeleton class so just-edited signature params are visible before
+		// a full compile, matching in-graph node behavior.
+		TempBP->ParentClass = OwnerClass;
+		TempBP->GeneratedClass = OwnerClass;
+		TempBP->SkeletonGeneratedClass = OwnerClass;
+		if (UBlueprint* OwnerBP = Cast<UBlueprint>(OwnerClass->ClassGeneratedBy))
+		{
+			if (OwnerBP->SkeletonGeneratedClass)
+			{
+				TempBP->SkeletonGeneratedClass = OwnerBP->SkeletonGeneratedClass;
+			}
+		}
+
 		if (NodeType == TEXT("AddDelegate"))
 		{
 			UK2Node_AddDelegate* N = NewObject<UK2Node_AddDelegate>(TempGraph);
@@ -2726,6 +2764,7 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 			UK2Node* GenericNode = NewObject<UK2Node>(TempGraph, NodeClass);
 			GenericNode->AllocateDefaultPins();
 			Node = GenericNode;
+			bGenericFallback = true;
 			Warnings.Add(TEXT("Resolved via generic K2Node fallback — pins may differ in actual Blueprint context"));
 		}
 		else
@@ -2790,7 +2829,12 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleResolveNode(const TSh
 	{
 		Root->SetStringField(TEXT("resolved_function_class"), ResolvedClass);
 	}
-	Root->SetStringField(TEXT("node_title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+	// Generic-fallback nodes are unconfigured; some legacy node classes crash in
+	// GetNodeTitle() on unconfigured state (UK2Node_SpawnActor null-derefs its
+	// Blueprint pin's DefaultObject). Report the class name for those instead.
+	Root->SetStringField(TEXT("node_title"), bGenericFallback
+		? Node->GetClass()->GetName()
+		: Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 	Root->SetArrayField(TEXT("pins"), PinsArr);
 	Root->SetNumberField(TEXT("pin_count"), PinsArr.Num());
 
@@ -4200,9 +4244,13 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(cons
 	Template->Modify();
 
 	FString CreatedType;
+	FTTTrackId NewTrackId;
 
 	if (TrackTypeStr.Equals(TEXT("float"), ESearchCase::IgnoreCase))
 	{
+		NewTrackId.TrackType = FTTTrackBase::TT_FloatInterp;
+		NewTrackId.TrackIndex = Template->FloatTracks.Num();
+
 		FTTFloatTrack NewTrack;
 		NewTrack.SetTrackName(TrackName, Template);
 		NewTrack.CurveFloat = NewObject<UCurveFloat>(OwnerClass, NAME_None, RF_Public);
@@ -4211,6 +4259,9 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(cons
 	}
 	else if (TrackTypeStr.Equals(TEXT("vector"), ESearchCase::IgnoreCase))
 	{
+		NewTrackId.TrackType = FTTTrackBase::TT_VectorInterp;
+		NewTrackId.TrackIndex = Template->VectorTracks.Num();
+
 		FTTVectorTrack NewTrack;
 		NewTrack.SetTrackName(TrackName, Template);
 		NewTrack.CurveVector = NewObject<UCurveVector>(OwnerClass, NAME_None, RF_Public);
@@ -4219,6 +4270,9 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(cons
 	}
 	else if (TrackTypeStr.Equals(TEXT("event"), ESearchCase::IgnoreCase))
 	{
+		NewTrackId.TrackType = FTTTrackBase::TT_Event;
+		NewTrackId.TrackIndex = Template->EventTracks.Num();
+
 		FTTEventTrack NewTrack;
 		NewTrack.SetTrackName(TrackName, Template);
 		NewTrack.CurveKeys = NewObject<UCurveFloat>(OwnerClass, NAME_None, RF_Public);
@@ -4228,6 +4282,9 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(cons
 	}
 	else if (TrackTypeStr.Equals(TEXT("color"), ESearchCase::IgnoreCase))
 	{
+		NewTrackId.TrackType = FTTTrackBase::TT_LinearColorInterp;
+		NewTrackId.TrackIndex = Template->LinearColorTracks.Num();
+
 		FTTLinearColorTrack NewTrack;
 		NewTrack.SetTrackName(TrackName, Template);
 		NewTrack.CurveLinearColor = NewObject<UCurveLinearColor>(OwnerClass, NAME_None, RF_Public);
@@ -4240,12 +4297,40 @@ FMonolithActionResult FMonolithBlueprintNodeActions::HandleAddTimelineTrack(cons
 			TEXT("Unknown track_type '%s'. Must be: float, vector, event, or color"), *TrackTypeStr));
 	}
 
-	FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+	// K2Node_Timeline::AllocateDefaultPins creates track pins from the template's
+	// DISPLAY track list (GetNumDisplayTracks/GetDisplayTrackId), not the raw track
+	// arrays — a track that is never registered there produces no pin, ever.
+	// Mirrors STimelineEditor::CreateNewTrack.
+	Template->AddDisplayTrack(NewTrackId);
+
+	// The K2Node_Timeline in the event graph only surfaces the new track's output pin
+	// after ReconstructNode() — pins regenerate from the template's track arrays in
+	// AllocateDefaultPins. Without this the track data exists but the pin never appears,
+	// and connect_pins to it fails.
+	int32 NodesReconstructed = 0;
+	TArray<UEdGraph*> AllGraphs;
+	BP->GetAllGraphs(AllGraphs);
+	for (UEdGraph* G : AllGraphs)
+	{
+		if (!G) continue;
+		for (UEdGraphNode* GNode : G->Nodes)
+		{
+			UK2Node_Timeline* TLNode = Cast<UK2Node_Timeline>(GNode);
+			if (TLNode && TLNode->TimelineName.ToString() == TimelineName)
+			{
+				TLNode->ReconstructNode();
+				++NodesReconstructed;
+			}
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
 
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("timeline_name"), TimelineName);
 	Root->SetStringField(TEXT("track_name"), TrackNameStr);
 	Root->SetStringField(TEXT("track_type"), CreatedType);
+	Root->SetNumberField(TEXT("nodes_reconstructed"), NodesReconstructed);
 	return FMonolithActionResult::Success(Root);
 }
 
