@@ -26,10 +26,20 @@ public:
 	/** Get the source database (read-only). May be null if DB doesn't exist. */
 	FMonolithSourceDatabase* GetDatabase() { return Database.IsValid() ? Database.Get() : nullptr; }
 
-	/** Full reindex: engine + shaders + project source (clean build). Returns false when startup is rejected. */
+	/**
+	 * Full reindex: engine + shaders + project source (clean build).
+	 * @return true if a run was actually started. False means nothing is
+	 *         happening — a run is already in flight, or the worker thread
+	 *         could not be created.
+	 */
 	bool TriggerReindex();
 
-	/** Incremental project-only reindex: loads preserved engine symbols, indexes only project C++ source. */
+	/**
+	 * Incremental project-only reindex: loads existing engine symbols, indexes only project C++ source.
+	 * @return true if a run was actually started. False means nothing is
+	 *         happening — a run is already in flight, the engine DB is missing,
+	 *         or the worker thread could not be created.
+	 */
 	bool TriggerProjectReindex();
 
 	/** Is indexing currently running? */
@@ -68,6 +78,13 @@ private:
 	TUniquePtr<FMonolithSourceDatabase> Database;
 	FMonolithSourceIndexer* Indexer = nullptr;
 	TAtomic<bool> bIsIndexing{false};
+
+	/**
+	 * Set at the top of Deinitialize(). A completion callback already queued on
+	 * the game thread cannot be cancelled, so it re-checks this before touching
+	 * the database.
+	 */
+	TAtomic<bool> bIsShuttingDown{false};
 
 	/** F17: Handle into FCoreUObjectDelegates::ReloadCompleteDelegate; cleared on Deinitialize. */
 	FDelegateHandle ReloadCompleteHandle;

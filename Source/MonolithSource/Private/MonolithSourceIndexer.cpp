@@ -72,7 +72,14 @@ bool FMonolithSourceIndexer::StartAsync()
 {
 	if (bIsRunning) return false;
 	Thread = FRunnableThread::Create(this, TEXT("MonolithSourceIndexer"), 0, TPri_BelowNormal);
-	return Thread != nullptr;
+	if (!Thread)
+	{
+		// Run() will never execute, so nothing else would ever broadcast. Without
+		// this the caller's bIsIndexing stays set forever.
+		CompleteRun(TEXT("Failed to create the indexing thread"));
+		return false;
+	}
+	return true;
 }
 
 bool FMonolithSourceIndexer::RunSynchronous()
@@ -120,9 +127,7 @@ uint32 FMonolithSourceIndexer::Run()
 	FMonolithSourceDatabase DB;
 	if (!DB.OpenForWriting(DbPath))
 	{
-		UE_LOG(LogMonolithSource, Error, TEXT("Indexer: Failed to open DB for writing: %s"), *DbPath);
-		bIsRunning = false;
-		OnComplete.Broadcast(0, 0, 1);
+		CompleteRun(*FString::Printf(TEXT("Failed to open DB for writing: %s"), *DbPath));
 		return 1;
 	}
 	DB.ClearOperationError();
@@ -131,10 +136,8 @@ uint32 FMonolithSourceIndexer::Run()
 	{
 		if (!DB.ResetDatabase() || DB.HasOperationError())
 		{
-			UE_LOG(LogMonolithSource, Error, TEXT("Indexer: failed to reset database"));
 			DB.Close();
-			bIsRunning = false;
-			OnComplete.Broadcast(0, 0, 1);
+			CompleteRun(TEXT("Failed to reset database"));
 			return 1;
 		}
 	}
@@ -142,10 +145,8 @@ uint32 FMonolithSourceIndexer::Run()
 	{
 		if (!DB.CreateTablesIfNeeded() || DB.HasOperationError() || DB.RequiresFullReindex())
 		{
-			UE_LOG(LogMonolithSource, Error, TEXT("Indexer: database schema is incompatible; run a full source.trigger_reindex first"));
 			DB.Close();
-			bIsRunning = false;
-			OnComplete.Broadcast(0, 0, 1);
+			CompleteRun(TEXT("Database schema is incompatible; run a full source.trigger_reindex first"));
 			return 2;
 		}
 	}
@@ -175,11 +176,8 @@ uint32 FMonolithSourceIndexer::Run()
 		DiscoverProjectModules(ProjectModules);
 		if (!DB.BeginProjectReplacement(ProjectPath) || DB.HasOperationError())
 		{
-			UE_LOG(LogMonolithSource, Error, TEXT("Indexer: could not begin atomic project replacement"));
-			TotalErrors++;
 			DB.Close();
-			bIsRunning = false;
-			OnComplete.Broadcast(TotalFilesProcessed.Load(), TotalSymbolsExtracted.Load(), TotalErrors.Load());
+			CompleteRun(TEXT("Could not begin atomic project replacement"));
 			return 3;
 		}
 		else
@@ -236,16 +234,33 @@ uint32 FMonolithSourceIndexer::Run()
 
 	DB.Close();
 	bWasCancelled = static_cast<bool>(bShouldStop);
+
+	CompleteRun(nullptr);
+
+	return (!bShouldStop && TotalErrors.Load() == 0) ? 0 : 1;
+}
+
+void FMonolithSourceIndexer::CompleteRun(const TCHAR* FailureReason)
+{
+	if (FailureReason)
+	{
+		UE_LOG(LogMonolithSource, Error, TEXT("Indexer: %s"), FailureReason);
+		TotalErrors++;
+	}
+
 	bIsRunning = false;
 
 	const int32 Files = TotalFilesProcessed.Load();
 	const int32 Symbols = TotalSymbolsExtracted.Load();
 	const int32 Errors = TotalErrors.Load();
 
-	UE_LOG(LogMonolithSource, Log, TEXT("Indexer complete: %d files, %d symbols, %d errors"), Files, Symbols, Errors);
-	OnComplete.Broadcast(Files, Symbols, Errors);
+	if (!FailureReason)
+	{
+		UE_LOG(LogMonolithSource, Log, TEXT("Indexer complete: %d files, %d symbols, %d errors"), Files, Symbols, Errors);
+	}
 
-	return (!bShouldStop && Errors == 0) ? 0 : 1;
+	OnComplete.Broadcast(Files, Symbols, Errors);
+	return;
 }
 
 // ============================================================

@@ -74,6 +74,8 @@ void UMonolithSourceSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UMonolithSourceSubsystem::Deinitialize()
 {
+	bIsShuttingDown = true;
+
 	// F17: Unbind the hot-reload hook BEFORE we tear down anything else, so a late-firing
 	// reload signal during shutdown can't re-enter into a half-destroyed subsystem.
 	if (ReloadCompleteHandle.IsValid())
@@ -82,9 +84,14 @@ void UMonolithSourceSubsystem::Deinitialize()
 		ReloadCompleteHandle.Reset();
 	}
 
-	// Stop any running indexer
+	// Stop any running indexer. Detach our completion callback FIRST: the
+	// indexer's destructor joins the worker, and the worker broadcasts
+	// OnComplete on its way out — a still-attached lambda would run against a
+	// subsystem that is already tearing down.
 	if (Indexer)
 	{
+		Indexer->OnComplete.Clear();
+		Indexer->OnProgress.Clear();
 		Indexer->RequestStop();
 		delete Indexer;
 		Indexer = nullptr;
@@ -143,8 +150,12 @@ void UMonolithSourceSubsystem::OnReloadComplete(EReloadCompleteReason Reason)
 	UE_LOG(LogMonolithSource, Log,
 		TEXT("[F17] Hot-reload detected — kicking incremental project reindex (auto)"));
 
-	LastReindexTimeSeconds = Now;
-	TriggerProjectReindex(); // Already async via Indexer->StartAsync(); returns immediately.
+	// Stamp the cooldown only if a run actually started. Stamping first would
+	// suppress the next 5s of auto-kicks on behalf of a reindex that never ran.
+	if (TriggerProjectReindex()) // Already async via Indexer->StartAsync(); returns immediately.
+	{
+		LastReindexTimeSeconds = Now;
+	}
 }
 
 // ============================================================
@@ -197,13 +208,22 @@ bool UMonolithSourceSubsystem::TriggerReindex()
 	Indexer->SetCleanBuild(true);
 	Indexer->SetIndexProjectSource(true);
 
-	Indexer->OnComplete.AddLambda([this, DbPath](int32 Files, int32 Symbols, int32 Errors)
+	// The indexer broadcasts from its worker thread and the game-thread hop that
+	// follows cannot be cancelled, so neither lambda may capture `this` — the
+	// subsystem can be gone by the time either runs.
+	const TWeakObjectPtr<UMonolithSourceSubsystem> WeakThis(this);
+	Indexer->OnComplete.AddLambda([WeakThis, DbPath](int32 Files, int32 Symbols, int32 Errors)
 	{
 		const bool bCancelled = Indexer && Indexer->WasCancelled();
 		const int32 Discovered = Indexer ? Indexer->GetDiscoveredFiles() : Files;
-		AsyncTask(ENamedThreads::GameThread, [this, DbPath, Files, Symbols, Errors, bCancelled, Discovered]()
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, DbPath, Files, Symbols, Errors, bCancelled, Discovered]()
 		{
-			HandleIndexComplete(DbPath, Files, Symbols, Errors, bCancelled, Discovered);
+			UMonolithSourceSubsystem* Subsystem = WeakThis.Get();
+			if (!Subsystem || Subsystem->bIsShuttingDown)
+			{
+				return;
+			}
+			Subsystem->HandleIndexComplete(DbPath, Files, Symbols, Errors, bCancelled, Discovered);
 			UE_LOG(LogMonolithSource, Log, TEXT("C++ source indexing complete: %d files, %d symbols, %d errors"), Files, Symbols, Errors);
 		});
 	});
@@ -280,13 +300,20 @@ bool UMonolithSourceSubsystem::TriggerProjectReindex()
 	Indexer->SetCleanBuild(false);   // Incremental — keep existing engine symbols
 	Indexer->SetIndexProjectSource(true);
 
-	Indexer->OnComplete.AddLambda([this, DbPath](int32 Files, int32 Symbols, int32 Errors)
+	// See TriggerReindex — weak capture, never `this`.
+	const TWeakObjectPtr<UMonolithSourceSubsystem> WeakThis(this);
+	Indexer->OnComplete.AddLambda([WeakThis, DbPath](int32 Files, int32 Symbols, int32 Errors)
 	{
 		const bool bCancelled = Indexer && Indexer->WasCancelled();
 		const int32 Discovered = Indexer ? Indexer->GetDiscoveredFiles() : Files;
-		AsyncTask(ENamedThreads::GameThread, [this, DbPath, Files, Symbols, Errors, bCancelled, Discovered]()
+		AsyncTask(ENamedThreads::GameThread, [WeakThis, DbPath, Files, Symbols, Errors, bCancelled, Discovered]()
 		{
-			HandleIndexComplete(DbPath, Files, Symbols, Errors, bCancelled, Discovered);
+			UMonolithSourceSubsystem* Subsystem = WeakThis.Get();
+			if (!Subsystem || Subsystem->bIsShuttingDown)
+			{
+				return;
+			}
+			Subsystem->HandleIndexComplete(DbPath, Files, Symbols, Errors, bCancelled, Discovered);
 			UE_LOG(LogMonolithSource, Log, TEXT("Project source indexing complete: %d files, %d symbols, %d errors"), Files, Symbols, Errors);
 		});
 	});

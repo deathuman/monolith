@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.21.1 (Beta)
+**Version:** 0.22.0 (Beta)
 
 ---
 
@@ -35,6 +35,16 @@ After F17, agents must poll `source.get_index_status` before relying on
 refreshed symbols. There is no guaranteed one-second freshness window; a
 manual full `source.trigger_reindex` remains required for incompatible generated
 databases.
+
+The auto-hook stamps its 5-second cooldown only when `TriggerProjectReindex()` reports that a run actually started. Stamping unconditionally (the pre-0.22.0 behaviour) suppressed the next five seconds of auto-kicks on behalf of a reindex that never ran.
+
+### Reindex Result Contract (0.22.0)
+
+`TriggerReindex()` and `TriggerProjectReindex()` return `bool`: `true` only when a run actually started. They return `false` when a reindex is already in flight, when the worker thread cannot be created, and — for `TriggerProjectReindex` — when `EngineSource.db` does not exist yet. `source.trigger_reindex` / `source.trigger_project_reindex` surface that as an **error** naming the cause; earlier builds always answered with a success message regardless.
+
+Every exit from `FMonolithSourceIndexer` now routes through `CompleteRun()`, which clears the running flag and broadcasts `OnComplete`. Two exits used to return silently — a failed `FRunnableThread::Create` in `StartAsync`, and a failed `OpenForWriting` in `Run`. Because the subsystem clears `bIsIndexing` from that callback, either one latched the flag and every later request was refused with "Indexing already in progress" until the editor restarted. `Source/MonolithSource/Private/Tests/MonolithSourceIndexerFailureTest.cpp` covers the writer-open exit.
+
+The completion callback hops to the game thread and cannot be cancelled once queued, so it holds a `TWeakObjectPtr` to the subsystem (never `this`) and re-checks a shutdown flag before reopening the database. `Deinitialize` clears the indexer's delegates before stopping and deleting it, so a worker broadcasting on its way out cannot re-enter a subsystem that is already tearing down.
 
 ### Actions (~20 — namespace: "source")
 

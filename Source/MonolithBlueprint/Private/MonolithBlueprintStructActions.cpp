@@ -1,7 +1,9 @@
 #include "MonolithBlueprintStructActions.h"
 #include "MonolithBlueprintInternal.h"
 #include "MonolithJsonUtils.h"
+#include "MonolithPinTypeGrammar.h"
 #include "MonolithParamSchema.h"
+#include "MonolithPackagePathValidator.h"
 #include "MonolithAssetUtils.h"
 #include "MonolithBulkFillTypes.h"
 #include "Reflection/MonolithReflectionWalker.h"
@@ -102,6 +104,13 @@ FMonolithActionResult FMonolithBlueprintStructActions::HandleCreateUserDefinedSt
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: save_path"));
 	}
 
+	// Defensive: reject malformed paths (e.g. "//Game/...") before they reach the Asset
+	// Registry or CreatePackage, which asserts in UObjectGlobals.cpp and kills the editor.
+	if (const FString ValidationError = MonolithCore::ValidatePackagePath(SavePath); !ValidationError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(ValidationError);
+	}
+
 	const TArray<TSharedPtr<FJsonValue>>* FieldsArray = nullptr;
 	if (!Params->TryGetArrayField(TEXT("fields"), FieldsArray) || !FieldsArray || FieldsArray->Num() == 0)
 	{
@@ -175,7 +184,7 @@ FMonolithActionResult FMonolithBlueprintStructActions::HandleCreateUserDefinedSt
 		}
 
 		// Parse the type string to FEdGraphPinType
-		FEdGraphPinType PinType = MonolithBlueprintInternal::ParsePinTypeFromString(TypeStr);
+		FEdGraphPinType PinType = MonolithPinTypeGrammar::ParsePinTypeFromString(TypeStr);
 
 		// The first field replaces the default member created by CreateUserDefinedStruct.
 		// Subsequent fields need AddVariable.
@@ -263,6 +272,13 @@ FMonolithActionResult FMonolithBlueprintStructActions::HandleCreateUserDefinedEn
 	if (SavePath.IsEmpty())
 	{
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: save_path"));
+	}
+
+	// Defensive: reject malformed paths (e.g. "//Game/...") before they reach the Asset
+	// Registry or CreatePackage, which asserts in UObjectGlobals.cpp and kills the editor.
+	if (const FString ValidationError = MonolithCore::ValidatePackagePath(SavePath); !ValidationError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(ValidationError);
 	}
 
 	const TArray<TSharedPtr<FJsonValue>>* ValuesArray = nullptr;
@@ -445,6 +461,13 @@ FMonolithActionResult FMonolithBlueprintStructActions::HandleCreateDataTable(con
 	if (SavePath.IsEmpty())
 	{
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: save_path"));
+	}
+
+	// Defensive: reject malformed paths (e.g. "//Game/...") before they reach the Asset
+	// Registry or CreatePackage, which asserts in UObjectGlobals.cpp and kills the editor.
+	if (const FString ValidationError = MonolithCore::ValidatePackagePath(SavePath); !ValidationError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(ValidationError);
 	}
 
 	FString RowStructName = Params->GetStringField(TEXT("row_struct"));
@@ -782,6 +805,13 @@ FMonolithActionResult FMonolithBlueprintStructActions::HandleCreateDataAsset(con
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: save_path"));
 	}
 
+	// Defensive: reject malformed paths (e.g. "//Game/...") before they reach the Asset
+	// Registry or CreatePackage, which asserts in UObjectGlobals.cpp and kills the editor.
+	if (const FString ValidationError = MonolithCore::ValidatePackagePath(SavePath); !ValidationError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(ValidationError);
+	}
+
 	FString ClassName = Params->GetStringField(TEXT("class_name"));
 	if (ClassName.IsEmpty())
 	{
@@ -950,6 +980,13 @@ FMonolithActionResult FMonolithBlueprintStructActions::HandleSeedDataAsset(const
 	if (SavePath.IsEmpty())
 	{
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: save_path"));
+	}
+
+	// Defensive: reject malformed paths (e.g. "//Game/...") before they reach the Asset
+	// Registry or CreatePackage, which asserts in UObjectGlobals.cpp and kills the editor.
+	if (const FString ValidationError = MonolithCore::ValidatePackagePath(SavePath); !ValidationError.IsEmpty())
+	{
+		return FMonolithActionResult::Error(ValidationError);
 	}
 
 	FString ClassName = Params->GetStringField(TEXT("class_name"));
