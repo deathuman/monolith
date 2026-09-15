@@ -284,6 +284,15 @@ namespace MonolithBulkFillActionsInternal
 		{
 			Out->SetStringField(TEXT("category"), Found->Category);
 		}
+		TSharedRef<FJsonObject> Annotations = MakeShared<FJsonObject>();
+		Annotations->SetBoolField(TEXT("readOnlyHint"), Found->bReadOnlyHint);
+		Annotations->SetBoolField(TEXT("destructiveHint"), Found->bDestructiveHint);
+		Annotations->SetBoolField(TEXT("idempotentHint"), Found->bIdempotentHint);
+		if (!Found->Title.IsEmpty())
+		{
+			Annotations->SetStringField(TEXT("title"), Found->Title);
+		}
+		Out->SetObjectField(TEXT("annotations"), Annotations);
 		// Same JSON-Schema "properties" object discover serializes as "params".
 		Out->SetObjectField(TEXT("params"),
 			Found->ParamSchema.IsValid() ? Found->ParamSchema : MakeShared<FJsonObject>());

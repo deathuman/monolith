@@ -57,6 +57,10 @@ bool FMonolithDescribeActionSchemaTargetActionTest::RunTest(const FString& /*Par
 		R.Result->TryGetStringField(TEXT("action"), Act);
 		TestEqual(TEXT("namespace echoes describe"), Ns, FString(TEXT("describe")));
 		TestEqual(TEXT("action echoes list_targets"), Act, FString(TEXT("list_targets")));
+		const TSharedPtr<FJsonObject>* Annotations;
+		TestTrue(TEXT("action annotations are exposed"),
+			R.Result->TryGetObjectField(TEXT("annotations"), Annotations) &&
+			Annotations && Annotations->IsValid());
 	}
 	return true;
 }
