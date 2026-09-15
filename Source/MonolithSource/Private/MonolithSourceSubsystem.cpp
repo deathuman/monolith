@@ -212,10 +212,11 @@ bool UMonolithSourceSubsystem::TriggerReindex()
 	// follows cannot be cancelled, so neither lambda may capture `this` — the
 	// subsystem can be gone by the time either runs.
 	const TWeakObjectPtr<UMonolithSourceSubsystem> WeakThis(this);
-	Indexer->OnComplete.AddLambda([WeakThis, DbPath](int32 Files, int32 Symbols, int32 Errors)
+	FMonolithSourceIndexer* ActiveIndexer = Indexer;
+	Indexer->OnComplete.AddLambda([WeakThis, DbPath, ActiveIndexer](int32 Files, int32 Symbols, int32 Errors)
 	{
-		const bool bCancelled = Indexer && Indexer->WasCancelled();
-		const int32 Discovered = Indexer ? Indexer->GetDiscoveredFiles() : Files;
+		const bool bCancelled = ActiveIndexer && ActiveIndexer->WasCancelled();
+		const int32 Discovered = ActiveIndexer ? ActiveIndexer->GetDiscoveredFiles() : Files;
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, DbPath, Files, Symbols, Errors, bCancelled, Discovered]()
 		{
 			UMonolithSourceSubsystem* Subsystem = WeakThis.Get();
@@ -302,10 +303,11 @@ bool UMonolithSourceSubsystem::TriggerProjectReindex()
 
 	// See TriggerReindex — weak capture, never `this`.
 	const TWeakObjectPtr<UMonolithSourceSubsystem> WeakThis(this);
-	Indexer->OnComplete.AddLambda([WeakThis, DbPath](int32 Files, int32 Symbols, int32 Errors)
+	FMonolithSourceIndexer* ActiveIndexer = Indexer;
+	Indexer->OnComplete.AddLambda([WeakThis, DbPath, ActiveIndexer](int32 Files, int32 Symbols, int32 Errors)
 	{
-		const bool bCancelled = Indexer && Indexer->WasCancelled();
-		const int32 Discovered = Indexer ? Indexer->GetDiscoveredFiles() : Files;
+		const bool bCancelled = ActiveIndexer && ActiveIndexer->WasCancelled();
+		const int32 Discovered = ActiveIndexer ? ActiveIndexer->GetDiscoveredFiles() : Files;
 		AsyncTask(ENamedThreads::GameThread, [WeakThis, DbPath, Files, Symbols, Errors, bCancelled, Discovered]()
 		{
 			UMonolithSourceSubsystem* Subsystem = WeakThis.Get();

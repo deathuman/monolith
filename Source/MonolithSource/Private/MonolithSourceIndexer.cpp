@@ -86,7 +86,8 @@ bool FMonolithSourceIndexer::RunSynchronous()
 {
 	if (bIsRunning) return false;
 	Init();
-	return Run() == 0;
+	Run();
+	return true;
 }
 
 void FMonolithSourceIndexer::RequestStop()

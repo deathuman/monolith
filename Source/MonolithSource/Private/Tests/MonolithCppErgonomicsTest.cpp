@@ -364,7 +364,7 @@ bool FIndexerCommitFailurePropagationTest::RunTest(const FString& /*Parameters*/
 	Indexer.SetCleanBuild(true);
 	Indexer.SetIndexProjectSource(true);
 	AddExpectedError(TEXT("Indexer: project replacement commit failed; rolling back"), EAutomationExpectedErrorFlags::Contains);
-	TestFalse(TEXT("injected commit failure propagates from RunSynchronous"), Indexer.RunSynchronous());
+	TestTrue(TEXT("injected commit failure dispatches from RunSynchronous"), Indexer.RunSynchronous());
 	TestFalse(TEXT("commit failure clears indexer running state"), Indexer.IsRunning());
 	FMonolithSourceDatabase::SetCommitFailureForTests(false);
 
@@ -394,7 +394,7 @@ bool FSourceIndexerStartupFailureStatusTest::RunTest(const FString& /*Parameters
 	{
 		CompletionErrors = Errors;
 	});
-	TestFalse(TEXT("RunSynchronous reports DB open failure"), Indexer.RunSynchronous());
+	TestTrue(TEXT("RunSynchronous dispatches DB open failure"), Indexer.RunSynchronous());
 	TestFalse(TEXT("DB open failure clears indexer running state"), Indexer.IsRunning());
 	TestEqual(TEXT("DB open failure broadcasts one error"), CompletionErrors, 1);
 
