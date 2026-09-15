@@ -155,13 +155,24 @@ namespace MonolithUI::ErrorFormattingTests
                 // Notify the registry while the object is still addressable.
                 FAssetRegistryModule::AssetDeleted(Existing);
 
-                // Drop the keep-alive flags and move the asset (a UBlueprint
-                // brings its generated + skeleton classes along -- see
-                // UBlueprint::RenameGeneratedClasses) out to the transient
-                // package, so the name is free again inside this session.
+                // Follow the editor's deletion order for a Blueprint: consign
+                // its generated and skeleton classes before moving the asset.
+                // Renaming a live UWidgetBlueprint otherwise lets
+                // UBlueprint::RenameGeneratedClasses collide with a REINST_
+                // class left by an earlier compile and can terminate the
+                // editor instead of returning a test failure.
+                if (UBlueprint* Blueprint = Cast<UBlueprint>(Existing))
+                {
+                    FBlueprintEditorUtils::RemoveGeneratedClasses(Blueprint);
+                }
+
+                // Drop the keep-alive flags and move only the asset itself out
+                // to the transient package. The generated classes were
+                // already consigned above, so skipping them here is deliberate.
                 Existing->ClearFlags(RF_Public | RF_Standalone);
                 Existing->Rename(nullptr, GetTransientPackage(),
-                    REN_DoNotDirty | REN_DontCreateRedirectors | REN_NonTransactional);
+                    REN_DoNotDirty | REN_DontCreateRedirectors |
+                    REN_NonTransactional | REN_SkipGeneratedClasses);
             }
 
             // A throwaway must not raise a save prompt on editor shutdown.
