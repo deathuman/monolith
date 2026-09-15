@@ -5,9 +5,9 @@
 /**
  * Read-only recursive collector for UChooserTable trees.
  *
- * Walks a chooser table's result rows, fallback result, and output-object column
- * cells, classifying each result location by row kind (asset / soft_asset /
- * evaluate_chooser / nested_chooser) and resolving its target asset path. Recurses
+ * Walks a chooser table's result rows, fallback result, output-object cells, and
+ * structured-output cells, classifying each result location by row kind (asset /
+ * soft_asset / evaluate_chooser / nested_chooser) and resolving its target asset path. Recurses
  * into embedded child tables (NestedObjects) and reports ParentTable / RootChooser.
  *
  * This is the READ counterpart factored out of the duplicate-tree writer's traversal
@@ -46,6 +46,7 @@ namespace MonolithChooserTree
 	 *   rows            : [ { row, kind, struct_type, asset, is_null }, ... ] (editor-only)
 	 *   fallback        : { kind, struct_type, asset, is_null } (if FallbackResult set)
 	 *   output_columns  : [ { column, cells:[...] }, ... ] (editor-only)
+	 *   output_struct_columns : [ { column, cells:[ { row/site, value:{__struct,...} } ] }, ... ] (editor-only)
 	 *   nested_objects  : count of NestedObjects (editor-only)
 	 *   child_tables    : [ <nested table sub-tree>, ... ] (recursive; editor-only)
 	 *

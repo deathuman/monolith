@@ -10,8 +10,11 @@
 #include "Chooser.h"                  // UChooserTable, FEvaluateChooser, FNestedChooser
 #include "ObjectChooser_Asset.h"      // FAssetChooser / FSoftAssetChooser
 #include "OutputObjectColumn.h"        // FOutputObjectColumn / FChooserOutputObjectRowData
+#include "OutputStructColumn.h"        // FOutputStructColumn
+#include "Reflection/MonolithReflectionReader.h"
 
 #include "StructUtils/InstancedStruct.h"
+#include "UObject/UnrealType.h"
 #include "UObject/SoftObjectPtr.h"
 #include "UObject/SoftObjectPath.h"
 
@@ -98,6 +101,32 @@ namespace MonolithChooserTree
 			}
 
 			return Obj;
+		}
+
+		TSharedPtr<FJsonValue> DescribeStructValue(const FInstancedStruct& Value)
+		{
+			const UScriptStruct* StructType = Value.GetScriptStruct();
+			const uint8* StructMemory = Value.GetMemory();
+			if (!StructType || !StructMemory)
+			{
+				return MakeShared<FJsonValueNull>();
+			}
+
+			TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+			Object->SetStringField(TEXT("__struct"), StructType->GetPathName());
+			for (TFieldIterator<FProperty> It(StructType); It; ++It)
+			{
+				FProperty* Property = *It;
+				const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(StructMemory);
+				TSharedPtr<FJsonValue> JsonValue = FMonolithReflectionReader::PropertyToJsonValue(Property, ValuePtr);
+				if (const FObjectProperty* ObjectProperty = CastField<FObjectProperty>(Property);
+					ObjectProperty && !ObjectProperty->GetObjectPropertyValue(ValuePtr))
+				{
+					JsonValue = MakeShared<FJsonValueString>(TEXT(""));
+				}
+				Object->SetField(Property->GetName(), JsonValue);
+			}
+			return MakeShared<FJsonValueObject>(Object);
 		}
 	}
 
@@ -194,6 +223,46 @@ namespace MonolithChooserTree
 				Columns.Add(MakeShared<FJsonValueObject>(ColObj));
 			}
 			Root->SetArrayField(TEXT("output_columns"), Columns);
+		}
+
+		// FOutputStructColumn cell values are not asset references, but recursive
+		// readback must still expose their bound type and reflected fields.
+		{
+			TArray<TSharedPtr<FJsonValue>> Columns;
+			for (int32 ColIdx = 0; ColIdx < Table->ColumnsStructs.Num(); ++ColIdx)
+			{
+				const FOutputStructColumn* StructCol = Table->ColumnsStructs[ColIdx].GetPtr<FOutputStructColumn>();
+				if (!StructCol)
+				{
+					continue;
+				}
+
+				TSharedPtr<FJsonObject> ColObj = MakeShared<FJsonObject>();
+				ColObj->SetNumberField(TEXT("column"), ColIdx);
+				TArray<TSharedPtr<FJsonValue>> Cells;
+				for (int32 CellIdx = 0; CellIdx < StructCol->RowValues.Num(); ++CellIdx)
+				{
+					if (StructCol->RowValues[CellIdx].IsValid())
+					{
+						TSharedPtr<FJsonObject> CellObj = MakeShared<FJsonObject>();
+						CellObj->SetNumberField(TEXT("row"), CellIdx);
+						CellObj->SetStringField(TEXT("site"), TEXT("row"));
+						CellObj->SetField(TEXT("value"), DescribeStructValue(StructCol->RowValues[CellIdx]));
+						Cells.Add(MakeShared<FJsonValueObject>(CellObj));
+					}
+				}
+				if (StructCol->FallbackValue.IsValid())
+				{
+					TSharedPtr<FJsonObject> CellObj = MakeShared<FJsonObject>();
+					CellObj->SetStringField(TEXT("site"), TEXT("fallback"));
+					CellObj->SetField(TEXT("value"), DescribeStructValue(StructCol->FallbackValue));
+					Cells.Add(MakeShared<FJsonValueObject>(CellObj));
+				}
+
+				ColObj->SetArrayField(TEXT("cells"), Cells);
+				Columns.Add(MakeShared<FJsonValueObject>(ColObj));
+			}
+			Root->SetArrayField(TEXT("output_struct_columns"), Columns);
 		}
 
 		// ParentTable (deprecated in favor of RootChooser, but still read for completeness).

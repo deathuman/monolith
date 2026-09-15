@@ -8,6 +8,7 @@
 #if WITH_CHOOSER
 #include "MonolithAssetUtils.h"
 #include "MonolithChooserTreeCollector.h"
+#include "Reflection/MonolithReflectionReader.h"
 
 // Chooser runtime headers. Chooser.Build.cs adds its Internal/ dir to
 // PublicIncludePaths, so the Internal table/result headers are reachable for any
@@ -17,6 +18,8 @@
 #include "ChooserPropertyAccess.h"   // FContextObjectTypeBase/Class/Struct + FChooserPropertyBinding (Public)
 #include "ObjectChooser_Asset.h"     // FAssetChooser / FSoftAssetChooser (Internal, public path)
 #include "OutputObjectColumn.h"       // FOutputObjectColumn / FChooserOutputObjectRowData (Internal, public path)
+#include "OutputStructColumn.h"       // FOutputStructColumn / FStructContextProperty
+#include "NameColumn.h"               // FChooserNameColumn / FChooserNameRowData
 #include "BoolColumn.h"              // FBoolColumn / EBoolColumnCellValue (Internal, public path)
 #include "EnumColumn.h"              // FEnumColumn / FChooserEnumRowData (Internal, public path)
 #include "GameplayTagColumn.h"       // FGameplayTagColumn (RowValues: FGameplayTagContainer)
@@ -41,11 +44,11 @@ void FMonolithChooserActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 	// --- inspect_chooser ---
 	Registry.RegisterAction(TEXT("chooser"), TEXT("inspect_chooser"),
-		TEXT("Read-only inspection of a UChooserTable: context-data parameters (class/struct requirements), result type + result class, row count, column count + types, a richer 'columns' array (per-column index, type, input-binding chain, is_input flag), referenced assets walked from result rows, and compile/validation status. Set include_cells=true to also emit per-row cell values for input columns (bool/enum/float-range/gameplay-tag). Set recursive=true to additionally emit the full nested tree of row/result targets (asset / soft_asset / evaluate_chooser / nested_chooser kinds), output-object column cells, fallback, parent_table/root_chooser, and recursed child tables."),
+		TEXT("Read-only inspection of a UChooserTable: context-data parameters (class/struct requirements), result type + result class, row count, column count + types, a richer 'columns' array (per-column index, type, input-binding chain, is_input/is_output flags), referenced assets walked from result rows, and compile/validation status. Set include_cells=true to also emit per-row cell values for input columns (bool/enum/float-range/gameplay-tag/name) and reflected OutputStruct values. Set recursive=true to additionally emit the full nested tree of row/result targets (asset / soft_asset / evaluate_chooser / nested_chooser kinds), output-object and OutputStruct column cells, fallback, parent_table/root_chooser, and recursed child tables."),
 		FMonolithActionHandler::CreateStatic(&HandleInspectChooser),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("UChooserTable asset path"))
-			.Optional(TEXT("include_cells"), TEXT("bool"), TEXT("When true, emit per-row cell values for each input column under columns[].cells (bool MatchTrue/MatchFalse/any, enum value + comparison, float-range {min,max}, gameplay-tag list). Default false (back-compat: binding chains are always emitted, cells are not)."))
+			.Optional(TEXT("include_cells"), TEXT("bool"), TEXT("When true, emit per-row cell values for input and OutputStruct columns under columns[].cells (bool MatchTrue/MatchFalse/any, enum value + comparison, float-range {min,max}, gameplay-tag list, Name value + comparison, reflected OutputStruct values). Default false (back-compat: binding chains are always emitted, cells are not)."))
 			.Optional(TEXT("recursive"), TEXT("bool"), TEXT("When true, emit a recursive 'tree' of every row/result target (normalized asset paths) including nested FEvaluateChooser/FNestedChooser children, FallbackResult, and FOutputObjectColumn cells, so a root->child remap is provable from readback. Default false (back-compat)."))
 			.Build());
 
@@ -201,11 +204,12 @@ namespace
 		return Folder + TEXT("/") + ShortName;
 	}
 
-	/** True when the column is one of the four bindable input (filter) column types. */
+	/** True when the column is a bindable input (filter) column type. */
 	bool IsInputColumn(const FInstancedStruct& Col)
 	{
 		return Col.GetPtr<FBoolColumn>() || Col.GetPtr<FEnumColumn>()
-			|| Col.GetPtr<FGameplayTagColumn>() || Col.GetPtr<FFloatRangeColumn>();
+			|| Col.GetPtr<FGameplayTagColumn>() || Col.GetPtr<FFloatRangeColumn>()
+			|| Col.GetPtr<FChooserNameColumn>();
 	}
 
 	/**
@@ -223,6 +227,8 @@ namespace
 		else if (const FEnumColumn* EnumC = Col.GetPtr<FEnumColumn>())         { InputValue = &EnumC->InputValue; }
 		else if (const FGameplayTagColumn* TagC = Col.GetPtr<FGameplayTagColumn>()) { InputValue = &TagC->InputValue; }
 		else if (const FFloatRangeColumn* RangeC = Col.GetPtr<FFloatRangeColumn>()) { InputValue = &RangeC->InputValue; }
+		else if (const FChooserNameColumn* NameC = Col.GetPtr<FChooserNameColumn>()) { InputValue = &NameC->InputValue; }
+		else if (const FOutputStructColumn* StructC = Col.GetPtr<FOutputStructColumn>()) { InputValue = &StructC->InputValue; }
 		if (!InputValue || !InputValue->IsValid())
 		{
 			return nullptr;
@@ -277,6 +283,43 @@ namespace
 		case EBoolColumnCellValue::MatchAny:   return TEXT("any");
 		default:                               return TEXT("unknown");
 		}
+	}
+
+	FString NameComparisonToString(ENameColumnCellValueComparison Value)
+	{
+		switch (Value)
+		{
+		case ENameColumnCellValueComparison::MatchEqual:    return TEXT("MatchEqual");
+		case ENameColumnCellValueComparison::MatchNotEqual: return TEXT("MatchNotEqual");
+		case ENameColumnCellValueComparison::MatchAny:      return TEXT("MatchAny");
+		default:                                            return TEXT("Unknown");
+		}
+	}
+
+	TSharedPtr<FJsonValue> InstancedStructToJsonValue(const FInstancedStruct& Value)
+	{
+		const UScriptStruct* StructType = Value.GetScriptStruct();
+		const uint8* StructMemory = Value.GetMemory();
+		if (!StructType || !StructMemory)
+		{
+			return MakeShared<FJsonValueNull>();
+		}
+
+		TSharedPtr<FJsonObject> Object = MakeShared<FJsonObject>();
+		Object->SetStringField(TEXT("__struct"), StructType->GetPathName());
+		for (TFieldIterator<FProperty> It(StructType); It; ++It)
+		{
+			FProperty* Property = *It;
+			const void* ValuePtr = Property->ContainerPtrToValuePtr<void>(StructMemory);
+			TSharedPtr<FJsonValue> JsonValue = FMonolithReflectionReader::PropertyToJsonValue(Property, ValuePtr);
+			if (const FObjectProperty* ObjectProperty = CastField<FObjectProperty>(Property);
+				ObjectProperty && !ObjectProperty->GetObjectPropertyValue(ValuePtr))
+			{
+				JsonValue = MakeShared<FJsonValueString>(TEXT(""));
+			}
+			Object->SetField(Property->GetName(), JsonValue);
+		}
+		return MakeShared<FJsonValueObject>(Object);
 	}
 
 	/**
@@ -337,6 +380,30 @@ namespace
 				Cell->SetNumberField(TEXT("row"), r);
 				Cell->SetNumberField(TEXT("value"), Row.Value);
 				Cell->SetNumberField(TEXT("comparison"), static_cast<int32>(Row.Comparison));
+				OutCells.Add(MakeShared<FJsonValueObject>(Cell));
+			}
+			return;
+		}
+		if (const FChooserNameColumn* NameC = Col.GetPtr<FChooserNameColumn>())
+		{
+			for (int32 r = 0; r < NameC->RowValues.Num(); ++r)
+			{
+				const FChooserNameRowData& Row = NameC->RowValues[r];
+				TSharedPtr<FJsonObject> Cell = MakeShared<FJsonObject>();
+				Cell->SetNumberField(TEXT("row"), r);
+				Cell->SetStringField(TEXT("value"), Row.Value.ToString());
+				Cell->SetStringField(TEXT("comparison"), NameComparisonToString(Row.Comparison));
+				OutCells.Add(MakeShared<FJsonValueObject>(Cell));
+			}
+			return;
+		}
+		if (const FOutputStructColumn* StructC = Col.GetPtr<FOutputStructColumn>())
+		{
+			for (int32 r = 0; r < StructC->RowValues.Num(); ++r)
+			{
+				TSharedPtr<FJsonObject> Cell = MakeShared<FJsonObject>();
+				Cell->SetNumberField(TEXT("row"), r);
+				Cell->SetField(TEXT("value"), InstancedStructToJsonValue(StructC->RowValues[r]));
 				OutCells.Add(MakeShared<FJsonValueObject>(Cell));
 			}
 			return;
@@ -414,7 +481,7 @@ FMonolithActionResult FMonolithChooserActions::HandleInspectChooser(const TShare
 	}
 
 	// Richer per-column view: index, type, input-binding chain, is_input flag, and
-	// (when include_cells) per-row cell values. Unknown/output column types degrade to
+	// (when include_cells) per-row cell values. Unknown columns degrade to
 	// { type, is_input:false } with no binding — never an error.
 	{
 		bool bIncludeCells = false;
@@ -431,13 +498,15 @@ FMonolithActionResult FMonolithChooserActions::HandleInspectChooser(const TShare
 			ColObj->SetStringField(TEXT("type"), SS ? SS->GetName() : TEXT("<null>"));
 
 			const bool bIsInput = IsInputColumn(Col);
+			const bool bIsOutputStruct = Col.GetPtr<FOutputStructColumn>() != nullptr;
 			ColObj->SetBoolField(TEXT("is_input"), bIsInput);
+			ColObj->SetBoolField(TEXT("is_output"), bIsOutputStruct);
 			if (TSharedPtr<FJsonObject> Binding = ReadInputBinding(Col))
 			{
 				ColObj->SetObjectField(TEXT("input_binding"), Binding);
 			}
 
-			if (bIncludeCells && bIsInput)
+			if (bIncludeCells && (bIsInput || bIsOutputStruct))
 			{
 				TArray<TSharedPtr<FJsonValue>> Cells;
 				ReadColumnCells(Col, Cells);

@@ -1,5 +1,6 @@
 #include "MonolithChooserAuthoringActions.h"
 #include "MonolithParamSchema.h"
+#include "Reflection/MonolithReflectionWalker.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -14,6 +15,8 @@
 #include "ChooserSignature.h"        // UChooserSignature (ResultType/OutputObjectType/ContextData)
 #include "ObjectChooser_Asset.h"     // FAssetChooser (Internal, public path) — result rows
 #include "OutputObjectColumn.h"      // FOutputObjectColumn / FChooserOutputObjectRowData
+#include "OutputStructColumn.h"      // FOutputStructColumn / FStructContextProperty
+#include "NameColumn.h"              // FChooserNameColumn / FChooserNameRowData
 #include "BoolColumn.h"              // FBoolColumn / EBoolColumnCellValue
 #include "EnumColumn.h"              // FEnumColumn / FChooserEnumRowData / EEnumColumnCellValueComparison
 #include "GameplayTagColumn.h"       // FGameplayTagColumn (RowValues: FGameplayTagContainer)
@@ -25,6 +28,7 @@
 #include "GameplayTagContainer.h"
 #include "GameplayTagsManager.h"
 #include "UObject/Class.h"
+#include "UObject/UnrealType.h"
 #include "Editor.h"
 #endif // WITH_CHOOSER
 
@@ -47,28 +51,30 @@ void FMonolithChooserAuthoringActions::RegisterActions(FMonolithToolRegistry& Re
 
 	// --- add_chooser_column ---
 	Registry.RegisterAction(TEXT("chooser"), TEXT("add_chooser_column"),
-		TEXT("Append a column to a UChooserTable. column_kind is Bool / Enum / GameplayTag / FloatRange / OutputObject. For input (filter) columns an optional binding_property dotted path sets the InputValue property-binding chain. CRITICAL: the new column's per-row value array is grown to the table's current row count so all parallel arrays stay aligned. Marks the package dirty."),
+		TEXT("Append a column to a UChooserTable. column_kind is Bool / Enum / GameplayTag / FloatRange / Name / OutputObject / OutputStruct. Name and OutputStruct require binding_property; OutputStruct also requires an exact struct_type path. CRITICAL: the new column's per-row value array is grown to the table's current row count so all parallel arrays stay aligned. Marks the package dirty."),
 		FMonolithActionHandler::CreateStatic(&HandleAddChooserColumn),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("UChooserTable asset path"))
-			.Required(TEXT("column_kind"), TEXT("string"), TEXT("Bool | Enum | GameplayTag | FloatRange | OutputObject"))
-			.Optional(TEXT("binding_property"), TEXT("string"), TEXT("Optional dotted property path for the input binding chain (e.g. 'bIsCrouching' or 'Movement.Speed'). Input columns only."))
+			.Required(TEXT("column_kind"), TEXT("string"), TEXT("Bool | Enum | GameplayTag | FloatRange | Name | OutputObject | OutputStruct"))
+			.Optional(TEXT("binding_property"), TEXT("string"), TEXT("Dotted property path for the binding chain. Required for Name and OutputStruct; optional for other input columns."))
 			.Optional(TEXT("enum_class"), TEXT("string"), TEXT("Enum columns only: full path or bare short name of the UEnum this column filters (e.g. '/Script/MyModule.EStance' or 'EStance'). Sets the editor-side enum binding so cell values display/validate against this enum."))
+			.Optional(TEXT("struct_type"), TEXT("string"), TEXT("OutputStruct columns only: exact UScriptStruct object path, e.g. '/Script/CoreUObject.Vector'."))
 			.Build());
 
 	// --- add_chooser_row ---
 	Registry.RegisterAction(TEXT("chooser"), TEXT("add_chooser_row"),
-		TEXT("Append a row to a UChooserTable. cells is one entry per INPUT (filter) column, in column order (Bool: true/false/any; Enum: int value; FloatRange: {min,max}; GameplayTag: tag string). output_psd is the asset the row selects (written as an FAssetChooser result). HIGHEST risk: every parallel array (each input column's per-row value array, each OutputObject column's RowValues, ResultsStructs, DisabledRows) grows by EXACTLY 1 atomically. Marks the package dirty."),
+		TEXT("Append a row to a UChooserTable. cells is one entry per INPUT (filter) column, in column order (Bool: true/false/any; Enum: int value; FloatRange: {min,max}; GameplayTag: tag string; Name: string or {value,comparison}). output_psd is the asset the row selects. When exactly one OutputStruct column exists, output_struct is the reflected field object for that row. HIGHEST risk: every parallel array grows by EXACTLY 1 atomically. Marks the package dirty."),
 		FMonolithActionHandler::CreateStatic(&HandleAddChooserRow),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("UChooserTable asset path"))
-			.Required(TEXT("cells"), TEXT("array"), TEXT("One cell per INPUT column in column order. Bool: bool or 'any'; Enum: integer; FloatRange: {min:number,max:number}; GameplayTag: tag string."))
+			.Required(TEXT("cells"), TEXT("array"), TEXT("One cell per INPUT column in column order. Bool: bool or 'any'; Enum: integer; FloatRange: {min:number,max:number}; GameplayTag: tag string; Name: string or {value:string,comparison:string}."))
 			.RequiredAssetPath(TEXT("output_psd"), TEXT("Asset this row selects (e.g. a PoseSearch database). Written as an FAssetChooser result row."))
+			.Optional(TEXT("output_struct"), TEXT("object"), TEXT("Required when exactly one OutputStruct column exists; rejected when none or more than one exists. Fields are authored against the column's bound struct_type."))
 			.Build());
 
 	// --- set_chooser_cell ---
 	Registry.RegisterAction(TEXT("chooser"), TEXT("set_chooser_cell"),
-		TEXT("Set a typed predicate value into a specific (column_index, row_index) cell of a UChooserTable. The accepted value fields depend on the column's concrete kind: Bool -> bool_value (bool) or 'any'; Enum -> enum_value (integer) [+ optional comparison: MatchEqual/MatchNotEqual/MatchAny]; FloatRange -> float_min + float_max (numbers); GameplayTag -> tags (string or array of tag strings). Both indices are validated in range. Marks the package dirty."),
+		TEXT("Set a typed predicate or reflected output value into a specific (column_index, row_index) cell of a UChooserTable. Name uses name_value plus optional comparison (MatchEqual/MatchNotEqual/MatchAny). OutputStruct uses struct_value against the column's authoritative bound type. Both indices are validated in range. Marks the package dirty."),
 		FMonolithActionHandler::CreateStatic(&HandleSetChooserCell),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("UChooserTable asset path"))
@@ -76,10 +82,12 @@ void FMonolithChooserAuthoringActions::RegisterActions(FMonolithToolRegistry& Re
 			.Required(TEXT("row_index"), TEXT("number"), TEXT("Zero-based row index (must be < row count)"))
 			.Optional(TEXT("bool_value"), TEXT("bool"), TEXT("Bool column: cell value (true/false). Omit and pass 'any' via this field as a string to match-any."))
 			.Optional(TEXT("enum_value"), TEXT("number"), TEXT("Enum column: raw integer enum value"))
-			.Optional(TEXT("comparison"), TEXT("string"), TEXT("Enum column: MatchEqual (default) / MatchNotEqual / MatchAny"))
+			.Optional(TEXT("comparison"), TEXT("string"), TEXT("Enum or Name column: MatchEqual (default) / MatchNotEqual / MatchAny"))
 			.Optional(TEXT("float_min"), TEXT("number"), TEXT("FloatRange column: inclusive minimum"))
 			.Optional(TEXT("float_max"), TEXT("number"), TEXT("FloatRange column: inclusive maximum"))
 			.Optional(TEXT("tags"), TEXT("array"), TEXT("GameplayTag column: a single tag string or an array of tag strings"))
+			.Optional(TEXT("name_value"), TEXT("string"), TEXT("Name column: required except when comparison is MatchAny"))
+			.Optional(TEXT("struct_value"), TEXT("object"), TEXT("OutputStruct column: reflected fields; the column's bound struct_type is authoritative"))
 			.Build());
 }
 
@@ -165,8 +173,494 @@ namespace
 		return Kind.Equals(TEXT("Bool"),       ESearchCase::IgnoreCase)
 			|| Kind.Equals(TEXT("Enum"),       ESearchCase::IgnoreCase)
 			|| Kind.Equals(TEXT("GameplayTag"),ESearchCase::IgnoreCase)
-			|| Kind.Equals(TEXT("FloatRange"), ESearchCase::IgnoreCase);
+			|| Kind.Equals(TEXT("FloatRange"), ESearchCase::IgnoreCase)
+			|| Kind.Equals(TEXT("Name"),       ESearchCase::IgnoreCase);
 	}
+
+	bool IsOutputStructColumnKind(const FString& Kind)
+	{
+		return Kind.Equals(TEXT("OutputStruct"), ESearchCase::IgnoreCase);
+	}
+
+	bool ParseNameComparison(const FString& Value, ENameColumnCellValueComparison& OutComparison)
+	{
+		if (Value.Equals(TEXT("MatchEqual"), ESearchCase::IgnoreCase))
+		{
+			OutComparison = ENameColumnCellValueComparison::MatchEqual;
+			return true;
+		}
+		if (Value.Equals(TEXT("MatchNotEqual"), ESearchCase::IgnoreCase))
+		{
+			OutComparison = ENameColumnCellValueComparison::MatchNotEqual;
+			return true;
+		}
+		if (Value.Equals(TEXT("MatchAny"), ESearchCase::IgnoreCase))
+		{
+			OutComparison = ENameColumnCellValueComparison::MatchAny;
+			return true;
+		}
+		return false;
+	}
+
+	bool ParseEnumValue(double Value, uint8& OutValue, FString& OutError)
+	{
+		if (!FMath::IsFinite(Value) || Value < 0.0 || Value > 255.0 || Value != FMath::TruncToDouble(Value))
+		{
+			OutError = TEXT("Enum cell value must be an integer in [0,255]");
+			return false;
+		}
+		OutValue = static_cast<uint8>(Value);
+		return true;
+	}
+
+	bool ResolveExactStructType(const FString& Path, UScriptStruct*& OutStruct, FString& OutError)
+	{
+		OutStruct = nullptr;
+		if (Path.IsEmpty() || !Path.StartsWith(TEXT("/")))
+		{
+			OutError = TEXT("struct_type must be an exact UScriptStruct object path");
+			return false;
+		}
+		OutStruct = LoadObject<UScriptStruct>(nullptr, *Path);
+		if (!OutStruct)
+		{
+			OutError = FString::Printf(TEXT("struct_type '%s' could not be resolved"), *Path);
+			return false;
+		}
+		return true;
+	}
+
+	UScriptStruct* GetOutputStructType(const FOutputStructColumn& Column)
+	{
+#if WITH_EDITORONLY_DATA
+		if (const FStructContextProperty* Context = Column.InputValue.GetPtr<FStructContextProperty>())
+		{
+			return Context->Binding.StructType;
+		}
+#endif
+		return nullptr;
+	}
+
+	bool ApplyOutputStructType(FInstancedStruct& Column, UScriptStruct* StructType)
+	{
+		FOutputStructColumn* Output = Column.GetMutablePtr<FOutputStructColumn>();
+		if (!Output || !StructType)
+		{
+			return false;
+		}
+#if WITH_EDITORONLY_DATA
+		FStructContextProperty* Context = Output->InputValue.GetMutablePtr<FStructContextProperty>();
+		if (!Context)
+		{
+			return false;
+		}
+		Context->Binding.StructType = StructType;
+		Output->StructTypeChanged();
+		return GetOutputStructType(*Output) == StructType;
+#else
+		return false;
+#endif
+	}
+
+	bool ValidateNewColumnBinding(FInstancedStruct& Column, UChooserTable& Table, FString& OutError)
+	{
+		FChooserColumnBase* Base = Column.GetMutablePtr<FChooserColumnBase>();
+		FChooserParameterBase* Input = Base ? Base->GetInputValue() : nullptr;
+		if (!Input)
+		{
+			OutError = TEXT("column has no bindable input value");
+			return false;
+		}
+		Input->Compile(Table.GetRootChooser(), true);
+		FText CompileMessage;
+		if (Input->HasCompileErrors(CompileMessage))
+		{
+			OutError = CompileMessage.ToString();
+			return false;
+		}
+
+		const bool bIsName = Column.GetPtr<FChooserNameColumn>() != nullptr;
+		const FOutputStructColumn* OutputColumn = Column.GetPtr<FOutputStructColumn>();
+		const FChooserPropertyBinding* Binding = nullptr;
+		if (const FChooserNameColumn* NameColumn = Column.GetPtr<FChooserNameColumn>())
+		{
+			if (const FNameContextProperty* Context = NameColumn->InputValue.GetPtr<FNameContextProperty>())
+			{
+				Binding = &Context->Binding;
+			}
+		}
+		else if (OutputColumn)
+		{
+			if (const FStructContextProperty* Context = OutputColumn->InputValue.GetPtr<FStructContextProperty>())
+			{
+				Binding = &Context->Binding;
+			}
+		}
+		if (!Binding)
+		{
+			OutError = TEXT("column binding could not be inspected");
+			return false;
+		}
+
+		const TConstArrayView<FInstancedStruct> ContextData = Table.GetRootChooser()->GetContextData();
+		if (!ContextData.IsValidIndex(Binding->ContextIndex))
+		{
+			OutError = FString::Printf(TEXT("context index %d is out of range"), Binding->ContextIndex);
+			return false;
+		}
+		const FInstancedStruct& ContextEntry = ContextData[Binding->ContextIndex];
+		const UStruct* CurrentStruct = nullptr;
+		if (const FContextObjectTypeClass* ClassContext = ContextEntry.GetPtr<FContextObjectTypeClass>())
+		{
+			CurrentStruct = ClassContext->Class;
+		}
+		else if (const FContextObjectTypeStruct* StructContext = ContextEntry.GetPtr<FContextObjectTypeStruct>())
+		{
+			CurrentStruct = StructContext->Struct;
+		}
+		if (!CurrentStruct)
+		{
+			OutError = TEXT("context entry has no class or struct type");
+			return false;
+		}
+
+		if (Binding->PropertyBindingChain.IsEmpty())
+		{
+			if (!Binding->IsBoundToRoot || (!OutputColumn || GetOutputStructType(*OutputColumn) != CurrentStruct))
+			{
+				OutError = TEXT("binding must resolve to the requested column value type");
+				return false;
+			}
+			return true;
+		}
+
+		for (int32 LinkIndex = 0; LinkIndex < Binding->PropertyBindingChain.Num(); ++LinkIndex)
+		{
+			FProperty* Property = FMonolithReflectionWalker::FindPropertyForwarding(
+				const_cast<UStruct*>(CurrentStruct), Binding->PropertyBindingChain[LinkIndex].ToString());
+			if (!Property)
+			{
+				OutError = FString::Printf(TEXT("binding property '%s' was not found"), *Binding->PropertyBindingChain[LinkIndex].ToString());
+				return false;
+			}
+			if (LinkIndex + 1 < Binding->PropertyBindingChain.Num())
+			{
+				if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+				{
+					CurrentStruct = StructProperty->Struct;
+				}
+				else if (const FObjectProperty* ObjectProperty = CastField<FObjectProperty>(Property))
+				{
+					CurrentStruct = ObjectProperty->PropertyClass;
+				}
+				else
+				{
+					OutError = FString::Printf(TEXT("binding property '%s' is not traversable"), *Property->GetName());
+					return false;
+				}
+				continue;
+			}
+
+			if (bIsName && !CastField<FNameProperty>(Property))
+			{
+				OutError = FString::Printf(TEXT("binding property '%s' is not an FName"), *Property->GetName());
+				return false;
+			}
+			if (OutputColumn)
+			{
+				const FStructProperty* StructProperty = CastField<FStructProperty>(Property);
+				if (!StructProperty || StructProperty->Struct != GetOutputStructType(*OutputColumn))
+				{
+					OutError = FString::Printf(TEXT("binding property '%s' does not match struct_type"), *Property->GetName());
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
+	bool ValidateReflectedValue(FProperty* Property, const TSharedPtr<FJsonValue>& Value, const FString& FieldPath, FString& OutError);
+
+	bool ValidateStructFields(const UStruct* Struct, const FJsonObject& Object, const FString& Prefix, FString& OutError)
+	{
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Object.Values)
+		{
+			const FString FieldPath = Prefix.IsEmpty() ? Pair.Key : Prefix + TEXT(".") + Pair.Key;
+			FProperty* Property = FMonolithReflectionWalker::FindPropertyForwarding(const_cast<UStruct*>(Struct), Pair.Key);
+			if (!Property)
+			{
+				continue; // WriteTree reports unknown fields in strict mode.
+			}
+			if (!ValidateReflectedValue(Property, Pair.Value, FieldPath, OutError))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool ValidateReflectedValue(FProperty* Property, const TSharedPtr<FJsonValue>& Value, const FString& FieldPath, FString& OutError)
+	{
+		if (!Property || !Value.IsValid())
+		{
+			OutError = FString::Printf(TEXT("%s must not be null"), *FieldPath);
+			return false;
+		}
+
+		if (const FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property))
+		{
+			if (Value->Type != EJson::String)
+			{
+				OutError = FString::Printf(TEXT("%s must be an enum name string"), *FieldPath);
+				return false;
+			}
+			return true;
+		}
+		if (const FByteProperty* ByteProperty = CastField<FByteProperty>(Property); ByteProperty && ByteProperty->Enum)
+		{
+			if (Value->Type != EJson::String)
+			{
+				OutError = FString::Printf(TEXT("%s must be an enum name string"), *FieldPath);
+				return false;
+			}
+			return true;
+		}
+		if (const FNumericProperty* Numeric = CastField<FNumericProperty>(Property))
+		{
+			double Number = 0.0;
+			if (Value->Type != EJson::Number || !Value->TryGetNumber(Number))
+			{
+				OutError = FString::Printf(TEXT("%s must be a number"), *FieldPath);
+				return false;
+			}
+			if (Numeric->IsInteger() && Number != FMath::RoundToDouble(Number))
+			{
+				OutError = FString::Printf(TEXT("%s must be an integer"), *FieldPath);
+				return false;
+			}
+			if (Numeric->IsFloatingPoint() && !FMath::IsFinite(Number))
+			{
+				OutError = FString::Printf(TEXT("%s must be finite"), *FieldPath);
+				return false;
+			}
+			if (const FInt8Property* Int8 = CastField<FInt8Property>(Property);
+				Int8 && (Number < TNumericLimits<int8>::Lowest() || Number > TNumericLimits<int8>::Max()))
+			{
+				OutError = FString::Printf(TEXT("%s is outside int8 range"), *FieldPath);
+				return false;
+			}
+			if (const FInt16Property* Int16 = CastField<FInt16Property>(Property);
+				Int16 && (Number < TNumericLimits<int16>::Lowest() || Number > TNumericLimits<int16>::Max()))
+			{
+				OutError = FString::Printf(TEXT("%s is outside int16 range"), *FieldPath);
+				return false;
+			}
+			if (const FIntProperty* Int32 = CastField<FIntProperty>(Property);
+				Int32 && (Number < TNumericLimits<int32>::Lowest() || Number > TNumericLimits<int32>::Max()))
+			{
+				OutError = FString::Printf(TEXT("%s is outside int32 range"), *FieldPath);
+				return false;
+			}
+			if (const FInt64Property* Int64 = CastField<FInt64Property>(Property);
+				Int64 && (Number < static_cast<double>(TNumericLimits<int64>::Lowest()) || Number > static_cast<double>(TNumericLimits<int64>::Max())))
+			{
+				OutError = FString::Printf(TEXT("%s is outside int64 range"), *FieldPath);
+				return false;
+			}
+			if (const FByteProperty* Byte = CastField<FByteProperty>(Property);
+				Byte && (Number < 0.0 || Number > TNumericLimits<uint8>::Max()))
+			{
+				OutError = FString::Printf(TEXT("%s is outside uint8 range"), *FieldPath);
+				return false;
+			}
+			if (const FUInt16Property* UInt16 = CastField<FUInt16Property>(Property);
+				UInt16 && (Number < 0.0 || Number > TNumericLimits<uint16>::Max()))
+			{
+				OutError = FString::Printf(TEXT("%s is outside uint16 range"), *FieldPath);
+				return false;
+			}
+			if (const FUInt32Property* UInt32 = CastField<FUInt32Property>(Property);
+				UInt32 && (Number < 0.0 || Number > static_cast<double>(TNumericLimits<uint32>::Max())))
+			{
+				OutError = FString::Printf(TEXT("%s is outside uint32 range"), *FieldPath);
+				return false;
+			}
+			if (const FUInt64Property* UInt64 = CastField<FUInt64Property>(Property);
+				UInt64 && (Number < 0.0 || Number > static_cast<double>(TNumericLimits<uint64>::Max())))
+			{
+				OutError = FString::Printf(TEXT("%s is outside uint64 range"), *FieldPath);
+				return false;
+			}
+			if (const FFloatProperty* Float = CastField<FFloatProperty>(Property);
+				Float && FMath::Abs(Number) > TNumericLimits<float>::Max())
+			{
+				OutError = FString::Printf(TEXT("%s is outside float range"), *FieldPath);
+				return false;
+			}
+			const FString MinText = Property->GetMetaData(TEXT("ClampMin"));
+			const FString MaxText = Property->GetMetaData(TEXT("ClampMax"));
+			if (!MinText.IsEmpty() && Number < FCString::Atod(*MinText))
+				{ OutError = FString::Printf(TEXT("%s is below ClampMin %s"), *FieldPath, *MinText); return false; }
+			if (!MaxText.IsEmpty() && Number > FCString::Atod(*MaxText))
+				{ OutError = FString::Printf(TEXT("%s exceeds ClampMax %s"), *FieldPath, *MaxText); return false; }
+			return true;
+		}
+		if (CastField<FBoolProperty>(Property))
+		{
+			if (Value->Type != EJson::Boolean)
+			{
+				OutError = FString::Printf(TEXT("%s must be a boolean"), *FieldPath);
+				return false;
+			}
+			return true;
+		}
+		if (CastField<FStrProperty>(Property) || CastField<FNameProperty>(Property) || CastField<FTextProperty>(Property)
+			|| CastField<FObjectProperty>(Property) || CastField<FSoftObjectProperty>(Property))
+		{
+			if (Value->Type == EJson::Null && (CastField<FObjectProperty>(Property) || CastField<FSoftObjectProperty>(Property)))
+			{
+				return true;
+			}
+			if (Value->Type != EJson::String)
+			{
+				OutError = FString::Printf(TEXT("%s must be a string"), *FieldPath);
+				return false;
+			}
+			return true;
+		}
+		if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+		{
+			const TSharedPtr<FJsonObject>* ChildObject = nullptr;
+			if (!Value->TryGetObject(ChildObject) || !ChildObject || !ChildObject->IsValid())
+			{
+				OutError = FString::Printf(TEXT("%s must be an object"), *FieldPath);
+				return false;
+			}
+			return ValidateStructFields(StructProperty->Struct, *ChildObject->Get(), FieldPath, OutError);
+		}
+		if (const FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
+		{
+			const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+			if (!Value->TryGetArray(Values) || !Values)
+			{
+				OutError = FString::Printf(TEXT("%s must be an array"), *FieldPath);
+				return false;
+			}
+			for (int32 Index = 0; Index < Values->Num(); ++Index)
+			{
+				if (!ValidateReflectedValue(ArrayProperty->Inner, (*Values)[Index], FString::Printf(TEXT("%s[%d]"), *FieldPath, Index), OutError))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+		if (const FSetProperty* SetProperty = CastField<FSetProperty>(Property))
+		{
+			const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+			if (!Value->TryGetArray(Values) || !Values)
+			{
+				OutError = FString::Printf(TEXT("%s must be an array"), *FieldPath);
+				return false;
+			}
+			for (int32 Index = 0; Index < Values->Num(); ++Index)
+			{
+				if (!ValidateReflectedValue(SetProperty->ElementProp, (*Values)[Index], FString::Printf(TEXT("%s[%d]"), *FieldPath, Index), OutError))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+		if (const FMapProperty* MapProperty = CastField<FMapProperty>(Property))
+		{
+			const TSharedPtr<FJsonObject>* Object = nullptr;
+			if (!Value->TryGetObject(Object) || !Object || !Object->IsValid())
+			{
+				OutError = FString::Printf(TEXT("%s must be an object"), *FieldPath);
+				return false;
+			}
+			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*Object)->Values)
+			{
+				if (!ValidateReflectedValue(MapProperty->ValueProp, Pair.Value, FieldPath + TEXT(".") + Pair.Key, OutError))
+				{
+					return false;
+				}
+			}
+			return true;
+		}
+		return true;
+	}
+
+	bool BuildOutputStructValue(const FOutputStructColumn& Column, const TSharedPtr<FJsonObject>& JsonValue, FInstancedStruct& OutValue, FString& OutError)
+	{
+		UScriptStruct* StructType = GetOutputStructType(Column);
+		if (!StructType)
+		{
+			OutError = TEXT("OutputStruct column has no bound struct_type");
+			return false;
+		}
+		if (!JsonValue.IsValid())
+		{
+			OutError = TEXT("struct_value/output_struct must be an object");
+			return false;
+		}
+		if (!ValidateStructFields(StructType, *JsonValue, StructType->GetName(), OutError))
+		{
+			return false;
+		}
+
+		OutValue.InitializeAs(StructType);
+		FBulkFillSpec Spec;
+		Spec.TargetNamespace = TEXT("chooser");
+		Spec.bStrict = true;
+		Spec.Tree = JsonValue;
+		const FDryRunReport Report = FMonolithReflectionWalker::WriteTree(
+			JsonValue, StructType, OutValue.GetMutableMemory(), nullptr, Spec);
+		if (Report.Errors > 0)
+		{
+			for (const FBulkFillFieldWrite& Field : Report.FieldWrites)
+			{
+				if (!Field.bOk)
+				{
+					OutError = FString::Printf(TEXT("%s: %s"), *Field.Path, *Field.Reason);
+					break;
+				}
+			}
+			OutValue.Reset();
+			return false;
+		}
+		return true;
+	}
+
+	#if WITH_EDITORONLY_DATA
+	int32 GetColumnRowCount(const FInstancedStruct& Col);
+
+	bool ValidateChooserAlignment(const UChooserTable& Table, FString& OutError)
+	{
+		const int32 RowCount = Table.ResultsStructs.Num();
+		if (Table.DisabledRows.Num() != RowCount)
+		{
+			OutError = FString::Printf(TEXT("DisabledRows count %d does not match ResultsStructs count %d"), Table.DisabledRows.Num(), RowCount);
+			return false;
+		}
+		for (int32 ColumnIndex = 0; ColumnIndex < Table.ColumnsStructs.Num(); ++ColumnIndex)
+		{
+			const int32 ColumnRows = GetColumnRowCount(Table.ColumnsStructs[ColumnIndex]);
+			if (ColumnRows == INDEX_NONE)
+			{
+				OutError = FString::Printf(TEXT("column %d has an unsupported chooser column type"), ColumnIndex);
+				return false;
+			}
+			if (ColumnRows != RowCount)
+			{
+				OutError = FString::Printf(TEXT("column %d has %d rows but ResultsStructs has %d"), ColumnIndex, ColumnRows, RowCount);
+				return false;
+			}
+		}
+		return true;
+	}
+	#endif
 
 #if WITH_EDITORONLY_DATA
 	/**
@@ -177,7 +671,9 @@ namespace
 	 *   FEnumColumn        -> RowValues        (TArray<FChooserEnumRowData>)
 	 *   FGameplayTagColumn -> RowValues        (TArray<FGameplayTagContainer>)
 	 *   FFloatRangeColumn  -> RowValues        (TArray<FChooserFloatRangeRowData>)
+	 *   FChooserNameColumn -> RowValues        (TArray<FChooserNameRowData>)
 	 *   FOutputObjectColumn-> RowValues        (TArray<FChooserOutputObjectRowData>)
+	 *   FOutputStructColumn-> RowValues        (TArray<FInstancedStruct>)
 	 * Returns INDEX_NONE for an unrecognized column type.
 	 */
 	int32 GetColumnRowCount(const FInstancedStruct& Col)
@@ -186,7 +682,9 @@ namespace
 		if (const FEnumColumn* EnumC = Col.GetPtr<FEnumColumn>())              { return EnumC->RowValues.Num(); }
 		if (const FGameplayTagColumn* TagC = Col.GetPtr<FGameplayTagColumn>()) { return TagC->RowValues.Num(); }
 		if (const FFloatRangeColumn* RangeC = Col.GetPtr<FFloatRangeColumn>()) { return RangeC->RowValues.Num(); }
+		if (const FChooserNameColumn* NameC = Col.GetPtr<FChooserNameColumn>()) { return NameC->RowValues.Num(); }
 		if (const FOutputObjectColumn* OutC = Col.GetPtr<FOutputObjectColumn>()){ return OutC->RowValues.Num(); }
+		if (const FOutputStructColumn* StructC = Col.GetPtr<FOutputStructColumn>()){ return StructC->RowValues.Num(); }
 		return INDEX_NONE;
 	}
 
@@ -223,6 +721,53 @@ namespace
 		{
 			OutC->RowValues.Add(FChooserOutputObjectRowData());
 			return true;
+		}
+		if (FChooserNameColumn* NameC = Col.GetMutablePtr<FChooserNameColumn>())
+		{
+			NameC->RowValues.Add(NameC->DefaultRowValue);
+			return true;
+		}
+		if (FOutputStructColumn* StructC = Col.GetMutablePtr<FOutputStructColumn>())
+		{
+			if (!StructC->DefaultRowValue.IsValid())
+			{
+				return false;
+			}
+			StructC->RowValues.Add(StructC->DefaultRowValue);
+			return true;
+		}
+		return false;
+	}
+
+	bool RemoveLastCell(FInstancedStruct& Col)
+	{
+		if (FBoolColumn* BoolC = Col.GetMutablePtr<FBoolColumn>())
+		{
+			if (BoolC->RowValuesWithAny.Num() > 0) { BoolC->RowValuesWithAny.RemoveAt(BoolC->RowValuesWithAny.Num() - 1, EAllowShrinking::No); return true; }
+		}
+		if (FEnumColumn* EnumC = Col.GetMutablePtr<FEnumColumn>())
+		{
+			if (EnumC->RowValues.Num() > 0) { EnumC->RowValues.RemoveAt(EnumC->RowValues.Num() - 1, EAllowShrinking::No); return true; }
+		}
+		if (FGameplayTagColumn* TagC = Col.GetMutablePtr<FGameplayTagColumn>())
+		{
+			if (TagC->RowValues.Num() > 0) { TagC->RowValues.RemoveAt(TagC->RowValues.Num() - 1, EAllowShrinking::No); return true; }
+		}
+		if (FFloatRangeColumn* RangeC = Col.GetMutablePtr<FFloatRangeColumn>())
+		{
+			if (RangeC->RowValues.Num() > 0) { RangeC->RowValues.RemoveAt(RangeC->RowValues.Num() - 1, EAllowShrinking::No); return true; }
+		}
+		if (FChooserNameColumn* NameC = Col.GetMutablePtr<FChooserNameColumn>())
+		{
+			if (NameC->RowValues.Num() > 0) { NameC->RowValues.RemoveAt(NameC->RowValues.Num() - 1, EAllowShrinking::No); return true; }
+		}
+		if (FOutputObjectColumn* OutC = Col.GetMutablePtr<FOutputObjectColumn>())
+		{
+			if (OutC->RowValues.Num() > 0) { OutC->RowValues.RemoveAt(OutC->RowValues.Num() - 1, EAllowShrinking::No); return true; }
+		}
+		if (FOutputStructColumn* StructC = Col.GetMutablePtr<FOutputStructColumn>())
+		{
+			if (StructC->RowValues.Num() > 0) { StructC->RowValues.RemoveAt(StructC->RowValues.Num() - 1, EAllowShrinking::No); return true; }
 		}
 		return false;
 	}
@@ -274,6 +819,45 @@ namespace
 			OutError = TEXT("Bool cell must be a bool or 'any'/'true'/'false'");
 			return false;
 		}
+		if (FChooserNameColumn* NameC = Col.GetMutablePtr<FChooserNameColumn>())
+		{
+			const int32 Last = NameC->RowValues.Num() - 1;
+			if (!NameC->RowValues.IsValidIndex(Last)) { OutError = TEXT("Name column has no row to write"); return false; }
+
+			FString NameValue;
+			ENameColumnCellValueComparison Comparison = ENameColumnCellValueComparison::MatchEqual;
+			if (Cell.IsValid() && Cell->TryGetString(NameValue))
+			{
+				NameC->RowValues[Last].Value = FName(*NameValue);
+				NameC->RowValues[Last].Comparison = Comparison;
+				return true;
+			}
+
+			const TSharedPtr<FJsonObject>* CellObject = nullptr;
+			FString ComparisonString;
+			if (!Cell.IsValid() || !Cell->TryGetObject(CellObject) || !CellObject || !CellObject->IsValid()
+				|| !(*CellObject)->TryGetStringField(TEXT("comparison"), ComparisonString)
+				|| !ParseNameComparison(ComparisonString, Comparison))
+			{
+				OutError = TEXT("Name cell must be a string or {value:string,comparison:MatchEqual|MatchNotEqual|MatchAny}");
+				return false;
+			}
+
+			if (Comparison == ENameColumnCellValueComparison::MatchAny)
+			{
+				NameC->RowValues[Last].Comparison = Comparison;
+				NameC->RowValues[Last].Value = NAME_None;
+				return true;
+			}
+			if (!(*CellObject)->TryGetStringField(TEXT("value"), NameValue))
+			{
+				OutError = TEXT("Name cell requires value:string unless comparison is MatchAny");
+				return false;
+			}
+			NameC->RowValues[Last].Value = FName(*NameValue);
+			NameC->RowValues[Last].Comparison = Comparison;
+			return true;
+		}
 		if (FEnumColumn* EnumC = Col.GetMutablePtr<FEnumColumn>())
 		{
 			const int32 Last = EnumC->RowValues.Num() - 1;
@@ -285,7 +869,12 @@ namespace
 				OutError = TEXT("Enum cell must be an integer value");
 				return false;
 			}
-			EnumC->RowValues[Last].Value = static_cast<uint8>(static_cast<int32>(NumVal));
+			uint8 EnumValue = 0;
+			if (!ParseEnumValue(NumVal, EnumValue, OutError))
+			{
+				return false;
+			}
+			EnumC->RowValues[Last].Value = EnumValue;
 			EnumC->RowValues[Last].Comparison = EEnumColumnCellValueComparison::MatchEqual;
 			return true;
 		}
@@ -301,8 +890,13 @@ namespace
 				return false;
 			}
 			double MinV = 0.0, MaxV = 0.0;
-			(*Obj)->TryGetNumberField(TEXT("min"), MinV);
-			(*Obj)->TryGetNumberField(TEXT("max"), MaxV);
+			if (!(*Obj)->TryGetNumberField(TEXT("min"), MinV)
+				|| !(*Obj)->TryGetNumberField(TEXT("max"), MaxV)
+				|| !FMath::IsFinite(MinV) || !FMath::IsFinite(MaxV))
+			{
+				OutError = TEXT("FloatRange cell requires finite numeric min and max");
+				return false;
+			}
 			RangeC->RowValues[Last].Min = static_cast<float>(MinV);
 			RangeC->RowValues[Last].Max = static_cast<float>(MaxV);
 			return true;
@@ -351,6 +945,8 @@ namespace
 		else if (FEnumColumn* EnumC = Col.GetMutablePtr<FEnumColumn>())           { InputValue = &EnumC->InputValue; }
 		else if (FGameplayTagColumn* TagC = Col.GetMutablePtr<FGameplayTagColumn>()){ InputValue = &TagC->InputValue; }
 		else if (FFloatRangeColumn* RangeC = Col.GetMutablePtr<FFloatRangeColumn>()){ InputValue = &RangeC->InputValue; }
+		else if (FChooserNameColumn* NameC = Col.GetMutablePtr<FChooserNameColumn>()){ InputValue = &NameC->InputValue; }
+		else if (FOutputStructColumn* StructC = Col.GetMutablePtr<FOutputStructColumn>()){ InputValue = &StructC->InputValue; }
 		if (!InputValue || !InputValue->IsValid())
 		{
 			return;
@@ -442,6 +1038,40 @@ namespace
 			OutError = TEXT("Bool cell requires bool_value (bool) or 'any'");
 			return false;
 		}
+		if (FChooserNameColumn* NameC = Col.GetMutablePtr<FChooserNameColumn>())
+		{
+			if (!NameC->RowValues.IsValidIndex(RowIdx)) { OutError = TEXT("row index out of range for Name column"); return false; }
+
+			FString NameValue;
+			if (!Params->TryGetStringField(TEXT("name_value"), NameValue))
+			{
+				FString ComparisonString;
+				ENameColumnCellValueComparison Comparison = ENameColumnCellValueComparison::MatchEqual;
+				if (!Params->TryGetStringField(TEXT("comparison"), ComparisonString)
+					|| !ParseNameComparison(ComparisonString, Comparison)
+					|| Comparison != ENameColumnCellValueComparison::MatchAny)
+				{
+					OutError = TEXT("Name cell requires name_value:string unless comparison is MatchAny");
+					return false;
+				}
+				NameC->RowValues[RowIdx].Value = NAME_None;
+				NameC->RowValues[RowIdx].Comparison = Comparison;
+				return true;
+			}
+
+			ENameColumnCellValueComparison Comparison = ENameColumnCellValueComparison::MatchEqual;
+			FString ComparisonString;
+			if (Params->HasField(TEXT("comparison"))
+				&& (!Params->TryGetStringField(TEXT("comparison"), ComparisonString)
+					|| !ParseNameComparison(ComparisonString, Comparison)))
+			{
+				OutError = FString::Printf(TEXT("Unrecognized Name comparison '%s'"), *ComparisonString);
+				return false;
+			}
+			NameC->RowValues[RowIdx].Value = FName(*NameValue);
+			NameC->RowValues[RowIdx].Comparison = Comparison;
+			return true;
+		}
 		if (FEnumColumn* EnumC = Col.GetMutablePtr<FEnumColumn>())
 		{
 			if (!EnumC->RowValues.IsValidIndex(RowIdx)) { OutError = TEXT("row index out of range for Enum column"); return false; }
@@ -452,8 +1082,11 @@ namespace
 				OutError = TEXT("Enum cell requires enum_value (integer)");
 				return false;
 			}
-			EnumC->RowValues[RowIdx].Value = static_cast<uint8>(static_cast<int32>(NumVal));
-
+			uint8 EnumValue = 0;
+			if (!ParseEnumValue(NumVal, EnumValue, OutError))
+			{
+				return false;
+			}
 			EEnumColumnCellValueComparison Cmp = EEnumColumnCellValueComparison::MatchEqual;
 			FString CmpStr;
 			if (Params->TryGetStringField(TEXT("comparison"), CmpStr))
@@ -463,6 +1096,7 @@ namespace
 				else if (CmpStr.Equals(TEXT("MatchAny"),      ESearchCase::IgnoreCase)) { Cmp = EEnumColumnCellValueComparison::MatchAny; }
 				else { OutError = FString::Printf(TEXT("Unrecognized comparison '%s'"), *CmpStr); return false; }
 			}
+			EnumC->RowValues[RowIdx].Value = EnumValue;
 			EnumC->RowValues[RowIdx].Comparison = Cmp;
 			return true;
 		}
@@ -522,7 +1156,24 @@ namespace
 			TagC->RowValues[RowIdx] = MoveTemp(Container);
 			return true;
 		}
-		OutError = TEXT("column is not a writable input column (Bool/Enum/FloatRange/GameplayTag)");
+		if (FOutputStructColumn* StructC = Col.GetMutablePtr<FOutputStructColumn>())
+		{
+			if (!StructC->RowValues.IsValidIndex(RowIdx)) { OutError = TEXT("row index out of range for OutputStruct column"); return false; }
+			const TSharedPtr<FJsonObject>* StructObject = nullptr;
+			if (!Params->TryGetObjectField(TEXT("struct_value"), StructObject) || !StructObject || !StructObject->IsValid())
+			{
+				OutError = TEXT("OutputStruct cell requires struct_value:object");
+				return false;
+			}
+			FInstancedStruct NewValue;
+			if (!BuildOutputStructValue(*StructC, *StructObject, NewValue, OutError))
+			{
+				return false;
+			}
+			StructC->RowValues[RowIdx] = MoveTemp(NewValue);
+			return true;
+		}
+		OutError = TEXT("column is not a writable input/output column (Bool/Enum/FloatRange/GameplayTag/Name/OutputStruct)");
 		return false;
 	}
 #endif // WITH_EDITORONLY_DATA
@@ -626,6 +1277,8 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserColumn(c
 		? Params->GetStringField(TEXT("binding_property")) : FString();
 	const FString EnumClassStr = Params->HasField(TEXT("enum_class"))
 		? Params->GetStringField(TEXT("enum_class")) : FString();
+	const FString StructTypeStr = Params->HasField(TEXT("struct_type"))
+		? Params->GetStringField(TEXT("struct_type")) : FString();
 
 	UChooserTable* Table = FMonolithAssetUtils::LoadAssetByPath<UChooserTable>(AssetPath);
 	if (!Table)
@@ -634,6 +1287,31 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserColumn(c
 	}
 
 #if WITH_EDITORONLY_DATA
+	const bool bIsName = ColumnKind.Equals(TEXT("Name"), ESearchCase::IgnoreCase);
+	const bool bIsOutputStruct = IsOutputStructColumnKind(ColumnKind);
+	if ((bIsName || bIsOutputStruct) && BindingProp.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("binding_property is required for Name and OutputStruct columns"));
+	}
+	if (bIsName && Params->HasField(TEXT("struct_type")))
+	{
+		return FMonolithActionResult::Error(TEXT("struct_type is valid only for OutputStruct columns"));
+	}
+	if (!bIsOutputStruct && Params->HasField(TEXT("struct_type")) && !StructTypeStr.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("struct_type is valid only for OutputStruct columns"));
+	}
+	if (bIsOutputStruct && StructTypeStr.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("struct_type is required for OutputStruct columns"));
+	}
+
+	FString AlignmentError;
+	if (!ValidateChooserAlignment(*Table, AlignmentError))
+	{
+		return FMonolithActionResult::Error(AlignmentError);
+	}
+
 	// Build the new column FInstancedStruct of the requested kind. Each Make<>()
 	// runs the column's default constructor, which InitializeAs()'s InputValue
 	// with the matching context-property struct.
@@ -644,17 +1322,37 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserColumn(c
 	else if (ColumnKind.Equals(TEXT("Enum"),        ESearchCase::IgnoreCase)) { NewColumn = FInstancedStruct::Make<FEnumColumn>(); }
 	else if (ColumnKind.Equals(TEXT("GameplayTag"), ESearchCase::IgnoreCase)) { NewColumn = FInstancedStruct::Make<FGameplayTagColumn>(); }
 	else if (ColumnKind.Equals(TEXT("FloatRange"),  ESearchCase::IgnoreCase)) { NewColumn = FInstancedStruct::Make<FFloatRangeColumn>(); }
+	else if (bIsName)                                           { NewColumn = FInstancedStruct::Make<FChooserNameColumn>(); }
 	else if (ColumnKind.Equals(TEXT("OutputObject"),ESearchCase::IgnoreCase)) { NewColumn = FInstancedStruct::Make<FOutputObjectColumn>(); }
+	else if (bIsOutputStruct)                                   { NewColumn = FInstancedStruct::Make<FOutputStructColumn>(); }
 	else
 	{
 		return FMonolithActionResult::Error(FString::Printf(
-			TEXT("Unrecognized column_kind '%s' (expected Bool/Enum/GameplayTag/FloatRange/OutputObject)"), *ColumnKind));
+			TEXT("Unrecognized column_kind '%s' (expected Bool/Enum/GameplayTag/FloatRange/Name/OutputObject/OutputStruct)"), *ColumnKind));
 	}
 
-	// Optional input binding (filter columns only).
-	if (bIsInput && !BindingProp.IsEmpty())
+	if (bIsOutputStruct)
+	{
+		UScriptStruct* StructType = nullptr;
+		FString StructError;
+		if (!ResolveExactStructType(StructTypeStr, StructType, StructError) || !ApplyOutputStructType(NewColumn, StructType))
+		{
+			return FMonolithActionResult::Error(StructError.IsEmpty() ? TEXT("Failed to bind OutputStruct type") : StructError);
+		}
+	}
+
+	// Input binding applies to filter columns and OutputStruct's write target.
+	if ((bIsInput || bIsOutputStruct) && !BindingProp.IsEmpty())
 	{
 		ApplyInputBinding(NewColumn, BindingProp);
+	}
+	if (bIsName || bIsOutputStruct)
+	{
+		FString BindingError;
+		if (!ValidateNewColumnBinding(NewColumn, *Table, BindingError))
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("binding_property could not be compiled: %s"), *BindingError));
+		}
 	}
 
 	// Optional explicit enum class for Enum columns — sets the editor-side enum
@@ -684,6 +1382,10 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserColumn(c
 	// the authoritative ResultsStructs length.
 	const int32 CurrentRowCount = Table->ResultsStructs.Num();
 	EnsureColumnRowCount(NewColumn, CurrentRowCount);
+	if (GetColumnRowCount(NewColumn) != CurrentRowCount)
+	{
+		return FMonolithActionResult::Error(TEXT("new column could not be aligned to the table row count"));
+	}
 
 	Table->ColumnsStructs.Add(MoveTemp(NewColumn));
 	Table->MarkPackageDirty();
@@ -724,17 +1426,28 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserRow(cons
 	}
 
 #if WITH_EDITORONLY_DATA
+	FString AlignmentError;
+	if (!ValidateChooserAlignment(*Table, AlignmentError))
+	{
+		return FMonolithActionResult::Error(AlignmentError);
+	}
+
 	// --- Step 1: validate cells.Num() == INPUT-column count BEFORE mutating anything. ---
 	TArray<int32> InputColumnIndices;
+	TArray<int32> OutputStructColumnIndices;
 	for (int32 i = 0; i < Table->ColumnsStructs.Num(); ++i)
 	{
 		const FInstancedStruct& Col = Table->ColumnsStructs[i];
-		// Input columns are the filter kinds (Bool/Enum/GameplayTag/FloatRange).
-		// OutputObject columns are NOT addressed by cells — they receive the row's output.
+		// Input columns are the filter kinds. Output columns are not addressed by cells.
 		if (Col.GetPtr<FBoolColumn>() || Col.GetPtr<FEnumColumn>()
-			|| Col.GetPtr<FGameplayTagColumn>() || Col.GetPtr<FFloatRangeColumn>())
+			|| Col.GetPtr<FGameplayTagColumn>() || Col.GetPtr<FFloatRangeColumn>()
+			|| Col.GetPtr<FChooserNameColumn>())
 		{
 			InputColumnIndices.Add(i);
+		}
+		if (Col.GetPtr<FOutputStructColumn>())
+		{
+			OutputStructColumnIndices.Add(i);
 		}
 	}
 
@@ -752,6 +1465,30 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserRow(cons
 		return FMonolithActionResult::Error(FString::Printf(TEXT("output_psd asset not found: %s"), *OutputPsd));
 	}
 
+	FInstancedStruct OutputStructValue;
+	if (OutputStructColumnIndices.Num() > 1)
+	{
+		return FMonolithActionResult::Error(TEXT("add_chooser_row supports at most one OutputStruct column"));
+	}
+	if (OutputStructColumnIndices.Num() == 1)
+	{
+		const TSharedPtr<FJsonObject>* OutputObject = nullptr;
+		if (!Params->TryGetObjectField(TEXT("output_struct"), OutputObject) || !OutputObject || !OutputObject->IsValid())
+		{
+			return FMonolithActionResult::Error(TEXT("output_struct:object is required when the table has exactly one OutputStruct column"));
+		}
+		const FOutputStructColumn* OutputColumn = Table->ColumnsStructs[OutputStructColumnIndices[0]].GetPtr<FOutputStructColumn>();
+		FString StructError;
+		if (!OutputColumn || !BuildOutputStructValue(*OutputColumn, *OutputObject, OutputStructValue, StructError))
+		{
+			return FMonolithActionResult::Error(StructError.IsEmpty() ? TEXT("Failed to build output_struct") : StructError);
+		}
+	}
+	else if (Params->HasField(TEXT("output_struct")))
+	{
+		return FMonolithActionResult::Error(TEXT("output_struct is valid only when the table has exactly one OutputStruct column"));
+	}
+
 	// Snapshot the current authoritative row count so we can detect/repair drift.
 	const int32 RowCountBefore = Table->ResultsStructs.Num();
 
@@ -763,12 +1500,31 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserRow(cons
 	{
 		EnsureColumnRowCount(Col, TargetRowCount);
 	}
+	for (const FInstancedStruct& Col : Table->ColumnsStructs)
+	{
+		if (GetColumnRowCount(Col) != TargetRowCount)
+		{
+			for (FInstancedStruct& RollbackColumn : Table->ColumnsStructs)
+			{
+				if (GetColumnRowCount(RollbackColumn) == TargetRowCount)
+				{
+					RemoveLastCell(RollbackColumn);
+				}
+			}
+			return FMonolithActionResult::Error(TEXT("row append could not align every chooser column"));
+		}
+	}
 
 	// ResultsStructs: append the FAssetChooser result for this row.
 	{
 		FInstancedStruct ResultStruct = FInstancedStruct::Make<FAssetChooser>();
 		ResultStruct.GetMutable<FAssetChooser>().Asset = OutputAsset;
 		Table->ResultsStructs.Add(MoveTemp(ResultStruct));
+	}
+	if (OutputStructColumnIndices.Num() == 1)
+	{
+		FOutputStructColumn* OutputColumn = Table->ColumnsStructs[OutputStructColumnIndices[0]].GetMutablePtr<FOutputStructColumn>();
+		OutputColumn->RowValues.Last() = MoveTemp(OutputStructValue);
 	}
 
 	// DisabledRows is a parallel TArray<bool>; grow by one (new row enabled).
@@ -788,13 +1544,7 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleAddChooserRow(cons
 				const int32 N = GetColumnRowCount(RbCol);
 				if (N == TargetRowCount)
 				{
-					// Trim the cell we appended in Step 2. RemoveAt avoids the
-					// [[nodiscard]] return of Pop() (C4834 under warnings-as-errors).
-					if (FBoolColumn* RbBoolC = RbCol.GetMutablePtr<FBoolColumn>())              { RbBoolC->RowValuesWithAny.RemoveAt(RbBoolC->RowValuesWithAny.Num() - 1, EAllowShrinking::No); }
-					else if (FEnumColumn* RbEnumC = RbCol.GetMutablePtr<FEnumColumn>())         { RbEnumC->RowValues.RemoveAt(RbEnumC->RowValues.Num() - 1, EAllowShrinking::No); }
-					else if (FGameplayTagColumn* RbTagC = RbCol.GetMutablePtr<FGameplayTagColumn>()){ RbTagC->RowValues.RemoveAt(RbTagC->RowValues.Num() - 1, EAllowShrinking::No); }
-					else if (FFloatRangeColumn* RbRangeC = RbCol.GetMutablePtr<FFloatRangeColumn>()){ RbRangeC->RowValues.RemoveAt(RbRangeC->RowValues.Num() - 1, EAllowShrinking::No); }
-					else if (FOutputObjectColumn* RbOutC = RbCol.GetMutablePtr<FOutputObjectColumn>()){ RbOutC->RowValues.RemoveAt(RbOutC->RowValues.Num() - 1, EAllowShrinking::No); }
+					RemoveLastCell(RbCol);
 				}
 			}
 			Table->ResultsStructs.RemoveAt(Table->ResultsStructs.Num() - 1, EAllowShrinking::No);
@@ -837,6 +1587,14 @@ FMonolithActionResult FMonolithChooserAuthoringActions::HandleSetChooserCell(con
 	if (!Params->TryGetNumberField(TEXT("row_index"), RowIdxD))
 	{
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: row_index"));
+	}
+	if (!FMath::IsFinite(ColIdxD) || ColIdxD < 0.0 || ColIdxD > TNumericLimits<int32>::Max() || ColIdxD != FMath::RoundToDouble(ColIdxD))
+	{
+		return FMonolithActionResult::Error(TEXT("column_index must be a finite nonnegative integer"));
+	}
+	if (!FMath::IsFinite(RowIdxD) || RowIdxD < 0.0 || RowIdxD > TNumericLimits<int32>::Max() || RowIdxD != FMath::RoundToDouble(RowIdxD))
+	{
+		return FMonolithActionResult::Error(TEXT("row_index must be a finite nonnegative integer"));
 	}
 	const int32 ColIdx = static_cast<int32>(ColIdxD);
 	const int32 RowIdx = static_cast<int32>(RowIdxD);
