@@ -7,6 +7,10 @@
 #include "GameFramework/Actor.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/World.h"
+#include "Engine/Engine.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/Controller.h"
+#include "GameFramework/PlayerState.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
@@ -37,8 +41,11 @@ namespace
 	{
 		FAnimPIELookup Result;
 
-		FString ActorName = Params->GetStringField(TEXT("actor"));
-		if (ActorName.IsEmpty())
+		FString ActorName;
+		Params->TryGetStringField(TEXT("actor"), ActorName);
+		int32 PlayerId = INDEX_NONE;
+		const bool bByPlayer = Params->TryGetNumberField(TEXT("player_id"), PlayerId);
+		if (ActorName.IsEmpty() && !bByPlayer)
 		{
 			Result.Error = FMonolithActionResult::Error(TEXT("Missing required param 'actor'"));
 			return Result;
@@ -50,20 +57,41 @@ namespace
 			ComponentName = Params->GetStringField(TEXT("component_name"));
 		}
 
-		FWorldContext* PIEContext = GEditor ? GEditor->GetPIEWorldContext() : nullptr;
-		if (!PIEContext || !PIEContext->World())
+		int32 PieInstance = 0;
+		Params->TryGetNumberField(TEXT("pie_instance"), PieInstance);
+		UWorld* PIEWorld = nullptr;
+		if (GEngine)
 		{
-			Result.Error = FMonolithActionResult::Error(TEXT("PIE not running — start Play-In-Editor first"));
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.PIEInstance == PieInstance && Context.World() && Context.World()->WorldType == EWorldType::PIE)
+				{
+					PIEWorld = Context.World();
+					break;
+				}
+			}
+		}
+		if (!PIEWorld)
+		{
+			Result.Error = FMonolithActionResult::Error(FString::Printf(TEXT("Requested PIE instance %d is unavailable"), PieInstance));
 			return Result;
 		}
-		UWorld* PIEWorld = PIEContext->World();
 
 		for (TActorIterator<AActor> It(PIEWorld); It; ++It)
 		{
-			if (It->GetActorLabel() == ActorName || It->GetName() == ActorName)
+			const APawn* Pawn = Cast<APawn>(*It);
+			const APlayerState* PlayerState = Pawn ? Pawn->GetPlayerState() : nullptr;
+			const bool bPlayerMatches = !bByPlayer || (PlayerState && PlayerState->GetPlayerId() == PlayerId);
+			const bool bNameMatches = ActorName.IsEmpty() || It->GetActorLabel() == ActorName
+				|| It->GetName() == ActorName || It->GetPathName() == ActorName;
+			if (bPlayerMatches && bNameMatches)
 			{
+				if (Result.Actor)
+				{
+					Result.Error = FMonolithActionResult::Error(TEXT("Ambiguous actor selector; use a full actor path or player_id"));
+					return Result;
+				}
 				Result.Actor = *It;
-				break;
 			}
 		}
 		if (!Result.Actor)
@@ -78,8 +106,12 @@ namespace
 			if (!MC) continue;
 			if (ComponentName.IsEmpty() || MC->GetName() == ComponentName)
 			{
+				if (Result.MeshComp)
+				{
+					Result.Error = FMonolithActionResult::Error(TEXT("Ambiguous skeletal mesh selector; specify component_name"));
+					return Result;
+				}
 				Result.MeshComp = MC;
-				break;
 			}
 		}
 		if (!Result.MeshComp)
@@ -333,7 +365,9 @@ void FMonolithAnimationRuntimeActions::RegisterActions(FMonolithToolRegistry& Re
 		     "When 'compare_to_actor' is set, samples a SECOND actor's AnimInstance in lockstep and emits per-variable deltas with per-type tolerance pass/fail classification + an overall roll-up."),
 		FMonolithActionHandler::CreateStatic(&HandleSamplePIEAnimInstance),
 		FParamSchemaBuilder()
-			.Required(TEXT("actor"), TEXT("string"), TEXT("Actor label or name in the PIE world"))
+			.Optional(TEXT("actor"), TEXT("string"), TEXT("Unique actor label/name or full path in the selected PIE world; required unless player_id is supplied"))
+			.Optional(TEXT("pie_instance"), TEXT("integer"), TEXT("Exact PIE instance, default 0; never falls back to another world"))
+			.Optional(TEXT("player_id"), TEXT("integer"), TEXT("Replicated PlayerState player id; resolves that player's pawn in the selected world"))
 			.Optional(TEXT("component_name"), TEXT("string"), TEXT("Skeletal mesh component name (if the actor has multiple)"))
 			.Optional(TEXT("variables"), TEXT("array"), TEXT("Anim-instance variable names to read live via reflection. Supports dotted member paths (e.g. 'Movement.Speed') that descend nested structs, matching UserDefinedStruct members by their friendly (authored) name. Struct-member traversal only; array/map indexing is not supported."))
 			.Optional(TEXT("bones"), TEXT("array"), TEXT("Bone names (strings) to report world-space transforms for"))
@@ -359,6 +393,21 @@ FMonolithActionResult FMonolithAnimationRuntimeActions::HandleSamplePIEAnimInsta
 
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(TEXT("actor"), Lookup.Actor->GetActorLabel());
+	Root->SetStringField(TEXT("actor_path"), Lookup.Actor->GetPathName());
+	Root->SetStringField(TEXT("world_path"), Lookup.Actor->GetWorld()->GetPathName());
+	if (const APawn* Pawn = Cast<APawn>(Lookup.Actor))
+	{
+		if (const APlayerState* PlayerState = Pawn->GetPlayerState())
+		{
+			Root->SetNumberField(TEXT("player_id"), PlayerState->GetPlayerId());
+			Root->SetStringField(TEXT("player_state_path"), PlayerState->GetPathName());
+		}
+		Root->SetStringField(TEXT("controller_path"), GetPathNameSafe(Pawn->GetController()));
+	}
+	Root->SetNumberField(TEXT("pie_instance"), GEngine->GetWorldContextFromWorld(Lookup.Actor->GetWorld())->PIEInstance);
+	Root->SetBoolField(TEXT("authority"), Lookup.Actor->HasAuthority());
+	Root->SetNumberField(TEXT("sample_frame"), static_cast<double>(GFrameCounter));
+	Root->SetNumberField(TEXT("world_seconds"), Lookup.Actor->GetWorld()->GetTimeSeconds());
 	Root->SetStringField(TEXT("component"), MeshComp->GetName());
 
 	// Animation mode + class info.
@@ -547,6 +596,9 @@ FMonolithActionResult FMonolithAnimationRuntimeActions::HandleSamplePIEAnimInsta
 		// with a synthetic params blob (actor + optional component name).
 		TSharedPtr<FJsonObject> CmpParams = MakeShared<FJsonObject>();
 		CmpParams->SetStringField(TEXT("actor"), CompareActor);
+		int32 ComparePieInstance = 0;
+		Params->TryGetNumberField(TEXT("pie_instance"), ComparePieInstance);
+		CmpParams->SetNumberField(TEXT("pie_instance"), ComparePieInstance);
 		FString CmpComponent;
 		if (Params->TryGetStringField(TEXT("compare_component_name"), CmpComponent) && !CmpComponent.IsEmpty())
 		{
