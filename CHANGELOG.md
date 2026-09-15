@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Preserved local compatibility fixes
 
-- **Native source indexing now replaces project snapshots atomically.** Schema-v4 databases use deterministic path identity and file-owned deprecation rows. Project-only reindexes remove stale dependent rows in one transaction, and cancellation, unreadable files, or write failures roll back without retaining obsolete project text. `source.get_index_status` exposes migration and progress state; older generated databases require one explicit full `source.trigger_reindex`.
+- **Native source indexing now replaces project snapshots atomically.** Schema-v4 databases use deterministic path identity and file-owned deprecation rows. Project-only reindexes remove stale dependent rows in one transaction, and cancellation, unreadable files, or write failures roll back without retaining obsolete project text. `source.get_index_status` exposes migration and progress state; older generated databases require one explicit full `source.trigger_reindex`. The v0.23.0 asset-index shutdown fix is complementary and must not weaken this source-index contract.
 - **Transient editor slow tasks no longer masquerade as blocking dialogs.** On UE 5.8+, the modal watcher classifies slow-task windows as informational and harvests genuine blocking dialogs on the first modal-loop tick, after Slate has registered the actual window. UE 5.7 retains the legacy hook while using the same deferred capture.
 - **Montage authoring now reports duration immediately.** New segments initialize their cached length, and montage builders refresh linkable elements and composite length before returning so same-session callers can validate the authored result.
 
