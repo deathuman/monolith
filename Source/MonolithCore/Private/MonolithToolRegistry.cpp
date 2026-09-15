@@ -1,4 +1,6 @@
 #include "MonolithToolRegistry.h"
+#include "MonolithUIRecovery.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "MonolithJsonUtils.h"
 #include "MonolithParamSchema.h"
 #include "MonolithFuzzyMatch.h"
@@ -200,11 +202,34 @@ void FMonolithToolRegistry::UnregisterNamespace(const FString& Namespace)
 	}
 }
 
+namespace
+{
+	FThreadSafeCounter MonolithActionDepth;
+	TAtomic<bool> bMonolithUIRecoveryOnly(false);
+	struct FScopedMonolithAction
+	{
+		FScopedMonolithAction() { MonolithActionDepth.Increment(); }
+		~FScopedMonolithAction() { MonolithActionDepth.Decrement(); }
+	};
+}
+
+bool IsMonolithActionExecuting() { return MonolithActionDepth.GetValue() > 0; }
+bool SetMonolithUIRecoveryOnly(bool bEnabled) { return bMonolithUIRecoveryOnly.Exchange(bEnabled); }
+
 FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	const FString& Namespace,
 	const FString& Action,
 	const TSharedPtr<FJsonObject>& Params)
 {
+	if (bMonolithUIRecoveryOnly.Load())
+	{
+		const bool bRecoveryAction = Namespace == TEXT("editor") &&
+			(Action == TEXT("get_slate_snapshot") || Action == TEXT("capture_slate_window")
+			 || Action == TEXT("interact_slate") || Action == TEXT("get_slate_operation"));
+		if (!bRecoveryAction && !(Namespace == TEXT("describe") && Action == TEXT("action_schema")))
+			return FMonolithActionResult::Error(TEXT("Modal recovery is active; only Slate observation, operation status and queued UI recovery are available."));
+	}
+	FScopedMonolithAction ExecutionScope;
 	FScopeLock Lock(&RegistryLock);
 
 	FString Key = MakeKey(Namespace, Action);

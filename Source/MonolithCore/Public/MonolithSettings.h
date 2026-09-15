@@ -205,6 +205,15 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="Modules")
 	bool bEnableEditor = true;
 
+	/** Enable Unreal's native Slate accessibility bridge during MonolithEditor
+	 *  startup so external accessibility/UI-automation clients can inspect the
+	 *  editor semantically. Off by default for the public plugin; projects that
+	 *  opt in must restart the editor. Higher-priority console overrides still win. */
+	UPROPERTY(config, EditAnywhere, Category="Modules|Editor",
+		meta=(DisplayName="Enable Native Editor Accessibility Bridge",
+			  ToolTip="Enable Unreal's native Slate/platform accessibility provider early in MonolithEditor startup for external accessibility and UI-automation clients. Requires an editor restart."))
+	bool bEnableEditorAccessibilityBridge = false;
+
 	UPROPERTY(config, EditAnywhere, Category="Modules")
 	bool bEnableConfig = true;
 

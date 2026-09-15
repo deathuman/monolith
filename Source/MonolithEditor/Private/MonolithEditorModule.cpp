@@ -1,6 +1,7 @@
 #include "MonolithEditorModule.h"
 #include "MonolithEditorActions.h"
 #include "MonolithEditorMapActions.h"
+#include "MonolithEditorSlateActions.h"
 #include "MonolithPieObjectActions.h"
 #include "MonolithPieInputActions.h"
 #include "MonolithPieTimeseries.h"
@@ -11,6 +12,7 @@
 #include "MonolithSettings.h"
 #include "PropertyEditorModule.h"
 #include "Misc/OutputDeviceRedirector.h"
+#include "HAL/IConsoleManager.h"
 
 // PART C — passive modal watcher.
 #include "Misc/CoreDelegates.h"
@@ -24,6 +26,40 @@
 
 namespace
 {
+	void EnableNativeEditorAccessibilityBridge(const UMonolithSettings& Settings)
+	{
+		if (!Settings.bEnableEditorAccessibilityBridge)
+		{
+			return;
+		}
+
+		IConsoleVariable* AccessibilityCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Accessibility.Enable"));
+		if (!AccessibilityCVar)
+		{
+			UE_LOG(LogMonolith, Warning,
+				TEXT("Monolith — native editor accessibility requested, but Accessibility.Enable is unavailable."));
+			return;
+		}
+
+		// Project-setting priority makes the Monolith opt-in deterministic while
+		// still allowing command-line/code/console overrides to take precedence.
+		if (AccessibilityCVar->GetInt() == 0)
+		{
+			AccessibilityCVar->Set(1, ECVF_SetByProjectSetting);
+		}
+
+		if (AccessibilityCVar->GetInt() != 0)
+		{
+			UE_LOG(LogMonolith, Display,
+				TEXT("Monolith — native editor accessibility bridge active (Accessibility.Enable=1)."));
+		}
+		else
+		{
+			UE_LOG(LogMonolith, Warning,
+				TEXT("Monolith — native editor accessibility was requested, but a higher-priority Accessibility.Enable override kept it disabled."));
+		}
+	}
+
 	// Recursively walk a Slate widget subtree, appending the text of every STextBlock
 	// found to OutText (newline-joined). Best-effort and depth-bounded so a pathological
 	// tree can't stall the first modal-loop tick.
@@ -56,13 +92,20 @@ namespace
 
 void FMonolithEditorModule::StartupModule()
 {
-	if (!GetDefault<UMonolithSettings>()->bEnableEditor) return;
+	const UMonolithSettings* Settings = GetDefault<UMonolithSettings>();
+	if (!Settings->bEnableEditor) return;
+
+	// Enable the engine's existing Slate -> platform accessibility provider before
+	// normal Monolith editor registration. External UIA/assistive clients can query
+	// the editor as soon as startup completes without a late runtime console toggle.
+	EnableNativeEditorAccessibilityBridge(*Settings);
 
 	LogCapture = new FMonolithLogCapture();
 	GLog->AddOutputDevice(LogCapture);
 
 	FMonolithEditorActions::RegisterActions(LogCapture);
 	FMonolithEditorMapActions::RegisterActions(FMonolithToolRegistry::Get());  // F8: create_empty_map + get_module_status
+	FMonolithEditorSlateActions::RegisterActions(FMonolithToolRegistry::Get());
 	// Gap 8: live-PIE object property read + function call (editor namespace).
 	FMonolithPieObjectActions::RegisterActions(FMonolithToolRegistry::Get());
 	// Gap 9: time-series PIE sampling with scripted provocation. Implemented in
@@ -140,7 +183,7 @@ void FMonolithEditorModule::OnPreSlateModal()
 
 void FMonolithEditorModule::OnModalLoopTick(float DeltaTime)
 {
-	(void)DeltaTime;
+	FMonolithEditorSlateActions::TickModalRecovery(DeltaTime);
 	int64 Id = 0;
 #if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 8, 0)
 	if (PendingModalIdentifiers.Num() == 0)
@@ -177,7 +220,7 @@ void FMonolithEditorModule::OnModalLoopTick(float DeltaTime)
 	}
 #endif
 	UE_LOG(LogMonolith, Warning,
-		TEXT("MODAL_OPEN ts='%s' id=%lld slow_task=false title='%s' text='%s' — game thread is in a blocking modal loop; MCP will be unresponsive until dismissed."),
+		TEXT("MODAL_OPEN ts='%s' id=%lld slow_task=false title='%s' text='%s' — blocking modal loop; deferred Slate actions admit restricted recovery requests, while legacy synchronous actions remain blocked until dismissal."),
 		*FDateTime::Now().ToString(TEXT("%Y-%m-%dT%H:%M:%S")), Id, *Title, *Text);
 }
 
@@ -211,6 +254,7 @@ void FMonolithEditorModule::OnPostSlateModal()
 
 void FMonolithEditorModule::ShutdownModule()
 {
+	FMonolithEditorSlateActions::Shutdown();
 #if WITH_EDITOR
 	if (PreSlateModalHandle.IsValid())
 	{
