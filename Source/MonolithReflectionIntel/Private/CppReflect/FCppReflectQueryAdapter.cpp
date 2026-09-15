@@ -152,24 +152,102 @@ namespace
 			if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return 0; }
 			int32 Line = 0;
 			Stmt.GetColumnValueByIndex(0, Line);
-			return Line;
+			if (Line > 0) { return Line; }
 		}
-		FSQLitePreparedStatement Stmt;
-		if (!Stmt.Create(DB, TEXT(
-			"SELECT s.line_start FROM symbols s "
-			"JOIN symbols p ON p.id = s.parent_symbol_id "
-			"WHERE s.name = ? AND s.kind IN ('function','method') "
-			"  AND p.name = ? AND p.kind IN ('class','struct') "
+		else
+		{
+			FSQLitePreparedStatement Stmt;
+			if (Stmt.Create(DB, TEXT(
+				"SELECT s.line_start FROM symbols s "
+				"JOIN symbols p ON p.id = s.parent_symbol_id "
+				"WHERE s.name = ? AND s.kind IN ('function','method') "
+				"  AND p.name = ? AND p.kind IN ('class','struct') "
+				"LIMIT 1;")))
+			{
+				Stmt.SetBindingValueByIndex(1, FunctionName);
+				Stmt.SetBindingValueByIndex(2, OwningClass);
+				if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+				{
+					int32 Line = 0;
+					Stmt.GetColumnValueByIndex(0, Line);
+					if (Line > 0) { return Line; }
+				}
+			}
+		}
+
+		// UHT can expose a reflected function whose declaration was not emitted
+		// as a `function` symbol by the lightweight C++ parser. The source FTS
+		// index still retains the original lines, so resolve the owning class to
+		// its header and search only that file. A missing FTS table, file, or
+		// token remains the documented best-effort source_line=0 result.
+		int32 ClassFileId = 0;
+		FSQLitePreparedStatement ClassStmt;
+		if (!ClassStmt.Create(DB, TEXT(
+			"SELECT file_id FROM symbols "
+			"WHERE name = ? AND kind IN ('class','struct') "
 			"LIMIT 1;")))
 		{
 			return 0;
 		}
-		Stmt.SetBindingValueByIndex(1, FunctionName);
-		Stmt.SetBindingValueByIndex(2, OwningClass);
-		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return 0; }
-		int32 Line = 0;
-		Stmt.GetColumnValueByIndex(0, Line);
-		return Line;
+		ClassStmt.SetBindingValueByIndex(1, OwningClass);
+		if (ClassStmt.Step() != ESQLitePreparedStatementStepResult::Row)
+		{
+			return 0;
+		}
+		ClassStmt.GetColumnValueByIndex(0, ClassFileId);
+		if (ClassFileId <= 0)
+		{
+			return 0;
+		}
+
+		FSQLitePreparedStatement SourceStmt;
+		if (!SourceStmt.Create(DB, TEXT(
+			"SELECT line_number, text FROM source_fts "
+			"WHERE file_id = ? AND source_fts MATCH ? "
+			"ORDER BY line_number LIMIT 64;")))
+		{
+			return 0;
+		}
+		SourceStmt.SetBindingValueByIndex(1, ClassFileId);
+		SourceStmt.SetBindingValueByIndex(2, FunctionName);
+
+		while (SourceStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			int32 ChunkStart = 0;
+			FString ChunkText;
+			SourceStmt.GetColumnValueByIndex(0, ChunkStart);
+			SourceStmt.GetColumnValueByIndex(1, ChunkText);
+
+			TArray<FString> Lines;
+			ChunkText.ParseIntoArrayLines(Lines, false);
+			for (int32 Index = 0; Index < Lines.Num(); ++Index)
+			{
+				const FString& SourceLine = Lines[Index];
+				const int32 NameOffset = SourceLine.Find(FunctionName, ESearchCase::CaseSensitive);
+				if (NameOffset == INDEX_NONE)
+				{
+					continue;
+				}
+
+				auto IsIdentifierChar = [](TCHAR Char)
+				{
+					return (Char >= TEXT('A') && Char <= TEXT('Z'))
+						|| (Char >= TEXT('a') && Char <= TEXT('z'))
+						|| (Char >= TEXT('0') && Char <= TEXT('9'))
+						|| Char == TEXT('_');
+				};
+				const bool bLeftBoundary = NameOffset == 0
+					|| !IsIdentifierChar(SourceLine[NameOffset - 1]);
+				const int32 NameEnd = NameOffset + FunctionName.Len();
+				const bool bRightBoundary = NameEnd >= SourceLine.Len()
+					|| !IsIdentifierChar(SourceLine[NameEnd]);
+				if (bLeftBoundary && bRightBoundary)
+				{
+					return ChunkStart + Index;
+				}
+			}
+		}
+		return 0;
 	}
 
 	bool CollectClassSpecifierTokens(FSQLiteDatabase& DB, TMap<FString, int32>& OutCounts)
