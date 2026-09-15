@@ -133,6 +133,15 @@ public:
 	 */
 	bool ForceRebuildReflectionTables(FString& OutCppReflectStatus, FString& OutNetworkStatus);
 
+#if WITH_DEV_AUTOMATION_TESTS
+	/** Test-only visibility for the root list passed into the UHT indexers. */
+	static TArray<FString> ResolveArtefactRootsForTesting(
+		bool bIncludeProjectPlugins, bool bIncludeMarketplacePlugins)
+	{
+		return ResolveArtefactRoots(bIncludeProjectPlugins, bIncludeMarketplacePlugins);
+	}
+#endif
+
 	/**
 	 * Return the SHARED EngineSource.db handle owned by UMonolithSourceSubsystem,
 	 * borrowed for read-only queries. This module no longer opens its own handle

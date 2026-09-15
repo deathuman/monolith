@@ -54,6 +54,10 @@
 #include "MonolithSourceDatabase.h"
 #include "Editor.h"
 
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#endif
+
 DEFINE_LOG_CATEGORY(LogMonolithReflectionIntel);
 
 #define LOCTEXT_NAMESPACE "FMonolithReflectionIntelModule"
@@ -73,6 +77,14 @@ namespace
 	{
 		return FModuleManager::GetModulePtr<FMonolithReflectionIntelModule>(
 			TEXT("MonolithReflectionIntel"));
+	}
+
+	FString ResolveProjectBuildArtefactRoot()
+	{
+		// ProjectIntermediateDir can be relative to the editor process directory.
+		// Convert it here so the indexers do not rebase it against ProjectDir.
+		return FPaths::ConvertRelativePathToFull(
+			FPaths::ProjectIntermediateDir() / TEXT("Build"));
 	}
 
 	/**
@@ -708,11 +720,8 @@ TArray<FString> FMonolithReflectionIntelModule::ResolveArtefactRoots(
 
 	// Game module root — ALWAYS scanned (preserves the original single-root
 	// behavior). FUHTArtefactReader / FNetworkRepIndexer descend
-	// <root>/<Platform>/<Target>/Inc/<Module>/UHT/ from here. Force an absolute
-	// project-anchored path: a relative ProjectIntermediateDir() would otherwise
-	// rebase against the process dir and yield a non-existent root (seen as
-	// "/home/game/Intermediate/Build" on a Linux source build).
-	Roots.Add(FPaths::ConvertRelativePathToFull(FPaths::ProjectIntermediateDir()) / TEXT("Build"));
+	// <root>/<Platform>/<Target>/Inc/<Module>/UHT/ from here.
+	Roots.Add(ResolveProjectBuildArtefactRoot());
 
 	// Fold in enabled plugins per the two scope flags. GetEnabledPlugins()
 	// returns enabled-only, so disabled plugins are never considered.
@@ -1091,6 +1100,31 @@ bool FMonolithReflectionIntelModule::ForceRebuildReflectionTables(
 		*OutCppReflectStatus, *OutNetworkStatus);
 	return bAllOk;
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithReflectionIntelProjectRootTest,
+	"Monolith.ReflectionIntel.ProjectBuildArtefactRootIsAbsolute",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithReflectionIntelProjectRootTest::RunTest(const FString& /*Parameters*/)
+{
+	const TArray<FString> Roots = FMonolithReflectionIntelModule::ResolveArtefactRootsForTesting(
+		/*bIncludeProjectPlugins=*/false, /*bIncludeMarketplacePlugins=*/false);
+	TestTrue(TEXT("Game module artefact root is present"), Roots.Num() > 0);
+	if (Roots.Num() == 0)
+	{
+		return false;
+	}
+
+	const FString ExpectedRoot = ResolveProjectBuildArtefactRoot();
+	TestEqual(TEXT("Game module root is normalized before the indexer boundary"), Roots[0], ExpectedRoot);
+	TestFalse(TEXT("Game module artefact root is absolute"), FPaths::IsRelative(Roots[0]));
+	TestTrue(TEXT("Game module artefact root stays under the project"),
+		FPaths::IsUnderDirectory(Roots[0], FPaths::ConvertRelativePathToFull(FPaths::ProjectDir())));
+	return true;
+}
+#endif
 
 #undef LOCTEXT_NAMESPACE
 

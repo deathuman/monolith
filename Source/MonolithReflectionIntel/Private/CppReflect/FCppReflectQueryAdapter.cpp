@@ -510,7 +510,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleGetUClass(const TSharedPtr<
 	{
 		FSQLitePreparedStatement FuncStmt;
 		FString FuncSql = TEXT(
-			"SELECT function_name, return_type, blueprint_callable, cpp_module, specifiers "
+			"SELECT function_name, return_type, blueprint_callable, cpp_module, specifiers, source_line "
 			"FROM reflect_ufunctions WHERE owning_class = ?");
 		if (!ModuleFilter.IsEmpty()) { FuncSql += TEXT(" AND cpp_module = ?"); }
 		FuncSql += TEXT(" ORDER BY function_name;");
@@ -524,12 +524,17 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleGetUClass(const TSharedPtr<
 			while (FuncStmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				FString FName, RetType, FModule, Specs;
-				int32 BpCallable = 0;
+				int32 BpCallable = 0, SourceLine = 0;
 				FuncStmt.GetColumnValueByIndex(0, FName);
 				FuncStmt.GetColumnValueByIndex(1, RetType);
 				FuncStmt.GetColumnValueByIndex(2, BpCallable);
 				FuncStmt.GetColumnValueByIndex(3, FModule);
 				FuncStmt.GetColumnValueByIndex(4, Specs);
+				FuncStmt.GetColumnValueByIndex(5, SourceLine);
+				if (SourceLine == 0)
+				{
+					SourceLine = LookupFunctionSourceLine(*DB, CName, FName);
+				}
 
 				TSharedPtr<FJsonObject> F = MakeShared<FJsonObject>();
 				F->SetStringField(TEXT("function_name"), FName);
@@ -537,6 +542,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleGetUClass(const TSharedPtr<
 				F->SetBoolField(TEXT("blueprint_callable"), BpCallable != 0);
 				F->SetStringField(TEXT("cpp_module"), FModule);
 				F->SetStringField(TEXT("specifiers"), Specs);
+				F->SetNumberField(TEXT("source_line"), SourceLine);
 				Funcs.Add(MakeShared<FJsonValueObject>(F));
 			}
 			UClassObj->SetArrayField(TEXT("ufunctions"), Funcs);
