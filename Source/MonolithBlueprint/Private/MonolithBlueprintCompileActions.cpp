@@ -17,9 +17,15 @@
 #include "EdGraphSchema_K2.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "MonolithBlueprintEditCradle.h"
+#include "MonolithSettings.h"
 #include "ScopedTransaction.h"
 #include "UObject/UObjectIterator.h"
 #include "Engine/Blueprint.h"
+#include "GameFramework/Actor.h"
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#endif
 
 // ============================================================
 //  Registration
@@ -46,7 +52,7 @@ void FMonolithBlueprintCompileActions::RegisterActions(FMonolithToolRegistry& Re
 		FMonolithActionHandler::CreateStatic(&HandleCreateBlueprint),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("save_path"),      TEXT("Asset save path, e.g. /Game/Test/BP_MyActor"))
-			.Required(TEXT("parent_class"),   TEXT("string"),  TEXT("Parent class name, e.g. Actor, Pawn, Character"))
+			.Required(TEXT("parent_class"),   TEXT("string"),  TEXT("Parent class: reflected name, C++ name, or /Script path (e.g. Actor, AActor, /Script/Engine.Actor)"))
 			.Optional(TEXT("blueprint_type"), TEXT("string"),  TEXT("Blueprint type: Normal, Const, MacroLibrary, Interface, FunctionLibrary (default: Normal)"), TEXT("Normal"))
 			.Optional(TEXT("skip_save"),      TEXT("boolean"), TEXT("Skip the synchronous package save — Blueprint exists in-memory and can be saved later (default: false)"), TEXT("false"))
 			.Build());
@@ -400,15 +406,15 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleCreateBlueprint(co
 		return FMonolithActionResult::Error(FString::Printf(TEXT("save_path must not end with '/': %s"), *SavePath));
 	}
 
-	// Resolve parent class — try exact, then with 'A' prefix
-	UClass* ParentClass = FindFirstObject<UClass>(*ParentClassName, EFindFirstObjectOptions::NativeFirst);
+	TArray<FString> ParentClassAttempts;
+	UClass* ParentClass = MonolithBlueprintInternal::ResolveBlueprintParentClass(
+		ParentClassName, &ParentClassAttempts);
 	if (!ParentClass)
 	{
-		ParentClass = FindFirstObject<UClass>(*(TEXT("A") + ParentClassName), EFindFirstObjectOptions::NativeFirst);
-	}
-	if (!ParentClass)
-	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Parent class not found: %s"), *ParentClassName));
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Parent class not found: %s. Use a reflected name (Actor), C++ name (AActor), or /Script path (/Script/Engine.Actor). Tried: %s"),
+			*ParentClassName,
+			*FString::Join(ParentClassAttempts, TEXT(", "))));
 	}
 
 	// Parse blueprint type
@@ -698,3 +704,42 @@ FMonolithActionResult FMonolithBlueprintCompileActions::HandleSaveDirtyAssets(co
 	Root->SetNumberField(TEXT("count"), SavedArr.Num());
 	return FMonolithActionResult::Success(Root);
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FMonolithBlueprintParentClassNameTest,
+	"Monolith.Blueprint.CreateBlueprint.ParentClassNameNormalization",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithBlueprintParentClassNameTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithBlueprintInternal;
+
+	TestTrue(TEXT("Reflected class name resolves"),
+		ResolveBlueprintParentClass(TEXT("Actor")) == AActor::StaticClass());
+	TestTrue(TEXT("C++ A prefix resolves"),
+		ResolveBlueprintParentClass(TEXT("AActor")) == AActor::StaticClass());
+	TestTrue(TEXT("Canonical script path resolves"),
+		ResolveBlueprintParentClass(TEXT("/Script/Engine.Actor")) == AActor::StaticClass());
+	TestTrue(TEXT("Script path with C++ A prefix resolves"),
+		ResolveBlueprintParentClass(TEXT("/Script/Engine.AActor")) == AActor::StaticClass());
+	TestTrue(TEXT("Reflected U class name resolves"),
+		ResolveBlueprintParentClass(TEXT("Blueprint")) == UBlueprint::StaticClass());
+	TestTrue(TEXT("C++ U prefix resolves"),
+		ResolveBlueprintParentClass(TEXT("UBlueprint")) == UBlueprint::StaticClass());
+	TestTrue(TEXT("Canonical script path for U class resolves"),
+		ResolveBlueprintParentClass(TEXT("/Script/Engine.Blueprint")) == UBlueprint::StaticClass());
+
+	UClass* PluginClass = UMonolithSettings::StaticClass();
+	TestNotNull(TEXT("Plugin class is available"), PluginClass);
+	TestTrue(TEXT("Plugin class reflected name resolves"),
+		ResolveBlueprintParentClass(TEXT("MonolithSettings")) == PluginClass);
+	TestTrue(TEXT("Plugin class C++ U prefix resolves"),
+		ResolveBlueprintParentClass(TEXT("UMonolithSettings")) == PluginClass);
+	TestTrue(TEXT("Canonical plugin script path resolves"),
+		ResolveBlueprintParentClass(TEXT("/Script/MonolithCore.MonolithSettings")) == PluginClass);
+	TestTrue(TEXT("Plugin script path with C++ U prefix resolves"),
+		ResolveBlueprintParentClass(TEXT("/Script/MonolithCore.UMonolithSettings")) == PluginClass);
+	return true;
+}
+#endif

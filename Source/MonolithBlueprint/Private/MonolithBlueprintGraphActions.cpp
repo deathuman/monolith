@@ -132,7 +132,7 @@ void FMonolithBlueprintGraphActions::RegisterActions(FMonolithToolRegistry& Regi
 		FMonolithActionHandler::CreateStatic(&HandleReparentBlueprint),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Blueprint asset path"))
-			.Required(TEXT("new_parent_class"), TEXT("string"), TEXT("New parent class name"))
+			.Required(TEXT("new_parent_class"), TEXT("string"), TEXT("New parent: reflected name, C++ name, or /Script path (e.g. Actor, AActor, /Script/Engine.Actor)"))
 			.Build());
 
 	// ---- Wave 6 ----
@@ -1153,10 +1153,15 @@ FMonolithActionResult FMonolithBlueprintGraphActions::HandleReparentBlueprint(co
 		return FMonolithActionResult::Error(TEXT("Missing required parameter: new_parent_class"));
 	}
 
-	UClass* NewParent = FindFirstObject<UClass>(*ClassName, EFindFirstObjectOptions::NativeFirst);
+	TArray<FString> ParentClassAttempts;
+	UClass* NewParent = MonolithBlueprintInternal::ResolveBlueprintParentClass(
+		ClassName, &ParentClassAttempts);
 	if (!NewParent)
 	{
-		return FMonolithActionResult::Error(FString::Printf(TEXT("Parent class not found: %s"), *ClassName));
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("Parent class not found: %s. Use a reflected name (Actor), C++ name (AActor), or /Script path (/Script/Engine.Actor). Tried: %s"),
+			*ClassName,
+			*FString::Join(ParentClassAttempts, TEXT(", "))));
 	}
 
 	if (NewParent->HasAnyClassFlags(CLASS_Interface))

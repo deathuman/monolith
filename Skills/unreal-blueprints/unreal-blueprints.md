@@ -12,6 +12,7 @@ Also works on: Level Blueprints (map path or `$current`), Widget Blueprints.
 ## Key Parameters
 
 - `asset_path` -- Blueprint path (NOT `asset`). Level BPs: map path or `"$current"`
+- `parent_class` / `new_parent_class` -- `create_blueprint` uses `parent_class`; `reparent_blueprint` uses `new_parent_class`. Both accept the reflected name (`Actor`), C++ name (`AActor`), or canonical script path (`/Script/Engine.Actor`).
 - `graph_name` -- from `list_graphs`
 - `node_id` -- from `get_graph_data` or `add_node` response
 - `component_name` -- from `get_components`

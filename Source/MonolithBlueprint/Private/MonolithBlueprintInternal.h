@@ -27,14 +27,79 @@
 #include "K2Node_ClearDelegate.h"
 #include "K2Node_CallDelegate.h"
 #include "K2Node_BaseMCDelegate.h"
+#include "K2Node_CreateDelegate.h"
+#include "K2Node_DynamicCast.h"
+#include "K2Node_SpawnActorFromClass.h"
 #include "EdGraphNode_Comment.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Editor.h"
 #include "UObject/Package.h"
+#include "UObject/UObjectGlobals.h"
 
 namespace MonolithBlueprintInternal
 {
+	inline FString StripNativeClassPrefix(const FString& ClassName)
+	{
+		if (ClassName.Len() > 1
+			&& (ClassName[0] == TEXT('A') || ClassName[0] == TEXT('U'))
+			&& FChar::IsUpper(ClassName[1]))
+		{
+			return ClassName.Mid(1);
+		}
+		return ClassName;
+	}
+
+	inline FString NormalizeClassReference(const FString& ClassReference)
+	{
+		int32 LastDot = INDEX_NONE;
+		if (ClassReference.FindLastChar(TEXT('.'), LastDot))
+		{
+			return ClassReference.Left(LastDot + 1)
+				+ StripNativeClassPrefix(ClassReference.Mid(LastDot + 1));
+		}
+		return StripNativeClassPrefix(ClassReference);
+	}
+
+	inline UClass* ResolveBlueprintParentClass(const FString& ClassReference, TArray<FString>* OutAttempts = nullptr)
+	{
+		TArray<FString> Candidates;
+		const FString NormalizedReference = NormalizeClassReference(ClassReference);
+		const bool bWasNormalized = !NormalizedReference.Equals(ClassReference, ESearchCase::CaseSensitive);
+		if (ClassReference.StartsWith(TEXT("/Script/")) && bWasNormalized)
+		{
+			Candidates.Add(NormalizedReference);
+		}
+		Candidates.Add(ClassReference);
+		if (!ClassReference.StartsWith(TEXT("/Script/")) && bWasNormalized)
+		{
+			Candidates.Add(NormalizedReference);
+		}
+
+		for (const FString& Candidate : Candidates)
+		{
+			if (OutAttempts)
+			{
+				OutAttempts->Add(Candidate);
+			}
+
+			if (Candidate.StartsWith(TEXT("/Script/")))
+			{
+				if (UClass* LoadedClass = StaticLoadClass(UObject::StaticClass(), nullptr, *Candidate))
+				{
+					return LoadedClass;
+				}
+			}
+
+			if (UClass* FoundClass = FindFirstObject<UClass>(*Candidate, EFindFirstObjectOptions::NativeFirst))
+			{
+				return FoundClass;
+			}
+		}
+
+		return nullptr;
+	}
+
 	/**
 	 * Try to resolve a Level Blueprint from a level asset path.
 	 * Level Blueprints are ULevelScriptBlueprint sub-objects of ULevel,
@@ -394,6 +459,21 @@ namespace MonolithBlueprintInternal
 		return Resolved;
 	}
 
+	// Stable-identity fields shared by every FMemberReference-bearing node branch:
+	// scope/self-context plus the local-variable MemberScope when one is set.
+	// Owner class paths are emitted per-branch because the field name differs
+	// (function_class_path / event_class_path / delegate_owner_class_path /
+	// variable_class_path) and must stay additive next to the legacy short-name fields.
+	inline void SerializeMemberReferenceIdentity(const FMemberReference& Ref, const TSharedPtr<FJsonObject>& NObj)
+	{
+		NObj->SetBoolField(TEXT("is_self_context"), Ref.IsSelfContext());
+		const FString ScopeName = Ref.GetMemberScopeName();
+		if (!ScopeName.IsEmpty())
+		{
+			NObj->SetStringField(TEXT("member_scope"), ScopeName);
+		}
+	}
+
 	// bSafeTitle: report the class name instead of calling GetNodeTitle(). Use for
 	// generic-fallback nodes — some legacy node classes crash in GetNodeTitle() on
 	// unconfigured state (UK2Node_SpawnActor null-derefs its Blueprint pin's DefaultObject).
@@ -401,6 +481,7 @@ namespace MonolithBlueprintInternal
 	{
 		TSharedPtr<FJsonObject> NObj = MakeShared<FJsonObject>();
 		NObj->SetStringField(TEXT("id"), Node->GetName());
+		NObj->SetStringField(TEXT("node_guid"), Node->NodeGuid.ToString());
 		NObj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
 		NObj->SetStringField(TEXT("title"), bSafeTitle
 			? Node->GetClass()->GetName()
@@ -423,7 +504,9 @@ namespace MonolithBlueprintInternal
 			if (UClass* OwnerClass = CallNode->FunctionReference.GetMemberParentClass())
 			{
 				NObj->SetStringField(TEXT("function_class"), OwnerClass->GetName());
+				NObj->SetStringField(TEXT("function_class_path"), OwnerClass->GetPathName());
 			}
+			SerializeMemberReferenceIdentity(CallNode->FunctionReference, NObj);
 		}
 		else if (UK2Node_ComponentBoundEvent* BoundNode = Cast<UK2Node_ComponentBoundEvent>(Node))
 		{
@@ -442,6 +525,13 @@ namespace MonolithBlueprintInternal
 			{
 				NObj->SetStringField(TEXT("delegate_owner_class"),
 					BoundNode->DelegateOwnerClass->GetName());
+				NObj->SetStringField(TEXT("delegate_owner_class_path"),
+					BoundNode->DelegateOwnerClass->GetPathName());
+			}
+			SerializeMemberReferenceIdentity(BoundNode->EventReference, NObj);
+			if (UClass* EventOwner = BoundNode->EventReference.GetMemberParentClass())
+			{
+				NObj->SetStringField(TEXT("event_class_path"), EventOwner->GetPathName());
 			}
 		}
 		else if (UK2Node_BaseMCDelegate* DelegateNode = Cast<UK2Node_BaseMCDelegate>(Node))
@@ -451,9 +541,11 @@ namespace MonolithBlueprintInternal
 			if (UClass* DelegateOwner = DelegateNode->DelegateReference.GetMemberParentClass())
 			{
 				NObj->SetStringField(TEXT("delegate_owner_class"), DelegateOwner->GetName());
+				NObj->SetStringField(TEXT("delegate_owner_class_path"), DelegateOwner->GetPathName());
 			}
 			NObj->SetBoolField(TEXT("self_context"),
 				DelegateNode->DelegateReference.IsSelfContext());
+			SerializeMemberReferenceIdentity(DelegateNode->DelegateReference, NObj);
 		}
 		else if (UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
 		{
@@ -463,6 +555,84 @@ namespace MonolithBlueprintInternal
 			{
 				NObj->SetStringField(TEXT("custom_name"),
 					EventNode->CustomFunctionName.ToString());
+			}
+			// Interface-implementation marker: authoritative signal that this
+			// event node implements a Blueprint Interface function (the
+			// declaration-only get_interfaces payload misses implementers).
+			NObj->SetBoolField(TEXT("is_interface_event"),
+				EventNode->IsInterfaceEventNode());
+			SerializeMemberReferenceIdentity(EventNode->EventReference, NObj);
+			if (UClass* EventOwner = EventNode->EventReference.GetMemberParentClass())
+			{
+				NObj->SetStringField(TEXT("event_class_path"), EventOwner->GetPathName());
+			}
+		}
+		else if (UK2Node_Variable* VarNode = Cast<UK2Node_Variable>(Node))
+		{
+			const FName VarName = VarNode->GetVarName();
+			if (VarName != NAME_None)
+			{
+				NObj->SetStringField(TEXT("variable_name"), VarName.ToString());
+			}
+			// Owner paths are only meaningful for non-self references — a
+			// self-context reference resolves against this Blueprint itself.
+			if (!VarNode->VariableReference.IsSelfContext())
+			{
+				if (UClass* OwnerClass = VarNode->VariableReference.GetMemberParentClass())
+				{
+					NObj->SetStringField(TEXT("variable_class_path"), OwnerClass->GetPathName());
+				}
+			}
+			SerializeMemberReferenceIdentity(VarNode->VariableReference, NObj);
+		}
+		else if (UK2Node_CreateDelegate* CreateDel = Cast<UK2Node_CreateDelegate>(Node))
+		{
+			if (CreateDel->SelectedFunctionName != NAME_None)
+			{
+				NObj->SetStringField(TEXT("function"), CreateDel->SelectedFunctionName.ToString());
+			}
+			// Self context = the object pin is unlinked or wired to a Self node
+			// (mirrors UK2Node_CreateDelegate::GetScopeClass's own bUseSelf rule).
+			bool bIsSelfContext = true;
+			bool bScopeResolvable = true;
+			if (UEdGraphPin* ObjectPin = CreateDel->GetObjectInPin())
+			{
+				bIsSelfContext = ObjectPin->LinkedTo.Num() == 0;
+				for (const UEdGraphPin* Linked : ObjectPin->LinkedTo)
+				{
+					if (Linked && Linked->PinType.PinSubCategory == UEdGraphSchema_K2::PN_Self)
+					{
+						bIsSelfContext = true;
+						break;
+					}
+				}
+				// GetScopeClass checks (LinkedTo.Num() <= 1) on this pin — keep
+				// malformed graphs out of the read path rather than tripping it.
+				bScopeResolvable = ObjectPin->LinkedTo.Num() <= 1;
+			}
+			NObj->SetBoolField(TEXT("is_self_context"), bIsSelfContext);
+			if (bScopeResolvable)
+			{
+				if (UClass* ScopeClass = CreateDel->GetScopeClass(/*bDontUseSkeletalClassForSelf=*/true))
+				{
+					NObj->SetStringField(TEXT("function_class_path"), ScopeClass->GetPathName());
+				}
+			}
+		}
+		else if (UK2Node_DynamicCast* CastNode = Cast<UK2Node_DynamicCast>(Node))
+		{
+			if (CastNode->TargetType)
+			{
+				NObj->SetStringField(TEXT("cast_class_path"), CastNode->TargetType->GetPathName());
+			}
+		}
+		else if (UK2Node_SpawnActorFromClass* SpawnNode = Cast<UK2Node_SpawnActorFromClass>(Node))
+		{
+			// Resolved from the class pin's default when unwired; omitted when
+			// the caller has not chosen a class yet.
+			if (UClass* SpawnClass = SpawnNode->GetClassToSpawn())
+			{
+				NObj->SetStringField(TEXT("spawn_class_path"), SpawnClass->GetPathName());
 			}
 		}
 		else if (UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(Node))

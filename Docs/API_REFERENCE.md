@@ -223,6 +223,10 @@ Lightweight overview with node id/class/title and exec connections only. ~10 KB 
 | `asset_path` | string | **required** | Package path |
 | `graph_name` | string | optional | Defaults to first UbergraphPage |
 
+> **Stable node identity (2026-08-25):** node payloads from the shared serializer (`get_graph_data`, `get_node_details`, `get_construction_script`, `export_graph`, node-creation responses) now also carry additive identity fields: `node_guid` on every node; qualified `function_class_path` / `delegate_owner_class_path` / `event_class_path` / `variable_class_path` owner paths next to the legacy short class-name fields; uniform `is_self_context`; `member_scope` for local-scoped references; and `variable_name` on variable nodes. Legacy fields are unchanged — additions only.
+>
+> **Resolver fields (2026-08-26):** plus `cast_class_path` (DynamicCast), `spawn_class_path` (SpawnActorFromClass), and `is_interface_event` (Event) under the same additive-only contract.
+
 ### `blueprint.build_blueprint_from_spec`
 
 The crown jewel — author an entire Blueprint (parent class, variables, components, functions, event graph nodes, connections) from a single JSON spec. Validates and compiles in one call. See `describe_query("action_schema", target_namespace="blueprint", target_action="build_blueprint_from_spec")` for the full spec schema.

@@ -45,7 +45,7 @@ The sibling-plugin pattern lets you do all of this while still appearing as a fi
 └─────────────────────────────────────────────────────────┘
 ```
 
-`FMonolithToolRegistry` is a process-wide singleton exported from Monolith's `MONOLITHCORE_API`. Any module — in-tree or sibling — that lists `MonolithCore` as a dependency can call `FMonolithToolRegistry::Get().RegisterHandler("namespace", "action", &MyHandler)` at startup and the action is immediately callable over MCP.
+`FMonolithToolRegistry` is a process-wide singleton exported from Monolith's `MONOLITHCORE_API`. Any module — in-tree or sibling — that lists `MonolithCore` as a dependency can call `Registry.RegisterAction(namespace, action, description, handler)` at startup and the action is immediately callable over MCP.
 
 The sibling plugin's namespace shows up under `monolith_discover()` alongside in-tree namespaces. AI clients see no difference.
 
@@ -290,12 +290,13 @@ public:
 void FMyPluginBridgeActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 #if WITH_THIRDPARTY
-    Registry.RegisterHandler(
+    Registry.RegisterAction(
         TEXT("myns"),               // namespace claim
         TEXT("do_something"),       // action name
-        &FMyPluginBridgeActions::HandleDoSomething);
+        TEXT("Does something useful with the target."),
+        FMonolithActionHandler::CreateStatic(&FMyPluginBridgeActions::HandleDoSomething));
 
-    // ... more handlers ...
+    // ... more actions ...
 #endif
 }
 
@@ -308,17 +309,17 @@ FMonolithActionResult FMyPluginBridgeActions::HandleDoSomething(
     if (!Params->TryGetStringField(TEXT("target"), TargetName))
     {
         return FMonolithActionResult::Error(
-            -32602, TEXT("Missing required param: target"));
+            TEXT("Missing required param: target"), -32602);
     }
 
     // Call into third-party API...
     bool bOk = ThirdPartyAPI::Do(TargetName);
 
     // Return result as JSON...
-    TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
     Result->SetBoolField(TEXT("success"), bOk);
     Result->SetStringField(TEXT("target"), TargetName);
-    return FMonolithActionResult::Ok(Result);
+    return FMonolithActionResult::Success(Result);
 }
 #endif
 ```
@@ -326,9 +327,9 @@ FMonolithActionResult FMyPluginBridgeActions::HandleDoSomething(
 Conventions:
 - **Namespace = lowercase, no spaces, project-specific.** Goes to `<myns>_query` MCP tool.
 - **Action name = snake_case.** Verbs preferred (`get_x`, `set_y`, `create_z`).
-- **Handler signature is fixed:** `static FMonolithActionResult Handle*(const TSharedPtr<FJsonObject>& Params)`.
-- **Errors return JSON-RPC error codes.** `-32601` (method not found), `-32602` (invalid params), `-32603` (internal error). Use `FMonolithActionResult::Error(code, message)`.
-- **Successful results return a `TSharedRef<FJsonObject>`** with whatever fields make sense for the action. Wrap in `FMonolithActionResult::Ok(payload)`.
+- **Handler signature is fixed:** `static FMonolithActionResult Handle*(const TSharedPtr<FJsonObject>& Params)`, registered via `FMonolithActionHandler::CreateStatic(&Class::Handle*)`.
+- **Errors return JSON-RPC error codes.** `-32601` (method not found), `-32602` (invalid params), `-32603` (internal error). Use `FMonolithActionResult::Error(message, code)` — message first, code defaults to `-32603` when omitted.
+- **Successful results pass a `TSharedPtr<FJsonObject>` payload to `FMonolithActionResult::Success(payload)`.** There is no `Ok()` constructor.
 
 If you have many handler classes, follow the in-tree Monolith convention: one class per logical subsystem (`FMyPluginInspectionActions`, `FMyPluginCRUDActions`, etc.), each with its own `RegisterActions` entry point that the module entry calls in sequence.
 
@@ -472,14 +473,14 @@ The in-tree optional modules (`MonolithBABridge`, `MonolithComboGraph`, `Monolit
 | **Namespace collision** | Your handlers don't fire; Monolith's existing handlers fire instead | Run `monolith_discover()` before claiming a namespace; pick something specific |
 | **Module loads before MonolithCore** | `FMonolithToolRegistry::Get()` returns null at startup | `LoadingPhase: Default` (not `PreEngineInit` / `PostConfigInit`) |
 | **Forgot `IsAvailable()` guard on shutdown** | Editor exit crash on plugin unload during teardown | Wrap registry calls in `if (FMonolithToolRegistry::IsAvailable())` in `ShutdownModule` |
-| **Registered actions outside `#if WITH_THIRDPARTY`** | Actions register but every call returns -32601 because handler bodies are stubbed out | Move both `RegisterHandler` calls AND the handler bodies inside the `#if` |
-| **Handler doesn't return JSON-RPC error on missing param** | AI client gets cryptic 500 instead of actionable error message | Validate params at the top, return `FMonolithActionResult::Error(-32602, ...)` |
+| **Registered actions outside `#if WITH_THIRDPARTY`** | Actions register but every call returns -32601 because handler bodies are stubbed out | Move both `RegisterAction` calls AND the handler bodies inside the `#if` |
+| **Handler doesn't return JSON-RPC error on missing param** | AI client gets cryptic 500 instead of actionable error message | Validate params at the top, return `FMonolithActionResult::Error(message, -32602)` |
 
 ---
 
 ## See also
 
 - [`SPEC_CORE.md`](SPEC_CORE.md) — Monolith plugin overview, registered namespaces, action counts
-- [`Plugins/Monolith/Source/MonolithCore/Public/MonolithToolRegistry.h`](../Source/MonolithCore/Public/MonolithToolRegistry.h) — registry API surface (RegisterHandler, UnregisterNamespace, Get, IsAvailable)
+- [`Plugins/Monolith/Source/MonolithCore/Public/MonolithToolRegistry.h`](../Source/MonolithCore/Public/MonolithToolRegistry.h) — registry API surface (RegisterAction, UnregisterNamespace, Get, ExecuteAction)
 - [`Plugins/Monolith/Source/MonolithBABridge/MonolithBABridge.Build.cs`](../Source/MonolithBABridge/MonolithBABridge.Build.cs) — canonical detection-probe + `MONOLITH_RELEASE_BUILD` Build.cs pattern
 - [`Plugins/Monolith/Scripts/make_release.ps1`](../Scripts/make_release.ps1) — public release pipeline; understand its dirty-tree gate, `MONOLITH_RELEASE_BUILD=1` injection, and `$StrippedModules` belt-and-braces strip list
