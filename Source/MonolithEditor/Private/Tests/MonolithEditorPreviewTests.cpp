@@ -48,7 +48,8 @@ namespace MonolithEditorPreviewTests
 	/** Test output directory under Saved/Tests/Monolith/EditorPreview/. */
 	static FString GetTestOutputDir()
 	{
-		return FPaths::ProjectDir() / TEXT("Saved/Tests/Monolith/EditorPreview");
+		return FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()) /
+			TEXT("Saved/Tests/Monolith/EditorPreview");
 	}
 
 	/** Build a TSharedPtr<FJsonObject> for the capture_scene_preview params. */

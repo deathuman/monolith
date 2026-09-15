@@ -168,9 +168,9 @@ namespace
 			FString OutputPath = Params->GetStringField(TEXT("output_path"));
 			if (FPaths::IsRelative(OutputPath))
 			{
-				OutputPath = FPaths::ProjectDir() / OutputPath;
+				OutputPath = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir()) / OutputPath;
 			}
-			return OutputPath;
+			return FPaths::ConvertRelativePathToFull(OutputPath);
 		}
 		return DefaultOutputPath(DefaultBucket);
 	}
