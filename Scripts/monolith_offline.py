@@ -1813,6 +1813,89 @@ class ReflectionActions:
 
     # ---------------- cppreflect ----------------
 
+    def _lookup_class_source(self, class_name: str, module_name: str = ""):
+        """Return a unique class source location; ambiguous matches stay unknown."""
+        if not class_name:
+            return (0, "")
+        sql = (
+            "SELECT s.line_start, f.path FROM symbols s JOIN files f ON f.id = s.file_id "
+            "LEFT JOIN modules m ON m.id = f.module_id "
+            "WHERE s.name = ? AND s.kind IN ('class','struct')"
+        )
+        binds = [class_name]
+        if module_name:
+            sql += " AND m.name = ?"
+            binds.append(module_name)
+        rows = self.db.execute(sql + " LIMIT 2", binds).fetchall()
+        if len(rows) != 1:
+            return (0, "")
+        return (int(rows[0]["line_start"] or 0), coerce_str(rows[0]["path"]))
+
+    def _lookup_function_source(self, owning_class: str, function_name: str, module_name: str = ""):
+        """Return a unique UFUNCTION declaration location from symbols/FTS."""
+        if not function_name:
+            return (0, "")
+
+        if owning_class:
+            sql = (
+                "SELECT s.line_start, f.path FROM symbols s "
+                "JOIN symbols p ON p.id = s.parent_symbol_id "
+                "JOIN files f ON f.id = s.file_id "
+                "LEFT JOIN modules m ON m.id = f.module_id "
+                "WHERE s.name = ? AND s.kind IN ('function','method') "
+                "AND p.name = ? AND p.kind IN ('class','struct')"
+            )
+            binds = [function_name, owning_class]
+        else:
+            sql = (
+                "SELECT s.line_start, f.path FROM symbols s JOIN files f ON f.id = s.file_id "
+                "LEFT JOIN modules m ON m.id = f.module_id "
+                "WHERE s.name = ? AND s.kind IN ('function','method')"
+            )
+            binds = [function_name]
+        if module_name:
+            sql += " AND m.name = ?"
+            binds.append(module_name)
+        rows = self.db.execute(sql + " LIMIT 2", binds).fetchall()
+        if len(rows) > 1:
+            return (0, "")
+        if len(rows) == 1 and int(rows[0]["line_start"] or 0) > 0:
+            return (int(rows[0]["line_start"]), coerce_str(rows[0]["path"]))
+        if not owning_class:
+            return (0, "")
+
+        class_sql = (
+            "SELECT s.file_id, f.path FROM symbols s JOIN files f ON f.id = s.file_id "
+            "LEFT JOIN modules m ON m.id = f.module_id "
+            "WHERE s.name = ? AND s.kind IN ('class','struct')"
+        )
+        class_binds = [owning_class]
+        if module_name:
+            class_sql += " AND m.name = ?"
+            class_binds.append(module_name)
+        class_rows = self.db.execute(class_sql + " LIMIT 2", class_binds).fetchall()
+        if len(class_rows) != 1:
+            return (0, "")
+
+        file_id = int(class_rows[0]["file_id"])
+        file_path = coerce_str(class_rows[0]["path"])
+        try:
+            chunks = self.db.execute(
+                "SELECT line_number, text FROM source_fts "
+                "WHERE file_id = ? AND source_fts MATCH ? ORDER BY line_number LIMIT 64",
+                (file_id, function_name),
+            ).fetchall()
+        except self._sqlite3.DatabaseError:
+            return (0, "")
+
+        token = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(function_name) + r"(?![A-Za-z0-9_])")
+        for chunk in chunks:
+            start = int(chunk["line_number"] or 0)
+            for offset, line in enumerate(coerce_str(chunk["text"]).splitlines()):
+                if token.search(line):
+                    return (start + offset, file_path)
+        return (0, "")
+
     def get_uclass(self, args):
         if not self._require_table("reflect_uclasses"):
             return
@@ -1837,16 +1920,11 @@ class ReflectionActions:
 
         # Source auto-join when line==0 or path=="".
         if source_line == 0 or source_path == "":
-            j = self.db.execute(
-                "SELECT s.line_start, f.path FROM symbols s JOIN files f ON f.id = s.file_id "
-                "WHERE s.name = ? AND s.kind IN ('class','struct') LIMIT 1",
-                (cname,)
-            ).fetchone()
-            if j:
-                if source_line == 0:
-                    source_line = int(j["line_start"] or 0)
-                if source_path == "":
-                    source_path = coerce_str(j["path"])
+            joined_line, joined_path = self._lookup_class_source(cname, mname)
+            if source_line == 0:
+                source_line = joined_line
+            if source_path == "":
+                source_path = joined_path
 
         # Parent chain (iterative, cap 16).
         parent_chain = []
@@ -1888,7 +1966,7 @@ class ReflectionActions:
             })
 
         # UFUNCTIONs (module-scoped only when module passed).
-        fsql = ("SELECT function_name, return_type, blueprint_callable, cpp_module, specifiers "
+        fsql = ("SELECT function_name, return_type, blueprint_callable, cpp_module, specifiers, source_line "
                 "FROM reflect_ufunctions WHERE owning_class = ?")
         fbinds = [cname]
         if module:
@@ -1897,12 +1975,25 @@ class ReflectionActions:
         fsql += " ORDER BY function_name"
         funcs = []
         for f in self.db.execute(fsql, fbinds).fetchall():
+            function_name = coerce_str(f["function_name"])
+            function_module = coerce_str(f["cpp_module"])
+            function_line = int(f["source_line"] or 0)
+            function_path = ""
+            if function_line == 0 or function_path == "":
+                joined_line, joined_path = self._lookup_function_source(
+                    cname, function_name, function_module)
+                if function_line == 0:
+                    function_line = joined_line
+                if function_path == "":
+                    function_path = joined_path
             funcs.append({
-                "function_name": coerce_str(f["function_name"]),
+                "function_name": function_name,
                 "return_type": coerce_str(f["return_type"]),
                 "blueprint_callable": bool(f["blueprint_callable"]),
-                "cpp_module": coerce_str(f["cpp_module"]),
+                "cpp_module": function_module,
                 "specifiers": coerce_str(f["specifiers"]),
+                "source_path": function_path,
+                "source_line": function_line,
             })
 
         uclass = {
@@ -1924,9 +2015,10 @@ class ReflectionActions:
         # exe precedence: --class_name flag wins, else the positional (Args::opt then positional[0]).
         class_name = (getattr(args, "class_name", None) or
                       getattr(args, "class_name_pos", None) or "")
+        module_name = getattr(args, "module_name", None) or ""
         bp_only = bool(getattr(args, "blueprint_visible_only", False))
         limit = clamp_limit(args.limit)
-        fh = compute_filter_hash([class_name, "1" if bp_only else "0"])
+        fh = compute_filter_hash([class_name, module_name, "1" if bp_only else "0"])
 
         try:
             page, had_cursor = resolve_page(getattr(args, "cursor", None) or "", fh)
@@ -1939,6 +2031,9 @@ class ReflectionActions:
         if class_name:
             where += " AND owning_class = ?"
             binds.append(class_name)
+        if module_name:
+            where += " AND cpp_module = ?"
+            binds.append(module_name)
         if bp_only:
             where += " AND blueprint_visibility IS NOT NULL AND blueprint_visibility <> ''"
 
@@ -1952,7 +2047,8 @@ class ReflectionActions:
             source_path = ""
             if source_line == 0 or source_path == "":
                 joined_line, joined_path = self._lookup_property_source(
-                    coerce_str(r["owning_class"]), coerce_str(r["property_name"]))
+                    coerce_str(r["owning_class"]), coerce_str(r["property_name"]),
+                    coerce_str(r["cpp_module"]))
                 if source_line == 0:
                     source_line = joined_line
                 if source_path == "":
@@ -1984,9 +2080,10 @@ class ReflectionActions:
         # exe precedence: --class_name flag wins, else the positional (Args::opt then positional[0]).
         class_name = (getattr(args, "class_name", None) or
                       getattr(args, "class_name_pos", None) or "")
+        module_name = getattr(args, "module_name", None) or ""
         bp_only = bool(getattr(args, "blueprint_callable_only", False))
         limit = clamp_limit(args.limit)
-        fh = compute_filter_hash([class_name, "1" if bp_only else "0"])
+        fh = compute_filter_hash([class_name, module_name, "1" if bp_only else "0"])
 
         try:
             page, had_cursor = resolve_page(getattr(args, "cursor", None) or "", fh)
@@ -1999,6 +2096,9 @@ class ReflectionActions:
         if class_name:
             where += " AND owning_class = ?"
             binds.append(class_name)
+        if module_name:
+            where += " AND cpp_module = ?"
+            binds.append(module_name)
         if bp_only:
             where += " AND blueprint_callable = 1"
 
@@ -2009,8 +2109,14 @@ class ReflectionActions:
         funcs = []
         for r in rows:
             line = int(r["source_line"] or 0)
-            if line == 0:
-                line = self._lookup_function_source_line(coerce_str(r["owning_class"]), coerce_str(r["function_name"]))
+            function_path = ""
+            if line == 0 or function_path == "":
+                joined_line, joined_path = self._lookup_function_source(
+                    coerce_str(r["owning_class"]), coerce_str(r["function_name"]),
+                    coerce_str(r["cpp_module"]))
+                if line == 0:
+                    line = joined_line
+                function_path = joined_path
             funcs.append({
                 "owning_class": coerce_str(r["owning_class"]),
                 "function_name": coerce_str(r["function_name"]),
@@ -2018,6 +2124,7 @@ class ReflectionActions:
                 "blueprint_callable": bool(r["blueprint_callable"]),
                 "cpp_module": coerce_str(r["cpp_module"]),
                 "specifiers": coerce_str(r["specifiers"]),
+                "source_path": function_path,
                 "source_line": line,
             })
 
@@ -2030,37 +2137,25 @@ class ReflectionActions:
             out["next_cursor"] = encode_cursor(fh, page + 1, total if not had_cursor else -1)
         emit(out)
 
-    def _lookup_function_source_line(self, owning_class: str, function_name: str) -> int:
-        if not function_name:
-            return 0
-        if owning_class:
-            r = self.db.execute(
-                "SELECT s.line_start FROM symbols s JOIN symbols p ON p.id = s.parent_symbol_id "
-                "WHERE s.name = ? AND s.kind IN ('function','method') AND p.name = ? "
-                "AND p.kind IN ('class','struct') LIMIT 1",
-                (function_name, owning_class)
-            ).fetchone()
-        else:
-            r = self.db.execute(
-                "SELECT line_start FROM symbols WHERE name = ? AND kind IN ('function','method') LIMIT 1",
-                (function_name,)
-            ).fetchone()
-        return int(r["line_start"]) if r else 0
-
-    def _lookup_property_source(self, owning_class: str, property_name: str):
+    def _lookup_property_source(self, owning_class: str, property_name: str, module_name: str = ""):
         if not owning_class or not property_name:
             return (0, "")
-        r = self.db.execute(
+        sql = (
             "SELECT s.line_start, f.path FROM symbols s "
             "JOIN symbols p ON p.id = s.parent_symbol_id "
             "JOIN files f ON f.id = s.file_id "
+            "LEFT JOIN modules m ON m.id = f.module_id "
             "WHERE s.name = ? AND s.kind = 'variable' "
-            "AND p.name = ? AND p.kind IN ('class','struct') LIMIT 1",
-            (property_name, owning_class)
-        ).fetchone()
-        if not r:
+            "AND p.name = ? AND p.kind IN ('class','struct')"
+        )
+        binds = [property_name, owning_class]
+        if module_name:
+            sql += " AND m.name = ?"
+            binds.append(module_name)
+        rows = self.db.execute(sql + " LIMIT 2", binds).fetchall()
+        if len(rows) != 1:
             return (0, "")
-        return (int(r["line_start"] or 0), coerce_str(r["path"]))
+        return (int(rows[0]["line_start"] or 0), coerce_str(rows[0]["path"]))
 
     def find_interface_impls(self, args):
         if not self._require_table("reflect_uinterface_impls"):
@@ -2145,16 +2240,12 @@ class ReflectionActions:
             source_line = int(r["source_line"] or 0)
             source_path = coerce_str(r["source_path"])
             if source_line == 0 or source_path == "":
-                joined = self.db.execute(
-                    "SELECT s.line_start, f.path FROM symbols s JOIN files f ON f.id = s.file_id "
-                    "WHERE s.name = ? AND s.kind IN ('class','struct') LIMIT 1",
-                    (coerce_str(r["class_name"]),)
-                ).fetchone()
-                if joined:
-                    if source_line == 0:
-                        source_line = int(joined["line_start"] or 0)
-                    if source_path == "":
-                        source_path = coerce_str(joined["path"])
+                joined_line, joined_path = self._lookup_class_source(
+                    coerce_str(r["class_name"]), coerce_str(r["module_name"]))
+                if source_line == 0:
+                    source_line = joined_line
+                if source_path == "":
+                    source_path = joined_path
             uclasses.append({
                 "class_name": coerce_str(r["class_name"]),
                 "module_name": coerce_str(r["module_name"]),
@@ -2776,12 +2867,14 @@ def build_parser():
     # (`monolith_query.exe cppreflect list_uproperties <ClassName>`); --class_name kept as alias.
     p.add_argument("class_name_pos", nargs="?", default="")
     p.add_argument("--class_name", default="")
+    p.add_argument("--module_name", "--module", dest="module_name", default="")
     p.add_argument("--blueprint_visible_only", action="store_true")
     _add_paginated(p)
 
     p = cpr_sub.add_parser("list_ufunctions")
     p.add_argument("class_name_pos", nargs="?", default="")
     p.add_argument("--class_name", default="")
+    p.add_argument("--module_name", "--module", dest="module_name", default="")
     p.add_argument("--blueprint_callable_only", action="store_true")
     _add_paginated(p)
 

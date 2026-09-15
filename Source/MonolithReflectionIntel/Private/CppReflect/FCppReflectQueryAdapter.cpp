@@ -83,97 +83,141 @@ namespace
 	 * Caller must already hold the shared DB lock (the borrowed source-symbol DB
 	 * is the SAME handle this query uses).
 	 */
-	void LookupClassSource(FSQLiteDatabase& DB, const FString& ClassName, int32& OutLine, FString& OutPath)
+	bool LookupClassSource(
+		FSQLiteDatabase& DB,
+		const FString& ClassName,
+		const FString& ModuleName,
+		int32& OutLine,
+		FString& OutPath)
 	{
-		if (ClassName.IsEmpty()) { return; }
+		if (ClassName.IsEmpty()) { return false; }
 		FSQLitePreparedStatement Stmt;
-		if (!Stmt.Create(DB, TEXT(
+		FString Sql = TEXT(
 			"SELECT s.line_start, f.path FROM symbols s "
 			"JOIN files f ON f.id = s.file_id "
-			"WHERE s.name = ? AND s.kind IN ('class','struct') "
-			"LIMIT 1;")))
+			"LEFT JOIN modules m ON m.id = f.module_id "
+			"WHERE s.name = ? AND s.kind IN ('class','struct') ");
+		if (!ModuleName.IsEmpty()) { Sql += TEXT("AND m.name = ? "); }
+		Sql += TEXT("LIMIT 2;");
+		if (!Stmt.Create(DB, *Sql))
 		{
-			return;
+			return false;
 		}
 		Stmt.SetBindingValueByIndex(1, ClassName);
-		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return; }
+		if (!ModuleName.IsEmpty()) { Stmt.SetBindingValueByIndex(2, ModuleName); }
+
+		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return false; }
 		Stmt.GetColumnValueByIndex(0, OutLine);
 		Stmt.GetColumnValueByIndex(1, OutPath);
+		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			OutLine = 0;
+			OutPath.Empty();
+			return false;
+		}
+		return true;
 	}
 
 	/** Source-index lookup for a reflected UPROPERTY. The C++ source index records
 	 * class members as `variable` symbols linked to their owning class. Both
 	 * out-params remain at their caller-provided unknown values when no match is
 	 * available, preserving the empty/0 fallback contract. */
-	void LookupPropertySource(
+	bool LookupPropertySource(
 		FSQLiteDatabase& DB,
 		const FString& OwningClass,
 		const FString& PropertyName,
+		const FString& ModuleName,
 		int32& OutLine,
 		FString& OutPath)
 	{
-		if (OwningClass.IsEmpty() || PropertyName.IsEmpty()) { return; }
+		if (OwningClass.IsEmpty() || PropertyName.IsEmpty()) { return false; }
 		FSQLitePreparedStatement Stmt;
-		if (!Stmt.Create(DB, TEXT(
+		FString Sql = TEXT(
 			"SELECT s.line_start, f.path FROM symbols s "
 			"JOIN symbols p ON p.id = s.parent_symbol_id "
 			"JOIN files f ON f.id = s.file_id "
+			"LEFT JOIN modules m ON m.id = f.module_id "
 			"WHERE s.name = ? AND s.kind = 'variable' "
-			"  AND p.name = ? AND p.kind IN ('class','struct') "
-			"LIMIT 1;")))
+			"  AND p.name = ? AND p.kind IN ('class','struct') ");
+		if (!ModuleName.IsEmpty()) { Sql += TEXT("AND m.name = ? "); }
+		Sql += TEXT("LIMIT 2;");
+		if (!Stmt.Create(DB, *Sql))
 		{
-			return;
+			return false;
 		}
 		Stmt.SetBindingValueByIndex(1, PropertyName);
 		Stmt.SetBindingValueByIndex(2, OwningClass);
-		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return; }
+		if (!ModuleName.IsEmpty()) { Stmt.SetBindingValueByIndex(3, ModuleName); }
+		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return false; }
 		Stmt.GetColumnValueByIndex(0, OutLine);
 		Stmt.GetColumnValueByIndex(1, OutPath);
+		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			OutLine = 0;
+			OutPath.Empty();
+			return false;
+		}
+		return true;
 	}
 
-	/** Variant for UFUNCTION rows: scope the function-name lookup to the owning
-	 *  class via the parent-symbol foreign key. Empty class falls back to a
-	 *  bare name lookup (won't disambiguate between same-named functions in
-	 *  different classes; engine code with that pattern keeps line=0). */
-	int32 LookupFunctionSourceLine(FSQLiteDatabase& DB, const FString& OwningClass, const FString& FunctionName)
+	/** Source-index lookup for a reflected UFUNCTION. UHT rows do not retain a
+	 *  declaration path/line, so prefer a unique parser symbol and then fall
+	 *  back to the owning class header's FTS chunks. Module scoping is mandatory
+	 *  when the caller has it; ambiguous matches deliberately remain unknown. */
+	bool LookupFunctionSource(
+		FSQLiteDatabase& DB,
+		const FString& OwningClass,
+		const FString& FunctionName,
+		const FString& ModuleName,
+		int32& OutLine,
+		FString& OutPath)
 	{
-		if (FunctionName.IsEmpty()) { return 0; }
+		OutLine = 0;
+		OutPath.Empty();
+		if (FunctionName.IsEmpty()) { return false; }
+
+		FString Sql;
 		if (OwningClass.IsEmpty())
 		{
-			FSQLitePreparedStatement Stmt;
-			if (!Stmt.Create(DB, TEXT(
-				"SELECT line_start FROM symbols "
-				"WHERE name = ? AND kind IN ('function','method') "
-				"LIMIT 1;")))
-			{
-				return 0;
-			}
-			Stmt.SetBindingValueByIndex(1, FunctionName);
-			if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return 0; }
-			int32 Line = 0;
-			Stmt.GetColumnValueByIndex(0, Line);
-			if (Line > 0) { return Line; }
+			Sql = TEXT(
+				"SELECT s.line_start, f.path FROM symbols s "
+				"JOIN files f ON f.id = s.file_id "
+				"LEFT JOIN modules m ON m.id = f.module_id "
+				"WHERE s.name = ? AND s.kind IN ('function','method') ");
 		}
 		else
 		{
-			FSQLitePreparedStatement Stmt;
-			if (Stmt.Create(DB, TEXT(
-				"SELECT s.line_start FROM symbols s "
+			Sql = TEXT(
+				"SELECT s.line_start, f.path FROM symbols s "
 				"JOIN symbols p ON p.id = s.parent_symbol_id "
+				"JOIN files f ON f.id = s.file_id "
+				"LEFT JOIN modules m ON m.id = f.module_id "
 				"WHERE s.name = ? AND s.kind IN ('function','method') "
-				"  AND p.name = ? AND p.kind IN ('class','struct') "
-				"LIMIT 1;")))
-			{
-				Stmt.SetBindingValueByIndex(1, FunctionName);
-				Stmt.SetBindingValueByIndex(2, OwningClass);
-				if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
-				{
-					int32 Line = 0;
-					Stmt.GetColumnValueByIndex(0, Line);
-					if (Line > 0) { return Line; }
-				}
-			}
+				"  AND p.name = ? AND p.kind IN ('class','struct') ");
 		}
+		if (!ModuleName.IsEmpty()) { Sql += TEXT("AND m.name = ? "); }
+		Sql += TEXT("LIMIT 2;");
+
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(DB, *Sql)) { return false; }
+		int32 BindIndex = 1;
+		Stmt.SetBindingValueByIndex(BindIndex++, FunctionName);
+		if (!OwningClass.IsEmpty()) { Stmt.SetBindingValueByIndex(BindIndex++, OwningClass); }
+		if (!ModuleName.IsEmpty()) { Stmt.SetBindingValueByIndex(BindIndex++, ModuleName); }
+		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			Stmt.GetColumnValueByIndex(0, OutLine);
+			Stmt.GetColumnValueByIndex(1, OutPath);
+			if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+			{
+				OutLine = 0;
+				OutPath.Empty();
+				return false;
+			}
+			if (OutLine > 0) { return true; }
+		}
+
+		if (OwningClass.IsEmpty()) { OutPath.Empty(); return false; }
 
 		// UHT can expose a reflected function whose declaration was not emitted
 		// as a `function` symbol by the lightweight C++ parser. The source FTS
@@ -182,22 +226,31 @@ namespace
 		// token remains the documented best-effort source_line=0 result.
 		int32 ClassFileId = 0;
 		FSQLitePreparedStatement ClassStmt;
-		if (!ClassStmt.Create(DB, TEXT(
-			"SELECT file_id FROM symbols "
-			"WHERE name = ? AND kind IN ('class','struct') "
-			"LIMIT 1;")))
+		FString ClassSql = TEXT(
+			"SELECT s.file_id FROM symbols s "
+			"JOIN files f ON f.id = s.file_id "
+			"LEFT JOIN modules m ON m.id = f.module_id "
+			"WHERE s.name = ? AND s.kind IN ('class','struct') ");
+		if (!ModuleName.IsEmpty()) { ClassSql += TEXT("AND m.name = ? "); }
+		ClassSql += TEXT("LIMIT 2;");
+		if (!ClassStmt.Create(DB, *ClassSql))
 		{
-			return 0;
+			return false;
 		}
 		ClassStmt.SetBindingValueByIndex(1, OwningClass);
+		if (!ModuleName.IsEmpty()) { ClassStmt.SetBindingValueByIndex(2, ModuleName); }
 		if (ClassStmt.Step() != ESQLitePreparedStatementStepResult::Row)
 		{
-			return 0;
+			return false;
 		}
 		ClassStmt.GetColumnValueByIndex(0, ClassFileId);
+		if (ClassStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			return false;
+		}
 		if (ClassFileId <= 0)
 		{
-			return 0;
+			return false;
 		}
 
 		FSQLitePreparedStatement SourceStmt;
@@ -206,7 +259,7 @@ namespace
 			"WHERE file_id = ? AND source_fts MATCH ? "
 			"ORDER BY line_number LIMIT 64;")))
 		{
-			return 0;
+			return false;
 		}
 		SourceStmt.SetBindingValueByIndex(1, ClassFileId);
 		SourceStmt.SetBindingValueByIndex(2, FunctionName);
@@ -243,11 +296,23 @@ namespace
 					|| !IsIdentifierChar(SourceLine[NameEnd]);
 				if (bLeftBoundary && bRightBoundary)
 				{
-					return ChunkStart + Index;
+					OutLine = ChunkStart + Index;
+					FSQLitePreparedStatement PathStmt;
+					if (PathStmt.Create(DB, TEXT("SELECT path FROM files WHERE id = ?;")))
+					{
+						PathStmt.SetBindingValueByIndex(1, ClassFileId);
+						if (PathStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+						{
+							PathStmt.GetColumnValueByIndex(0, OutPath);
+						}
+					}
+					return OutLine > 0;
 				}
 			}
 		}
-		return 0;
+		OutLine = 0;
+		OutPath.Empty();
+		return false;
 	}
 
 	bool CollectClassSpecifierTokens(FSQLiteDatabase& DB, TMap<FString, int32>& OutCounts)
@@ -333,6 +398,8 @@ void FCppReflectQueryAdapter::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.Optional(TEXT("class_name"), TEXT("string"),
 				TEXT("Filter by owning_class (exact match)"))
+			.Optional(TEXT("module_name"), TEXT("string"),
+				TEXT("Optional module filter when the class exists in multiple modules"))
 			.Optional(TEXT("blueprint_visible_only"), TEXT("boolean"),
 				TEXT("Restrict to properties with a non-empty blueprint_visibility"), TEXT("false"))
 			.Optional(TEXT("limit"), TEXT("integer"),
@@ -350,6 +417,8 @@ void FCppReflectQueryAdapter::RegisterActions(FMonolithToolRegistry& Registry)
 		FParamSchemaBuilder()
 			.Optional(TEXT("class_name"), TEXT("string"),
 				TEXT("Filter by owning_class (exact match)"))
+			.Optional(TEXT("module_name"), TEXT("string"),
+				TEXT("Optional module filter when the class exists in multiple modules"))
 			.Optional(TEXT("blueprint_callable_only"), TEXT("boolean"),
 				TEXT("Restrict to functions exposed to the BP VM"), TEXT("false"))
 			.Optional(TEXT("limit"), TEXT("integer"),
@@ -529,14 +598,14 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleGetUClass(const TSharedPtr<
 	// Handover doc items #10 + E — best-effort auto-join the original source
 	// line AND file path when the stored values are missing (UHT discards header
 	// line numbers and the reflect_uclasses.source_path is the ModuleRelativePath
-	// form, often empty; the source-symbol index carries both). A single joined
-	// lookup fills whichever of the two is unknown. The name-only match may pick
-	// the wrong file/line when two classes share a name (see LookupClassSource).
+	// form, often empty; the source-symbol index carries both). A module-scoped
+	// unique joined lookup fills whichever of the two is unknown; ambiguous
+	// matches deliberately remain empty/zero.
 	if (SrcLine == 0 || SrcPath.IsEmpty())
 	{
 		int32 JoinedLine = 0;
 		FString JoinedPath;
-		LookupClassSource(*DB, CName, JoinedLine, JoinedPath);
+		LookupClassSource(*DB, CName, MName, JoinedLine, JoinedPath);
 		if (SrcLine == 0)       { SrcLine = JoinedLine; }
 		if (SrcPath.IsEmpty())  { SrcPath = JoinedPath; }
 	}
@@ -631,7 +700,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleGetUClass(const TSharedPtr<
 			TArray<TSharedPtr<FJsonValue>> Funcs;
 			while (FuncStmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
-				FString FName, RetType, FModule, Specs;
+				FString FName, RetType, FModule, Specs, SourcePath;
 				int32 BpCallable = 0, SourceLine = 0;
 				FuncStmt.GetColumnValueByIndex(0, FName);
 				FuncStmt.GetColumnValueByIndex(1, RetType);
@@ -639,9 +708,13 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleGetUClass(const TSharedPtr<
 				FuncStmt.GetColumnValueByIndex(3, FModule);
 				FuncStmt.GetColumnValueByIndex(4, Specs);
 				FuncStmt.GetColumnValueByIndex(5, SourceLine);
-				if (SourceLine == 0)
+				if (SourceLine == 0 || SourcePath.IsEmpty())
 				{
-					SourceLine = LookupFunctionSourceLine(*DB, CName, FName);
+					int32 JoinedLine = 0;
+					FString JoinedPath;
+					LookupFunctionSource(*DB, CName, FName, FModule, JoinedLine, JoinedPath);
+					if (SourceLine == 0) { SourceLine = JoinedLine; }
+					if (SourcePath.IsEmpty()) { SourcePath = JoinedPath; }
 				}
 
 				TSharedPtr<FJsonObject> F = MakeShared<FJsonObject>();
@@ -650,6 +723,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleGetUClass(const TSharedPtr<
 				F->SetBoolField(TEXT("blueprint_callable"), BpCallable != 0);
 				F->SetStringField(TEXT("cpp_module"), FModule);
 				F->SetStringField(TEXT("specifiers"), Specs);
+				F->SetStringField(TEXT("source_path"), SourcePath);
 				F->SetNumberField(TEXT("source_line"), SourceLine);
 				Funcs.Add(MakeShared<FJsonValueObject>(F));
 			}
@@ -672,6 +746,8 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUProperties(const TShar
 
 	const FString ClassName = Params->HasField(TEXT("class_name"))
 		? Params->GetStringField(TEXT("class_name")) : FString();
+	const FString ModuleName = Params->HasField(TEXT("module_name"))
+		? Params->GetStringField(TEXT("module_name")) : FString();
 	const bool bBpOnly = Params->HasField(TEXT("blueprint_visible_only"))
 		? Params->GetBoolField(TEXT("blueprint_visible_only")) : false;
 	const int32 ReqLimit = Params->HasField(TEXT("limit"))
@@ -681,7 +757,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUProperties(const TShar
 
 	constexpr int32 HARD_CAP = 200;
 	const int32 Limit = FMath::Clamp(ReqLimit, 1, HARD_CAP);
-	const uint32 FilterHash = RIComputeFilterHash({ ClassName, bBpOnly ? TEXT("1") : TEXT("0") });
+	const uint32 FilterHash = RIComputeFilterHash({ ClassName, ModuleName, bBpOnly ? TEXT("1") : TEXT("0") });
 
 	int32 Page = 0;
 	int32 CachedTotal = -1;
@@ -703,6 +779,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUProperties(const TShar
 
 	FString WhereSql = TEXT("WHERE 1=1");
 	if (!ClassName.IsEmpty()) { WhereSql += TEXT(" AND owning_class = ?"); }
+	if (!ModuleName.IsEmpty()) { WhereSql += TEXT(" AND cpp_module = ?"); }
 	if (bBpOnly)                { WhereSql += TEXT(" AND blueprint_visibility IS NOT NULL AND blueprint_visibility <> ''"); }
 
 	const FString Sql = FString::Printf(
@@ -719,6 +796,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUProperties(const TShar
 	}
 	int32 BindIdx = 1;
 	if (!ClassName.IsEmpty()) { Stmt.SetBindingValueByIndex(BindIdx++, ClassName); }
+	if (!ModuleName.IsEmpty()) { Stmt.SetBindingValueByIndex(BindIdx++, ModuleName); }
 	Stmt.SetBindingValueByIndex(BindIdx++, Limit);
 	Stmt.SetBindingValueByIndex(BindIdx++, Page * Limit);
 
@@ -743,7 +821,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUProperties(const TShar
 		{
 			int32 JoinedLine = 0;
 			FString JoinedPath;
-			LookupPropertySource(*DB, OClass, PName, JoinedLine, JoinedPath);
+			LookupPropertySource(*DB, OClass, PName, PModule, JoinedLine, JoinedPath);
 			if (SourceLine == 0)       { SourceLine = JoinedLine; }
 			if (SourcePath.IsEmpty())  { SourcePath = JoinedPath; }
 		}
@@ -771,6 +849,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUProperties(const TShar
 		{
 			int32 CBind = 1;
 			if (!ClassName.IsEmpty()) { CountStmt.SetBindingValueByIndex(CBind++, ClassName); }
+			if (!ModuleName.IsEmpty()) { CountStmt.SetBindingValueByIndex(CBind++, ModuleName); }
 			if (CountStmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				int32 Total = 0;
@@ -803,6 +882,8 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUFunctions(const TShare
 
 	const FString ClassName = Params->HasField(TEXT("class_name"))
 		? Params->GetStringField(TEXT("class_name")) : FString();
+	const FString ModuleName = Params->HasField(TEXT("module_name"))
+		? Params->GetStringField(TEXT("module_name")) : FString();
 	const bool bBpOnly = Params->HasField(TEXT("blueprint_callable_only"))
 		? Params->GetBoolField(TEXT("blueprint_callable_only")) : false;
 	const int32 ReqLimit = Params->HasField(TEXT("limit"))
@@ -812,7 +893,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUFunctions(const TShare
 
 	constexpr int32 HARD_CAP = 200;
 	const int32 Limit = FMath::Clamp(ReqLimit, 1, HARD_CAP);
-	const uint32 FilterHash = RIComputeFilterHash({ ClassName, bBpOnly ? TEXT("1") : TEXT("0") });
+	const uint32 FilterHash = RIComputeFilterHash({ ClassName, ModuleName, bBpOnly ? TEXT("1") : TEXT("0") });
 
 	int32 Page = 0;
 	int32 CachedTotal = -1;
@@ -834,6 +915,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUFunctions(const TShare
 
 	FString WhereSql = TEXT("WHERE 1=1");
 	if (!ClassName.IsEmpty()) { WhereSql += TEXT(" AND owning_class = ?"); }
+	if (!ModuleName.IsEmpty()) { WhereSql += TEXT(" AND cpp_module = ?"); }
 	if (bBpOnly)                { WhereSql += TEXT(" AND blueprint_callable = 1"); }
 
 	const FString Sql = FString::Printf(
@@ -850,13 +932,14 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUFunctions(const TShare
 	}
 	int32 BindIdx = 1;
 	if (!ClassName.IsEmpty()) { Stmt.SetBindingValueByIndex(BindIdx++, ClassName); }
+	if (!ModuleName.IsEmpty()) { Stmt.SetBindingValueByIndex(BindIdx++, ModuleName); }
 	Stmt.SetBindingValueByIndex(BindIdx++, Limit);
 	Stmt.SetBindingValueByIndex(BindIdx++, Page * Limit);
 
 	TArray<TSharedPtr<FJsonValue>> Rows;
 	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
-		FString OClass, FName, RetType, FModule, Specs;
+		FString OClass, FName, RetType, FModule, Specs, SourcePath;
 		int32 BpCallable = 0;
 		int32 SrcLine = 0;
 		Stmt.GetColumnValueByIndex(0, OClass);
@@ -868,10 +951,14 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUFunctions(const TShare
 		Stmt.GetColumnValueByIndex(6, SrcLine);
 
 		// Handover doc item #10 — best-effort auto-join the original source
-		// line from the symbol index when the stored value is 0.
-		if (SrcLine == 0)
+		// path and line from the symbol/FTS index when UHT did not store them.
+		if (SrcLine == 0 || SourcePath.IsEmpty())
 		{
-			SrcLine = LookupFunctionSourceLine(*DB, OClass, FName);
+			int32 JoinedLine = 0;
+			FString JoinedPath;
+			LookupFunctionSource(*DB, OClass, FName, FModule, JoinedLine, JoinedPath);
+			if (SrcLine == 0) { SrcLine = JoinedLine; }
+			if (SourcePath.IsEmpty()) { SourcePath = JoinedPath; }
 		}
 
 		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
@@ -881,6 +968,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUFunctions(const TShare
 		R->SetBoolField(TEXT("blueprint_callable"), BpCallable != 0);
 		R->SetStringField(TEXT("cpp_module"), FModule);
 		R->SetStringField(TEXT("specifiers"), Specs);
+		R->SetStringField(TEXT("source_path"), SourcePath);
 		R->SetNumberField(TEXT("source_line"), SrcLine);
 		Rows.Add(MakeShared<FJsonValueObject>(R));
 	}
@@ -896,6 +984,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUFunctions(const TShare
 		{
 			int32 CBind = 1;
 			if (!ClassName.IsEmpty()) { CountStmt.SetBindingValueByIndex(CBind++, ClassName); }
+			if (!ModuleName.IsEmpty()) { CountStmt.SetBindingValueByIndex(CBind++, ModuleName); }
 			if (CountStmt.Step() == ESQLitePreparedStatementStepResult::Row)
 			{
 				int32 Total = 0;
@@ -1102,7 +1191,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleFindClassSpecifier(const TS
 		{
 			int32 JoinedLine = 0;
 			FString JoinedPath;
-			LookupClassSource(*DB, CName, JoinedLine, JoinedPath);
+			LookupClassSource(*DB, CName, MName, JoinedLine, JoinedPath);
 			if (SourceLine == 0) { SourceLine = JoinedLine; }
 			if (SPath.IsEmpty()) { SPath = JoinedPath; }
 		}
