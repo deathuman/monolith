@@ -148,7 +148,8 @@ FMonolithActionResult FProjectExportAssetTextAction::Execute(const TSharedPtr<FJ
 	// Optional: scope to a sub-object by name/class substring.
 	UObject* ExportRoot = Asset;
 	FString ResolvedObject;
-	const FString ObjectFilter = Params->GetStringField(TEXT("object_filter"));
+	FString ObjectFilter;
+	Params->TryGetStringField(TEXT("object_filter"), ObjectFilter);
 	if (!ObjectFilter.IsEmpty())
 	{
 		TArray<FString> Candidates;
@@ -178,7 +179,8 @@ FMonolithActionResult FProjectExportAssetTextAction::Execute(const TSharedPtr<FJ
 	const int32 FullBytes = FullText.Len();
 
 	// Optional grep narrowing.
-	const FString GrepPattern = Params->GetStringField(TEXT("grep_pattern"));
+	FString GrepPattern;
+	Params->TryGetStringField(TEXT("grep_pattern"), GrepPattern);
 	FString PayloadText = FullText;
 	int32 MatchCount = 0;
 	const bool bGrepped = !GrepPattern.IsEmpty();
