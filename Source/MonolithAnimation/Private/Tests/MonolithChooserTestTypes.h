@@ -19,10 +19,10 @@ struct FMonolithChooserTestAttackRowData
 {
 	GENERATED_BODY()
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Monolith|Chooser|Test")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Monolith|Chooser|Test", meta = (ClampMin = "0.0"))
 	float Damage = 10.f;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Monolith|Chooser|Test")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Monolith|Chooser|Test", meta = (ClampMin = "0.0"))
 	float StaminaCost = 15.f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Monolith|Chooser|Test")
