@@ -740,7 +740,7 @@ bool FMonolithChooserNameOutputStructTest::RunTest(const FString& /*Parameters*/
 	TSharedPtr<FJsonObject> AddEnumParams = Params(*TablePath);
 	AddEnumParams->SetStringField(TEXT("column_kind"), TEXT("Enum"));
 	AddEnumParams->SetStringField(TEXT("binding_property"), TEXT("ChooserContext.AttackVariant"));
-	AddEnumParams->SetStringField(TEXT("enum_class"), TEXT("/Script/MonolithAnimation.MonolithChooserTestAttackVariant"));
+	AddEnumParams->SetStringField(TEXT("enum_class"), StaticEnum<EMonolithChooserTestAttackVariant>()->GetPathName());
 	Result = Execute(TEXT("add_chooser_column"), AddEnumParams);
 	if (!TestTrue(TEXT("Enum regression column added"), Result.bSuccess) || Table->ColumnsStructs.IsEmpty())
 	{
