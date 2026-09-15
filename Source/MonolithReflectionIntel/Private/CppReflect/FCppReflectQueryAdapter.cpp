@@ -101,6 +101,36 @@ namespace
 		Stmt.GetColumnValueByIndex(1, OutPath);
 	}
 
+	/** Source-index lookup for a reflected UPROPERTY. The C++ source index records
+	 * class members as `variable` symbols linked to their owning class. Both
+	 * out-params remain at their caller-provided unknown values when no match is
+	 * available, preserving the empty/0 fallback contract. */
+	void LookupPropertySource(
+		FSQLiteDatabase& DB,
+		const FString& OwningClass,
+		const FString& PropertyName,
+		int32& OutLine,
+		FString& OutPath)
+	{
+		if (OwningClass.IsEmpty() || PropertyName.IsEmpty()) { return; }
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(DB, TEXT(
+			"SELECT s.line_start, f.path FROM symbols s "
+			"JOIN symbols p ON p.id = s.parent_symbol_id "
+			"JOIN files f ON f.id = s.file_id "
+			"WHERE s.name = ? AND s.kind = 'variable' "
+			"  AND p.name = ? AND p.kind IN ('class','struct') "
+			"LIMIT 1;")))
+		{
+			return;
+		}
+		Stmt.SetBindingValueByIndex(1, PropertyName);
+		Stmt.SetBindingValueByIndex(2, OwningClass);
+		if (Stmt.Step() != ESQLitePreparedStatementStepResult::Row) { return; }
+		Stmt.GetColumnValueByIndex(0, OutLine);
+		Stmt.GetColumnValueByIndex(1, OutPath);
+	}
+
 	/** Variant for UFUNCTION rows: scope the function-name lookup to the owning
 	 *  class via the parent-symbol foreign key. Empty class falls back to a
 	 *  bare name lookup (won't disambiguate between same-named functions in
@@ -598,7 +628,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUProperties(const TShar
 	if (bBpOnly)                { WhereSql += TEXT(" AND blueprint_visibility IS NOT NULL AND blueprint_visibility <> ''"); }
 
 	const FString Sql = FString::Printf(
-		TEXT("SELECT owning_class, property_name, property_type, cpp_module, blueprint_visibility, specifiers "
+		TEXT("SELECT owning_class, property_name, property_type, cpp_module, blueprint_visibility, specifiers, source_line "
 			 "FROM reflect_uproperties %s "
 			 "ORDER BY owning_class, property_name "
 			 "LIMIT ? OFFSET ?;"),
@@ -618,12 +648,27 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUProperties(const TShar
 	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
 		FString OClass, PName, PType, PModule, BpVis, Specs;
+		int32 SourceLine = 0;
 		Stmt.GetColumnValueByIndex(0, OClass);
 		Stmt.GetColumnValueByIndex(1, PName);
 		Stmt.GetColumnValueByIndex(2, PType);
 		Stmt.GetColumnValueByIndex(3, PModule);
 		Stmt.GetColumnValueByIndex(4, BpVis);
 		Stmt.GetColumnValueByIndex(5, Specs);
+		Stmt.GetColumnValueByIndex(6, SourceLine);
+
+		// reflect_uproperties stores no source_path, and UHT commonly stores
+		// source_line=0. Fill both from the existing source-symbol index when
+		// available; leave path empty / line 0 when the symbol is unknown.
+		FString SourcePath;
+		if (SourceLine == 0 || SourcePath.IsEmpty())
+		{
+			int32 JoinedLine = 0;
+			FString JoinedPath;
+			LookupPropertySource(*DB, OClass, PName, JoinedLine, JoinedPath);
+			if (SourceLine == 0)       { SourceLine = JoinedLine; }
+			if (SourcePath.IsEmpty())  { SourcePath = JoinedPath; }
+		}
 
 		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 		R->SetStringField(TEXT("owning_class"), OClass);
@@ -632,6 +677,8 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleListUProperties(const TShar
 		R->SetStringField(TEXT("cpp_module"), PModule);
 		R->SetStringField(TEXT("blueprint_visibility"), BpVis);
 		R->SetStringField(TEXT("specifiers"), Specs);
+		R->SetStringField(TEXT("source_path"), SourcePath);
+		R->SetNumberField(TEXT("source_line"), SourceLine);
 		Rows.Add(MakeShared<FJsonValueObject>(R));
 	}
 
@@ -940,7 +987,7 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleFindClassSpecifier(const TS
 	// case-insensitively (LIKE is already ASCII-case-insensitive in SQLite).
 	FSQLitePreparedStatement Stmt;
 	if (!Stmt.Create(*DB, TEXT(
-		"SELECT class_name, module_name, parent_class, source_path, flags "
+		"SELECT class_name, module_name, parent_class, source_path, source_line, flags "
 		"FROM reflect_uclasses "
 		"WHERE flags = ?1 COLLATE NOCASE OR flags LIKE ?2 OR flags LIKE ?3 OR flags LIKE ?4 "
 		"ORDER BY module_name, class_name "
@@ -963,17 +1010,31 @@ FMonolithActionResult FCppReflectQueryAdapter::HandleFindClassSpecifier(const TS
 	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
 		FString CName, MName, Parent, SPath, Flags;
+		int32 SourceLine = 0;
 		Stmt.GetColumnValueByIndex(0, CName);
 		Stmt.GetColumnValueByIndex(1, MName);
 		Stmt.GetColumnValueByIndex(2, Parent);
 		Stmt.GetColumnValueByIndex(3, SPath);
-		Stmt.GetColumnValueByIndex(4, Flags);
+		Stmt.GetColumnValueByIndex(4, SourceLine);
+		Stmt.GetColumnValueByIndex(5, Flags);
+
+		// UHT rows commonly carry source_line=0 and may carry no path. Reuse the
+		// class source-index fallback while retaining empty/0 for unknown symbols.
+		if (SourceLine == 0 || SPath.IsEmpty())
+		{
+			int32 JoinedLine = 0;
+			FString JoinedPath;
+			LookupClassSource(*DB, CName, JoinedLine, JoinedPath);
+			if (SourceLine == 0) { SourceLine = JoinedLine; }
+			if (SPath.IsEmpty()) { SPath = JoinedPath; }
+		}
 
 		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 		R->SetStringField(TEXT("class_name"), CName);
 		R->SetStringField(TEXT("module_name"), MName);
 		R->SetStringField(TEXT("parent_class"), Parent);
 		R->SetStringField(TEXT("source_path"), SPath);
+		R->SetNumberField(TEXT("source_line"), SourceLine);
 		R->SetStringField(TEXT("flags"), Flags);
 		Rows.Add(MakeShared<FJsonValueObject>(R));
 	}

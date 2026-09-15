@@ -1,10 +1,13 @@
-"""SQLite schema for source_indexer."""
+"""SQLite schema for the legacy source_indexer (native schema contract v4)."""
 
 from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 1
+# v4: deterministic path identity, atomic project replacement semantics, and
+# file ownership for every deprecation row (including unresolved symbols).
+# Older generated databases must be explicitly rebuilt with trigger_reindex.
+SCHEMA_VERSION = 4
 
 _DDL = """
 -- Core tables ----------------------------------------------------------------
@@ -75,6 +78,26 @@ CREATE TABLE IF NOT EXISTS includes (
     line          INTEGER
 );
 
+-- Schema v2 (item 3): UE_DEPRECATED extraction. symbol_id is NULLABLE —
+-- class-body method declarations are NOT indexed as `symbols` rows
+-- (Step-0 finding), so the extractor parses the symbol NAME from the
+-- declaration text after the macro and stores symbol_id = NULL when it
+-- cannot resolve a symbols row. Lookups (check_deprecations) key on
+-- symbol_name, so a NULL symbol_id does not break the read path.
+
+CREATE TABLE IF NOT EXISTS symbol_deprecations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol_id   INTEGER REFERENCES symbols(id),
+    file_id     INTEGER REFERENCES files(id),
+    symbol_name TEXT NOT NULL,
+    version     TEXT,
+    message     TEXT,
+    kind        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deprecations_name ON symbol_deprecations(symbol_name);
+CREATE INDEX IF NOT EXISTS idx_deprecations_file_id ON symbol_deprecations(file_id);
+
 -- FTS5 virtual tables --------------------------------------------------------
 
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
@@ -117,7 +140,7 @@ END;
 def init_db(conn: sqlite3.Connection) -> None:
     """Create all tables, indexes, FTS virtual tables, and triggers.
 
-    Sets schema_version=1 in meta table. Safe to call on an existing DB
+    Sets schema_version=4 in meta table. Safe to call on an existing DB
     (all CREATE statements use IF NOT EXISTS).
     """
     try:

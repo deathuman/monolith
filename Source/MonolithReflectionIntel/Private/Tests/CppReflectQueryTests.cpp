@@ -87,8 +87,14 @@ namespace MonolithCppReflectTestDetail
 			return FString();
 		}
 
-		OutWorkRoot = FPaths::AutomationTransientDir()
-			/ FString::Printf(TEXT("cppreflect-fixture-%s"), *FGuid::NewGuid().ToString());
+		// AutomationTransientDir() can be returned as a project-relative path in
+		// the editor.  FUHTArtefactReader normalizes its roots independently, so
+		// passing that relative spelling can turn a valid staged fixture into a
+		// missing `C:/../...` root.  Resolve once here and pass the same absolute
+		// path to both the file writer and the reader.
+		OutWorkRoot = FPaths::ConvertRelativePathToFull(
+			FPaths::AutomationTransientDir()
+			/ FString::Printf(TEXT("cppreflect-fixture-%s"), *FGuid::NewGuid().ToString()));
 
 		const FString ModuleUhtDir = OutWorkRoot / TEXT("Inc") / ModuleName / TEXT("UHT");
 		FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*ModuleUhtDir);

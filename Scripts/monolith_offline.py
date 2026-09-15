@@ -1942,18 +1942,33 @@ class ReflectionActions:
         if bp_only:
             where += " AND blueprint_visibility IS NOT NULL AND blueprint_visibility <> ''"
 
-        sql = (f"SELECT owning_class, property_name, property_type, cpp_module, blueprint_visibility, specifiers "
+        sql = (f"SELECT owning_class, property_name, property_type, cpp_module, blueprint_visibility, specifiers, source_line "
                f"FROM reflect_uproperties {where} ORDER BY owning_class, property_name LIMIT ? OFFSET ?")
         rows = self.db.execute(sql, binds + [limit, page * limit]).fetchall()
 
-        out = {"success": True, "uproperties": [{
-            "owning_class": coerce_str(r["owning_class"]),
-            "property_name": coerce_str(r["property_name"]),
-            "property_type": coerce_str(r["property_type"]),
-            "cpp_module": coerce_str(r["cpp_module"]),
-            "blueprint_visibility": coerce_str(r["blueprint_visibility"]),
-            "specifiers": coerce_str(r["specifiers"]),
-        } for r in rows]}
+        properties = []
+        for r in rows:
+            source_line = int(r["source_line"] or 0)
+            source_path = ""
+            if source_line == 0 or source_path == "":
+                joined_line, joined_path = self._lookup_property_source(
+                    coerce_str(r["owning_class"]), coerce_str(r["property_name"]))
+                if source_line == 0:
+                    source_line = joined_line
+                if source_path == "":
+                    source_path = joined_path
+            properties.append({
+                "owning_class": coerce_str(r["owning_class"]),
+                "property_name": coerce_str(r["property_name"]),
+                "property_type": coerce_str(r["property_type"]),
+                "cpp_module": coerce_str(r["cpp_module"]),
+                "blueprint_visibility": coerce_str(r["blueprint_visibility"]),
+                "specifiers": coerce_str(r["specifiers"]),
+                "source_path": source_path,
+                "source_line": source_line,
+            })
+
+        out = {"success": True, "uproperties": properties}
 
         total = -1
         if not had_cursor:
@@ -2032,6 +2047,21 @@ class ReflectionActions:
             ).fetchone()
         return int(r["line_start"]) if r else 0
 
+    def _lookup_property_source(self, owning_class: str, property_name: str):
+        if not owning_class or not property_name:
+            return (0, "")
+        r = self.db.execute(
+            "SELECT s.line_start, f.path FROM symbols s "
+            "JOIN symbols p ON p.id = s.parent_symbol_id "
+            "JOIN files f ON f.id = s.file_id "
+            "WHERE s.name = ? AND s.kind = 'variable' "
+            "AND p.name = ? AND p.kind IN ('class','struct') LIMIT 1",
+            (property_name, owning_class)
+        ).fetchone()
+        if not r:
+            return (0, "")
+        return (int(r["line_start"] or 0), coerce_str(r["path"]))
+
     def find_interface_impls(self, args):
         if not self._require_table("reflect_uinterface_impls"):
             return
@@ -2103,20 +2133,36 @@ class ReflectionActions:
         if spec_lower == "blueprintable":
             effective = "IsBlueprintBase"
 
-        sql = ("SELECT class_name, module_name, parent_class, source_path, flags FROM reflect_uclasses "
+        sql = ("SELECT class_name, module_name, parent_class, source_path, source_line, flags FROM reflect_uclasses "
                "WHERE flags = ? COLLATE NOCASE OR flags LIKE ? OR flags LIKE ? OR flags LIKE ? "
                "ORDER BY module_name, class_name LIMIT ? OFFSET ?")
         binds = [effective, effective + ":%", "%:" + effective + ":%", "%:" + effective,
                  limit, page * limit]
         rows = self.db.execute(sql, binds).fetchall()
 
-        uclasses = [{
-            "class_name": coerce_str(r["class_name"]),
-            "module_name": coerce_str(r["module_name"]),
-            "parent_class": coerce_str(r["parent_class"]),
-            "source_path": coerce_str(r["source_path"]),
-            "flags": coerce_str(r["flags"]),
-        } for r in rows]
+        uclasses = []
+        for r in rows:
+            source_line = int(r["source_line"] or 0)
+            source_path = coerce_str(r["source_path"])
+            if source_line == 0 or source_path == "":
+                joined = self.db.execute(
+                    "SELECT s.line_start, f.path FROM symbols s JOIN files f ON f.id = s.file_id "
+                    "WHERE s.name = ? AND s.kind IN ('class','struct') LIMIT 1",
+                    (coerce_str(r["class_name"]),)
+                ).fetchone()
+                if joined:
+                    if source_line == 0:
+                        source_line = int(joined["line_start"] or 0)
+                    if source_path == "":
+                        source_path = coerce_str(joined["path"])
+            uclasses.append({
+                "class_name": coerce_str(r["class_name"]),
+                "module_name": coerce_str(r["module_name"]),
+                "parent_class": coerce_str(r["parent_class"]),
+                "source_path": source_path,
+                "source_line": source_line,
+                "flags": coerce_str(r["flags"]),
+            })
 
         out = {"success": True, "specifier_name": specifier_name}
         if effective != specifier_name:
