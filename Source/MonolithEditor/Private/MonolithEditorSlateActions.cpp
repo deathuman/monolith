@@ -57,6 +57,9 @@ namespace
 	void DrainUIOperation();
 #if WITH_DEV_AUTOMATION_TESTS
 	bool bTestSlateUnavailable = false;
+	bool bTestAllowModalRecoveryTickDuringAction = false;
+	// Lets the focused automation test exercise the pump without a live listener.
+	TFunction<void(float)> ModalRecoveryHttpTickOverride;
 #endif
 	bool IsSlateAvailableForOperation()
 	{
@@ -752,23 +755,44 @@ namespace
 			Item->Phase = TEXT("completed");
 		}
 	}
+
+	void PumpModalRecoveryHttpTick(float DeltaTime, TFunctionRef<void(float)> HttpTick)
+	{
+		{
+			TGuardValue<bool> PumpGuard(bPumpingRecovery, true);
+			const bool bPrevious = SetMonolithUIRecoveryOnly(true);
+			HttpTick(DeltaTime);
+			SetMonolithUIRecoveryOnly(bPrevious);
+		}
+		// Dispatch only after HTTP returns, so the listener cannot be re-entered
+		// by the action queued by its own request.
+		DrainUIOperation();
+	}
 }
 
 void FMonolithEditorSlateActions::TickModalRecovery(float DeltaTime)
 {
 	// Deferred dispatch guarantees the initiating HTTP request is no longer on
 	// the stack. Never pump HTTP for a legacy synchronous domain action.
-	if (RunningUIActions == 0 || IsMonolithActionExecuting() || bPumpingRecovery || !FHttpServerModule::IsAvailable()) return;
+#if WITH_DEV_AUTOMATION_TESTS
+	if (IsMonolithActionExecuting() && !bTestAllowModalRecoveryTickDuringAction) return;
+#else
+	if (IsMonolithActionExecuting()) return;
+#endif
+	if (bPumpingRecovery) return;
+#if WITH_DEV_AUTOMATION_TESTS
+	if (ModalRecoveryHttpTickOverride)
 	{
-		TGuardValue<bool> PumpGuard(bPumpingRecovery, true);
-		const bool bPrevious = SetMonolithUIRecoveryOnly(true);
-		// Tick through the public virtual ticker interface; no Engine changes.
-		static_cast<FTSTickerObjectBase&>(FHttpServerModule::Get()).Tick(DeltaTime);
-		SetMonolithUIRecoveryOnly(bPrevious);
+		PumpModalRecoveryHttpTick(DeltaTime, ModalRecoveryHttpTickOverride);
+		return;
 	}
-	// Dispatch after HTTP has returned, so even a nested modal cannot re-enter
-	// the listener iteration or the request that queued this recovery action.
-	DrainUIOperation();
+#endif
+	if (!FHttpServerModule::IsAvailable()) return;
+	PumpModalRecoveryHttpTick(DeltaTime, [](float TickDeltaTime)
+	{
+		// Tick through the public virtual ticker interface; no Engine changes.
+		static_cast<FTSTickerObjectBase&>(FHttpServerModule::Get()).Tick(TickDeltaTime);
+	});
 }
 
 void FMonolithEditorSlateActions::Shutdown()
@@ -913,6 +937,136 @@ bool FMonolithSlateUnavailableOperationTest::RunTest(const FString&)
 		TestFalse(TEXT("Unavailable queued input removed"), PendingOperation.IsValid());
 		Operations.Remove(Item);
 	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMonolithSlateModalRecoveryLivenessTest,
+	"Monolith.Editor.Accessibility.ModalRecoveryLiveness",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FMonolithSlateModalRecoveryLivenessTest::RunTest(const FString&)
+{
+	if (!TestFalse(TEXT("No operation is pending before the fixture"), PendingOperation.IsValid())) return false;
+	if (!TestEqual(TEXT("Recovery starts with no running UI actions"), RunningUIActions, 0)) return false;
+
+	const FString ControlLabel = TEXT("__MonolithModalRecoveryLiveness__");
+	int32 Clicks = 0;
+	TSharedPtr<SButton> Button;
+	const auto Window = SNew(SWindow).Title(FText::FromString(TEXT("Monolith modal recovery fixture"))).ClientSize(FVector2D(400, 180))
+	[
+		SAssignNew(Button, SButton)
+		.Text(FText::FromString(ControlLabel))
+		.OnClicked_Lambda([&Clicks]() { ++Clicks; return FReply::Handled(); })
+	];
+	TestTrue(TEXT("Fixture button is created"), Button.IsValid());
+	auto& Slate = FSlateApplication::Get();
+	Slate.AddWindow(Window);
+	Slate.Tick();
+
+	const bool bPreviousRecoveryOnly = SetMonolithUIRecoveryOnly(false);
+	FString OperationId;
+	int32 HttpTicks = 0;
+	bool bSnapshotServed = false;
+	bool bOperationQueued = false;
+	bool bQueuedOperationPolled = false;
+	bool bUnrelatedActionBlocked = false;
+	bool bNestedPumpBlocked = false;
+	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
+	const bool bPreviousTestActionBypass = bTestAllowModalRecoveryTickDuringAction;
+	bTestAllowModalRecoveryTickDuringAction = false;
+	ModalRecoveryHttpTickOverride = [this, &Registry, &OperationId, &HttpTicks, &bSnapshotServed, &bOperationQueued, &bQueuedOperationPolled, &bUnrelatedActionBlocked, &bNestedPumpBlocked, &ControlLabel](float DeltaTime)
+	{
+		++HttpTicks;
+		TestEqual(TEXT("HTTP pump runs before any UI action"), RunningUIActions, 0);
+
+		const auto Unrelated = Registry.ExecuteAction(TEXT("editor"), TEXT("get_module_status"), MakeShared<FJsonObject>());
+		bUnrelatedActionBlocked = !Unrelated.bSuccess && Unrelated.ErrorMessage.Contains(TEXT("Modal recovery"));
+		TestTrue(TEXT("Unrelated editor action remains blocked during recovery"), bUnrelatedActionBlocked);
+
+		auto SnapshotParams = MakeShared<FJsonObject>();
+		SnapshotParams->SetStringField(TEXT("filter"), ControlLabel);
+		const auto Snapshot = Registry.ExecuteAction(TEXT("editor"), TEXT("get_slate_snapshot"), SnapshotParams);
+		bSnapshotServed = Snapshot.bSuccess && Snapshot.Result.IsValid();
+		TestTrue(TEXT("First recovery snapshot is served by the modal HTTP pump"), bSnapshotServed);
+		if (bSnapshotServed)
+		{
+			const TArray<TSharedPtr<FJsonValue>>* Controls = nullptr;
+			TestTrue(TEXT("Recovery snapshot contains the observed fixture control"), Snapshot.Result->TryGetArrayField(TEXT("controls"), Controls));
+			if (Controls && Controls->Num() > 0)
+			{
+				auto InteractParams = MakeShared<FJsonObject>();
+				InteractParams->SetStringField(TEXT("snapshot_id"), Snapshot.Result->GetStringField(TEXT("snapshot_id")));
+				InteractParams->SetNumberField(TEXT("control_index"), 0);
+				InteractParams->SetStringField(TEXT("operation"), TEXT("click"));
+				const auto Queued = Registry.ExecuteAction(TEXT("editor"), TEXT("interact_slate"), InteractParams);
+				bOperationQueued = Queued.bSuccess && Queued.Result.IsValid();
+				TestTrue(TEXT("Observed UI action queues through the recovery request"), bOperationQueued);
+				if (bOperationQueued)
+				{
+					OperationId = Queued.Result->GetStringField(TEXT("operation_id"));
+					auto PollParams = MakeShared<FJsonObject>();
+					PollParams->SetStringField(TEXT("operation_id"), OperationId);
+					const auto QueuedPoll = Registry.ExecuteAction(TEXT("editor"), TEXT("get_slate_operation"), PollParams);
+					bQueuedOperationPolled = QueuedPoll.bSuccess && QueuedPoll.Result.IsValid()
+						&& QueuedPoll.Result->GetStringField(TEXT("phase")) == TEXT("queued");
+					TestTrue(TEXT("Queued operation can be polled before the HTTP tick returns"), bQueuedOperationPolled);
+				}
+			}
+		}
+
+		FMonolithEditorSlateActions::TickModalRecovery(DeltaTime);
+		bNestedPumpBlocked = HttpTicks == 1;
+		TestTrue(TEXT("Nested modal tick cannot re-enter the HTTP pump"), bNestedPumpBlocked);
+	};
+
+	const bool bActionExecuting = IsMonolithActionExecuting();
+	if (bActionExecuting)
+	{
+		FMonolithEditorSlateActions::TickModalRecovery(0.016f);
+		TestEqual(TEXT("Production action-execution guard blocks the synthetic tick"), HttpTicks, 0);
+	}
+	bTestAllowModalRecoveryTickDuringAction = true;
+	FMonolithEditorSlateActions::TickModalRecovery(0.016f);
+	bTestAllowModalRecoveryTickDuringAction = false;
+	TestEqual(TEXT("Modal pump ran once with zero running actions"), HttpTicks, 1);
+	if (bActionExecuting)
+	{
+		TestTrue(TEXT("Operation remains deferred while the outer Monolith action is active"), PendingOperation.IsValid());
+		TestEqual(TEXT("Deferred operation does not dispatch inside the outer action"), Clicks, 0);
+	}
+	else
+	{
+		TestFalse(TEXT("Queued operation drains after the HTTP callback returns"), PendingOperation.IsValid());
+		TestEqual(TEXT("Recovery operation dispatches after the pump returns"), Clicks, 1);
+	}
+	if (!OperationId.IsEmpty())
+	{
+		auto PollParams = MakeShared<FJsonObject>();
+		PollParams->SetStringField(TEXT("operation_id"), OperationId);
+		const auto Completed = Registry.ExecuteAction(TEXT("editor"), TEXT("get_slate_operation"), PollParams);
+		TestTrue(TEXT("Operation status remains available after recovery"), Completed.bSuccess && Completed.Result.IsValid());
+		if (Completed.bSuccess && Completed.Result.IsValid())
+			TestEqual(TEXT("Operation reflects deferred dispatch state"), Completed.Result->GetStringField(TEXT("phase")), FString(bActionExecuting ? TEXT("queued") : TEXT("completed")));
+	}
+	const auto NormalAccess = Registry.ExecuteAction(TEXT("editor"), TEXT("get_module_status"), MakeShared<FJsonObject>());
+	TestTrue(TEXT("Normal editor action access resumes when recovery ends"), NormalAccess.bSuccess);
+	TestFalse(TEXT("Pump reentrancy guard is released"), bPumpingRecovery);
+	TestEqual(TEXT("UI action counter is balanced"), RunningUIActions, 0);
+
+	ModalRecoveryHttpTickOverride = TFunction<void(float)>();
+	bTestAllowModalRecoveryTickDuringAction = bPreviousTestActionBypass;
+	if (PendingOperation.IsValid())
+	{
+		Operations.Remove(PendingOperation);
+		PendingOperation.Reset();
+	}
+	if (!OperationId.IsEmpty()) Operations.RemoveAll([&OperationId](const auto& Item) { return Item->Id == OperationId; });
+	SnapshotId.Reset();
+	ObservedControls.Reset();
+	ObservedWindows.Reset();
+	Slate.RequestDestroyWindow(Window);
+	Slate.Tick();
+	SetMonolithUIRecoveryOnly(bPreviousRecoveryOnly);
 	return true;
 }
 #endif

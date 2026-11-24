@@ -4,14 +4,14 @@
 #include "MonolithToolRegistry.h"
 
 /**
- * Phase 13: Level Design Quick Wins (9 actions)
+ * Phase 13: Level Design Quick Wins
  * Lights, materials, mesh swap, LOD, instancing, component property reflection.
  * High-frequency actions for level design sessions.
  */
 class FMonolithMeshLevelDesignActions
 {
 public:
-	/** Register all 9 level design actions with the tool registry */
+	/** Register all level design actions with the tool registry */
 	static void RegisterActions(FMonolithToolRegistry& Registry);
 
 private:
@@ -32,6 +32,12 @@ private:
 
 	/** Set per-LOD screen size thresholds on a static mesh asset */
 	static FMonolithActionResult SetLodScreenSizes(const TSharedPtr<FJsonObject>& Params);
+
+	/** Read supported per-LOD mesh build settings */
+	static FMonolithActionResult GetLodBuildSettings(const TSharedPtr<FJsonObject>& Params);
+
+	/** Patch supported per-LOD mesh build settings and rebuild the named mesh */
+	static FMonolithActionResult SetLodBuildSettings(const TSharedPtr<FJsonObject>& Params);
 
 	/** Identify meshes used many times that could be HISM-converted */
 	static FMonolithActionResult FindInstancingCandidates(const TSharedPtr<FJsonObject>& Params);

@@ -1,6 +1,6 @@
 # Monolith — Technical Specification
 
-**Version:** 0.23.0 (Beta)
+**Version:** 0.24.0 (Beta)
 **Wiki:** https://github.com/tumourlove/monolith/wiki
 **Engine:** Unreal Engine 5.7+
 **Platform:** Windows, macOS, Linux
@@ -45,7 +45,7 @@ Monolith.uplugin
   MonolithSource        — Engine source + API lookup, auto-reindex on hot-reload (Phase J F17), LLM C++ authoring ergonomics (include/signature/deprecation/verify/example/lint/stub) (~20+ actions)
   MonolithUI            — Widget blueprint CRUD + slot/template/styling, animation v1 (deprecated) + v2 (hoisted), settings scaffolding, accessibility, UISpec build/dump/schema, EffectSurface sub-bag actions (reflective optional-provider probe, decoupled 2026-04-27), CommonUI categories A–I, Type Registry diagnostic, Style Service diagnostic. (66 always-on + 51 CommonUI = 117 module-owned + 4 GAS UI binding aliases registered cross-namespace). CommonUI actions conditional on #if WITH_COMMONUI. EffectSurface actions return -32010 ErrOptionalDepUnavailable when the optional EffectSurface provider is absent (see specs/SPEC_MonolithUI.md § "Error Contract"). Architecture expansion Phase A–L landed 2026-04-26 (Spec Builder, Type Registry, EffectSurface, Style Service, hoisted Design Import verbs)
   MonolithMesh          — Mesh inspection, scene manipulation, spatial queries, level blockout, GeometryScript ops, horror/accessibility, lighting, audio/acoustics, performance, decals, level design, tech art, context props, procedural geometry (sweep walls, auto-collision, proc mesh caching, blueprint prefabs), genre presets, encounter design, accessibility reports (~190+ core actions) + EXPERIMENTAL procedural town generator (45 actions, disabled by default via bEnableProceduralTownGen)
-  MonolithGAS           — Gameplay Ability System integration: abilities, attributes, effects, ASC, tags, cues, targets, input, inspection, scaffolding, UI attribute binding (~130+ actions, incl. 4 also aliased into `ui` namespace). Conditional on #if WITH_GBA. ALSO owns the `input` namespace (13 actions — Enhanced Input asset inspection + instanced modifier/trigger authoring; NOT GAS, and registered BEFORE the bEnableGAS gate so it survives GAS being switched off)
+  MonolithGAS           — Gameplay Ability System integration: abilities, attributes, effects, ASC, tags, cues, targets, input, inspection, scaffolding, UI attribute binding (~130+ actions, incl. 4 also aliased into `ui` namespace). Conditional on #if WITH_GBA. ALSO owns the `input` namespace (15 actions — Enhanced Input asset inspection, key mapping row add/remove, and instanced modifier/trigger authoring; NOT GAS, and registered BEFORE the bEnableGAS gate so it survives GAS being switched off)
   MonolithComboGraph    — ComboGraph plugin integration: combo graph CRUD, node/edge management, effects, cues, ability scaffolding (~13 actions). Conditional on #if WITH_COMBOGRAPH
   MonolithAI            — AI asset manipulation: Behavior Trees, Blackboards, State Trees, EQS, Smart Objects, AI Controllers, Perception, Navigation, Runtime/PIE, Scaffolds, Discovery, Advanced (~220+ actions). Conditional on #if WITH_STATETREE, #if WITH_SMARTOBJECTS (required); #if WITH_MASSENTITY, #if WITH_ZONEGRAPH (optional)
   MonolithLogicDriver   — Logic Driver Pro integration: SM CRUD, graph read/write, node config, runtime/PIE, JSON spec, scaffolding, discovery, components, text graph (~66 actions). Conditional on #if WITH_LOGICDRIVER
@@ -73,12 +73,12 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 ### MCP Protocol
 
 - **Protocol version:** Echoes client's requested version; supports both `2024-11-05` and `2025-03-26` (defaults to `2025-03-26`)
-- **Transport:** HTTP with JSON-RPC 2.0 (POST for requests, GET for SSE stub, OPTIONS for CORS). Transport type in `.mcp.json` varies by client: `"http"` for Claude Code, `"streamableHttp"` for Cursor/Cline
+- **Transport:** HTTP with JSON-RPC 2.0 request/response over POST; standalone `GET /mcp` returns HTTP 405 with `Allow: POST, OPTIONS, DELETE` because SSE streaming is not implemented. This follows the [Streamable HTTP specification (2025-03-26)](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports), which permits 405 when standalone GET streaming is unsupported. OPTIONS handles CORS. Transport type in `.mcp.json` varies by client: `"http"` for Claude Code, `"streamableHttp"` for Cursor/Cline
 - **Endpoint:** `http://localhost:{port}/mcp` (default port 9316)
 - **Bind retry:** `FMonolithHttpServer::Start()` attempts up to 5 binds with exponential backoff and TCP port probe before failing. `Restart()` method available for runtime recovery. Console command: `Monolith.Restart`
 - **Batch support:** Yes (JSON-RPC arrays)
 - **Session management:** None — server is fully stateless (session tracking removed; no per-session state was ever stored)
-- **CORS:** `Access-Control-Allow-Origin: *`
+- **CORS:** Echoes an allowlisted `http(s)://localhost`, `127.0.0.1` or `[::1]` origin, with an optional port; absent, `null` and non-loopback origins receive no `Access-Control-Allow-Origin` header. Responses include `Vary: Origin`; there is no wildcard origin grant.
 
 #### JSON-RPC error catalogue
 
@@ -92,6 +92,8 @@ Standard codes mirror the JSON-RPC 2.0 spec. Monolith server-defined codes live 
 | `ErrInvalidParams` | `-32602` | Action found, params invalid (missing required field, bad enum, etc.). |
 | `ErrInternalError` | `-32603` | The server choked. Default for unspecified failures. |
 | `ErrOptionalDepUnavailable` | `-32010` | An optional sibling/marketplace plugin the action depends on is not present. The action exists in the registry; the call cannot be served. First consumer: the 10 EffectSurface action handlers when the optional EffectSurface provider is absent (see [`specs/SPEC_MonolithUI.md` § "Error Contract — Optional EffectSurface Provider Absence (-32010)"](specs/SPEC_MonolithUI.md#error-contract--optional-effectsurface-provider-absence--32010)). Reserved range `-32011..-32019` left open for future "optional dep" codes. |
+
+**Required-param check.** Before dispatch, `FMonolithToolRegistry::ExecuteAction` rejects a call that omits any schema-required param (after the K2 alias rewrite), naming every missing key and the keys that were provided. `asset_path` is checked like any other param (issue #157 removed a blanket exemption that let a missing `asset_path` reach handlers as an empty string, surfacing as e.g. `"Blueprint not found: "`). Two legacy undeclared aliases still satisfy it, each scoped to the namespace whose handlers read it: `system_path` in `niagara` and `package_path` in `project`. When used, the alias value is moved onto `asset_path` before dispatch; when neither is present the error reads `asset_path (or alias: system_path)`. The `wbp_path` required param still accepts `asset_path` as a substitute.
 
 **`warnings[]` channel (Phase 1.0, 2026-05-27).** Successful responses may carry an optional top-level `warnings: string[]` array. The array is appended to (not replaced) by three independent sources before emit, and is omitted when empty:
 
@@ -176,16 +178,17 @@ Each module has its own spec file under `specs/`. The table below is the index.
 The engine source indexer is a native C++ implementation within `MonolithSource`. `UMonolithSourceSubsystem` builds and maintains `EngineSource.db` in-process. Indexing is triggered via:
 
 - **`trigger_reindex`** — full engine source re-index
-- **`trigger_project_reindex`** — atomic project/project-plugin C++ replacement (Engine rows preserved; failures roll back)
-- **`get_index_status`** — read-only progress and migration status (`schema_version` is actual; `expected_schema_version` is the current contract)
+- **`trigger_project_reindex`** — atomically replaces project and project-plugin C++ rows while preserving Engine rows. It purges previously indexed rows under the project's `Source/` and `Plugins/` trees first, removing deleted files, symbols, modules, and plugins without duplication. Cancellation, unreadable source, or database failure rolls back the prior project snapshot. The same incremental pass may start after Live Coding or hot reload. See `specs/SPEC_MonolithSource.md` § Incremental Project Reindex.
+- **`get_index_status`** — read-only progress and migration status (`schema_version` is actual; `expected_schema_version` is the current contract), including `requires_full_reindex`.
 
 Schema-v4 databases use deterministic path identity and file-owned deprecation
-rows. Older generated databases
-are incompatible and require one explicit full `trigger_reindex`; project-only
-indexing is rejected while that migration is required. Poll `get_index_status`
-for completion rather than assuming a freshness window. The native indexer
-preserves the prior project snapshot on cancellation, unreadable source, or
-database failure.
+rows. Parser version 2 adds reflected class-member rows and Allman-style
+out-of-line definitions and callers; an index created by an older parser
+requires one explicit full `trigger_reindex`, and its full-reindex requirement
+must be visible through `get_index_status`. Project-only indexing is rejected
+while a full rebuild is required. Poll `get_index_status` for completion rather
+than assuming a freshness window. The native indexer preserves the prior
+project snapshot on cancellation, unreadable source, or database failure.
 
 ### 4.2 Python Source Indexer (legacy)
 
@@ -212,6 +215,8 @@ database failure.
 
 ### Source DB Schema
 
+Native C++ indexer schema version **3** (stamped in `meta.schema_version`). A pre-v3 `EngineSource.db` is migrated in place on open.
+
 | Table | Purpose |
 |-------|---------|
 | `modules` | id, name, path, module_type, build_cs_path |
@@ -220,6 +225,7 @@ database failure.
 | `inheritance` | id, child_id, parent_id |
 | `references` | id, from_symbol_id, to_symbol_id, ref_kind, file_id, line |
 | `includes` | id, file_id, included_path, line |
+| `symbol_deprecations` | id, symbol_id (nullable), symbol_name, version, message, kind, file_id (nullable, v3) |
 | `symbols_fts` | FTS5 on name, qualified_name, docstring |
 | `source_fts` | FTS5 on text (file_id, line_number UNINDEXED) |
 | `meta` | key, value |
@@ -275,7 +281,7 @@ Live `source_query` additionally exposes the native-only `trigger_reindex`,
 | `get_class_hierarchy` | `symbol` | `--direction up\|down\|both`, `--depth` | Inheritance tree traversal |
 | `get_module_info` | `module_name` | — | File count, symbol counts by kind, key classes |
 | `get_symbol_context` | `symbol` | `--context-lines` | Definition with surrounding context |
-| `read_file` | `file_path` | `--start`, `--end` | Read source lines; resolves via absolute path → DB exact → DB suffix match |
+| `read_file` | `file_path` [`start` [`end`]] | `--start`, `--end` | Read source lines; resolves via path on disk → DB exact → DB suffix match (forward-slash, separator-anchored, so `Engine/Source/...` works) → legacy backslash form → engine-root join for unindexed `Engine/...` paths. Positional line numbers are honoured; a non-integer or a positional+option duplicate is an error |
 
 **Project (5 actions)** — mirrors `project_query` MCP tool:
 
@@ -311,7 +317,7 @@ Live `source_query` additionally exposes the native-only `trigger_reindex`,
 - Opens DBs with `PRAGMA query_only=ON` + `PRAGMA journal_mode=DELETE`. The DELETE journal mode override is mandatory — WAL mode silently returns 0 rows on Windows when opened in any read-only mode (same bug that affected the C++ module; see CLAUDE.md Key Lessons).
 - FTS escaping mirrors `EscapeFTS()` in C++: `::` replaced with space, non-word chars stripped, each token wrapped as `"token"*` for prefix match.
 - `read_source` defaults to `--header` (includes `.h` declarations). Pass `--no-header` to skip header files.
-- `read_file` with `--end 0` (default) reads 200 lines from `--start`.
+- `read_file` with `--end 0` (default) reads 200 lines from `--start`. `read_file <path> 100 140` is equivalent to `--start 100 --end 140`.
 - Source output is plain text. Project output is JSON.
 
 ---
@@ -485,7 +491,7 @@ The regression harness is `Scripts\test_proxy_build.ps1`. It builds through both
 
 1. On editor startup (5s delay), checks `api.github.com/repos/tumourlove/monolith/releases/latest`
 2. Compares `tag_name` semver against compiled `MONOLITH_VERSION`
-3. Selects the release asset for the running engine (compile-time `ENGINE_MINOR_VERSION`; fail-closed if a per-engine release has no matching asset) and parses the matching `Monolith-SHA256-v2-UE5.<minor>:` integrity marker from the release notes (fail-closed if a per-engine asset has no matching v2 marker; legacy assets use `Monolith-SHA256-v2:`, absent = proceed unverified with a warning)
+3. Selects an explicit `Monolith-*.zip` release asset for the running engine (compile-time `ENGINE_MINOR_VERSION`; fail-closed if a per-engine release has no matching asset). Selection uses the stable `Monolith-` prefix and `-UE5.<minor>.zip` suffix rather than coupling to the hand-entered release tag. GitHub's repository `zipball_url` and unrelated ZIP assets are never install candidates because they omit the required precompiled plugin binaries. The updater then parses the matching `Monolith-SHA256-v2-UE5.<minor>:` integrity marker from the release notes (fail-closed if a per-engine asset has no matching v2 marker; legacy assets use `Monolith-SHA256-v2:`, absent = proceed unverified with a warning)
 4. If newer: shows a dialog window with full release notes + "Install Update" / "Remind Me Later"
 5. Download stages to `Saved/Monolith/Staging/` (NOT Plugins/ — would cause UBT conflicts); the downloaded zip's SHA-256 is computed with the plugin's portable `MonolithSha256::Compute` (FIPS 180-4, no engine platform hook — `FPlatformMisc::GetSHA256Signature` has no Windows impl and its generic fallback fatally asserts, Issues #90/#94) and must equal the parsed marker or the install refuses. The "v2" marker generation exists because v0.14.7–v0.21.0 updaters hard-assert on the old marker names — old names must never be emitted again
 6. On editor exit, a detached swap script runs:
@@ -541,7 +547,7 @@ AI discoverability: `monolith_guide(section="recipes")` returns Recipe 5 ("Visua
 See `TODO.md` for the full list. Key architectural constraints:
 
 - **6 reimplemented NiagaraEditor helpers** — NiagaraEditor APIs not exported by Epic; Monolith reimplements them locally
-- **SSE is stub-only** — GET endpoint returns single event and close, not full streaming
+- **SSE streaming is unsupported** — standalone `GET /mcp` returns 405; clients use POST request/response transport.
 - **MaterialExpressionNoise fails on Lumen card passes** — Compiles for base pass but errors on Lumen card capture shaders ("function signature unavailable"). Engine limitation, not a Monolith bug. Workaround: use custom HLSL noise or pre-baked noise textures instead.
 - **MaterialExpressionRadialGradientExponential does not exist** — Despite appearing in some community references, this expression class is not in UE 5.7. Use a Custom HLSL node with `pow(1.0 - saturate(length(UV - 0.5) * 2.0), Exponent)` instead.
 
@@ -603,7 +609,7 @@ Counts below were re-verified against the live `monolith_discover()` registry on
 | MonolithSource | source | ~20 | 11 baseline + 1 v0.17.0 Phase 2 audit action `audit_module_dep_reality` registered cross-module from `MonolithReflectionIntel` (catches UPROPERTY / API-symbol references whose owning module is missing from the declaring module's `Build.cs` deps; the audit handler lives in `MonolithReflectionIntel`, registration onto `source` is for caller ergonomics — agents already discover `source_query` first) + 8 ([Unreleased]) LLM C++ authoring-ergonomics actions across Phases 1-3 (`get_include_path`, `get_signature`, `check_deprecations` — Phase 1; `verify_symbols`, `find_example_usage` — Phase 2; `lint_header`, `generate_class_stub` — Phase 3; plus `suggest_build_cs_deps` registered cross-module from `MonolithReflectionIntel`). See [`specs/SPEC_MonolithSource.md`](specs/SPEC_MonolithSource.md). |
 | MonolithUI | ui | 134 module-owned (79 always-on + 55 CommonUI under `WITH_COMMONUI`) + 4 GAS UI binding aliases (registered from `MonolithGAS`, conditional on `WITH_GBA`) = **138** distinct registrations into `ui::` in the full-stack configuration | Architecture expansion Phase A–L landed 2026-04-26 (see prior entry). v0.14.11 [Unreleased] Tier 1/2/3/4 close-the-loop ergonomics layered on top: Tier 1 fixes (hash-cache mis-keying, CommonUI allowlist additions, `create_bound_action_bar.action_button_class` param, `compile_widget` `errors[]`/`warnings[]` surface, `set_widget_property` `value` alias). Tier 2 +8 actions: `rename_widget`, `add_widget_variable`, `audit_focus_chain`, `apply_token_binding` (MVP-STUB — issue #2-10b for full BP-graph node-write completion), `list_widget_property_enums`, `convert_textblock_to_common`, `set_action_bar_button_class`, `dump_blueprint_compile_log` (gains `BlueprintGraph` + `Projects` deps in `MonolithUI.Build.cs`). Tier 3 +4 scaffolders: `scaffold_main_menu`, `scaffold_settings_panel_with_tabs`, `scaffold_pause_menu`, `build_menu_from_spec` (MVP — issue #3-18b for multi-screen aggregation). Tier 4 polish: `convert_button_to_common` Tokenforge auto-detect, `-32011` Tokenforge Provider Absence error contract parity with `-32010`, new CommonUI Property Allowlist Coverage section in [`specs/SPEC_MonolithUI.md`](specs/SPEC_MonolithUI.md). The 4 GAS aliases (`bind_widget_to_attribute`, `unbind_widget_attribute`, `list_attribute_bindings`, `clear_widget_attribute_bindings`) come from `MonolithGAS/Private/MonolithGASUIBindingActions.cpp` and dispatch to the same handlers as their canonical `gas::` versions. Phase 3 (2026-05-23) of [`Docs/plans/2026-05-22-monolith-ui-bp-gap-actions.md`](plans/2026-05-22-monolith-ui-bp-gap-actions.md) added 4 CommonUI-gated actions — `set_widget_navigation_bulk`, `dump_widget_navigation`, `convert_border_to_common`, `reparent_widget_root` — bumping CommonUI 51 → 55, module-owned 129 → 133, full-stack 133 → 137. Phase 4 (2026-05-23) added 1 always-on action — `set_widget_is_variable` — bumping always-on 78 → 79, module-owned 133 → 134, full-stack 137 → 138 (CommonUI subtotal unchanged) |
 | MonolithGAS | gas | 135 | 131 documented in the Action Categories table + 4 UI binding actions (`bind_widget_to_attribute`, `unbind_widget_attribute`, `list_attribute_bindings`, `clear_widget_attribute_bindings`) — the latter four are also aliased into `ui` |
-| MonolithGAS | input | 13 | **New in v0.23.0.** Enhanced Input, **not GAS** — `UInputAction` / `UInputMappingContext` are engine assets, and the namespace **registers BEFORE the `bEnableGAS` gate**, so it stays available when GAS integration is switched off. 5 read-only inspection (`list_input_actions`, `get_input_action`, `list_input_mapping_contexts`, `get_input_mapping_context`, `validate_input_mappings` — reimplemented from PR #130 by @kunkunGames) + 8 instanced-subobject authoring (`add_mapping_modifier`, `add_mapping_trigger`, `remove_mapping_modifier`, `remove_mapping_trigger`, `set_mapping_modifiers`, `set_mapping_triggers`, `set_input_action_modifiers`, `set_input_action_triggers` — issue #140, reported by @Alexbeav). The namespace mixes read and write, so its dispatcher hint cannot claim read-only; the five read actions enforce their own no-mutation contract. See [`specs/SPEC_MonolithGAS.md` § Input Namespace](specs/SPEC_MonolithGAS.md) |
+| MonolithGAS | input | 15 | **New in v0.23.0.** Enhanced Input, **not GAS** — `UInputAction` / `UInputMappingContext` are engine assets, and the namespace **registers BEFORE the `bEnableGAS` gate**, so it stays available when GAS integration is switched off. 5 read-only inspection (`list_input_actions`, `get_input_action`, `list_input_mapping_contexts`, `get_input_mapping_context`, `validate_input_mappings` — reimplemented from PR #130 by @kunkunGames) + 8 instanced-subobject authoring (`add_mapping_modifier`, `add_mapping_trigger`, `remove_mapping_modifier`, `remove_mapping_trigger`, `set_mapping_modifiers`, `set_mapping_triggers`, `set_input_action_modifiers`, `set_input_action_triggers` — issue #140, reported by @Alexbeav) + 2 key mapping row actions (`add_key_mapping`, `remove_key_mapping` — issue #148, reported by @grzegorzkarwalski-del). The namespace mixes read and write, so its dispatcher hint cannot claim read-only; the five read actions enforce their own no-mutation contract. See [`specs/SPEC_MonolithGAS.md` § Input Namespace](specs/SPEC_MonolithGAS.md) |
 | MonolithComboGraph | combograph | 13 | |
 | MonolithAI | ai | 223 | Phase J F8 added `add_perception_to_actor` and `get_bt_graph` — pre-J baseline was 219, not the previously documented 229 (per-category `~N` estimates in SPEC_MonolithAI were aspirational, not literal) + 2 test/profiling harness Wave 1 (`rebuild_navigation`, `validate_nav_points`). Motion Matching AI-wander runtime surface (2026-06-07, **no MCP-action delta**): 3 `UBTTaskNode` classes (`BTTask_SetMaxWalkSpeed`, `BTTask_SetCrouch`, `BTTask_RandomizeFloat` — placed via `add_bt_node`) + 1 Blueprintable `AAIController` (`AMonolithBehaviorTreeAIController`, runs its BT `UPROPERTY` on `OnPossess`). Fixes: `reorder_bt_children` order now persists (`NodePosX`-based); `build_behavior_tree_from_spec` now links `UBehaviorTree::BlackboardAsset`. See [`specs/SPEC_MonolithAI.md`](specs/SPEC_MonolithAI.md) § Motion Matching AI-wander runtime surface |
 | MonolithLogicDriver | logicdriver | 66 | |
@@ -872,6 +878,10 @@ Unknown action / unknown namespace dispatch errors now carry a `data.suggestions
 **Rerun-slice scheme, not keyset.** FTS5 `bm25()` rank is unstable under inserts / deletes (the rank drifts on next index update). Keyset / row-id cursors would silently skip or duplicate rows. The honest option for a moving FTS index is to rerun the query and slice the result set — accepting the rerun cost in exchange for correctness. Documented in the Phase 3 design audit.
 
 **`project_query("search")` cursor pagination (WISHLIST).** Architecturally blocked by `FMonolithIndexDatabase::FullTextSearch` at `MonolithIndexDatabase.cpp:1017-1079`, which performs a UNION-and-resort across multiple FTS tables without a deterministic ordering. A CTE / `UNION ALL` refactor with stable ordering is the prerequisite; deferred to a future Phase 5+ workstream.
+
+#### Proxy request timeout
+
+Forwarded requests use a 120 s request timeout by default (`MONOLITH_PROXY_TIMEOUT_S` overrides it; invalid values are ignored with a stderr note). The native proxy keeps resolve/connect at 10 s so a closed editor is still detected promptly. A timed-out `tools/call` is NOT reported as "Unreal Editor not running": both proxies return `Monolith request for tool '<name>' timed out after Ns. The Unreal Editor is still running and may have completed the action -- verify the result before retrying.` A refused connection still returns the editor-down error. Proxy version 1.2.0 (#147).
 
 ### 14.6 Proxy Call Log (Phase 4, 2026-05-27)
 

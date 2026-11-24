@@ -6,6 +6,7 @@
 #include "MonolithJsonUtils.h"
 
 #include "Engine/StaticMesh.h"
+#include "StaticMeshResources.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/PointLight.h"
 #include "Engine/SpotLight.h"
@@ -26,7 +27,11 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Editor.h"
+#include "MeshDescription.h"
+#include "StaticMeshAttributes.h"
 #include "UObject/UnrealType.h"
+
+#include <initializer_list>
 
 // Reuse the transaction helper from SceneActions
 namespace LevelDesignHelpers
@@ -188,6 +193,337 @@ namespace LevelDesignHelpers
 	}
 }
 
+namespace MeshBuildSettingsActions
+{
+	struct FBuildSettingsPatch
+	{
+		bool bHasGenerateLightmapUVs = false;
+		bool bGenerateLightmapUVs = false;
+		bool bHasSrcLightmapIndex = false;
+		int32 SrcLightmapIndex = 0;
+		bool bHasDstLightmapIndex = false;
+		int32 DstLightmapIndex = 0;
+	};
+
+	struct FScopedPostMeshBuildObserver
+	{
+		UStaticMesh* Mesh = nullptr;
+		int32 CallbackCount = 0;
+		FDelegateHandle Handle;
+
+		explicit FScopedPostMeshBuildObserver(UStaticMesh* InMesh)
+			: Mesh(InMesh)
+		{
+			Handle = Mesh->OnPostMeshBuild().AddLambda([this](UStaticMesh* BuiltMesh)
+			{
+				if (BuiltMesh == Mesh)
+				{
+					++CallbackCount;
+				}
+			});
+		}
+
+		~FScopedPostMeshBuildObserver()
+		{
+			if (Mesh && Handle.IsValid())
+			{
+				Mesh->OnPostMeshBuild().Remove(Handle);
+			}
+		}
+	};
+
+	bool RejectUnknownKeys(const TSharedPtr<FJsonObject>& Object,
+		std::initializer_list<const TCHAR*> AllowedKeys, FString& OutError, const TCHAR* ObjectName)
+	{
+		if (!Object.IsValid())
+		{
+			OutError = FString::Printf(TEXT("%s must be a JSON object"), ObjectName);
+			return false;
+		}
+
+		TSet<FString> Allowed;
+		for (const TCHAR* Key : AllowedKeys)
+		{
+			Allowed.Add(Key);
+		}
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Object->Values)
+		{
+			if (!Allowed.Contains(Field.Key))
+			{
+				OutError = FString::Printf(TEXT("Unknown %s key: %s"), ObjectName, *Field.Key);
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool ReadRequiredString(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName,
+		FString& OutValue, FString& OutError)
+	{
+		const TSharedPtr<FJsonValue>* Value = Object->Values.Find(FieldName);
+		if (!Value || !Value->IsValid() || (*Value)->Type != EJson::String)
+		{
+			OutError = FString::Printf(TEXT("%s must be a string"), FieldName);
+			return false;
+		}
+		OutValue = (*Value)->AsString();
+		if (OutValue.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("%s must not be empty"), FieldName);
+			return false;
+		}
+		if (!OutValue.StartsWith(TEXT("/")) || OutValue.Contains(TEXT(":")))
+		{
+			OutError = TEXT("asset_path must be an exact package or object path without a subobject suffix");
+			return false;
+		}
+		return true;
+	}
+
+	bool ReadStrictInteger(const TSharedPtr<FJsonValue>& Value, const TCHAR* FieldName,
+		int32 MinValue, int32 MaxValue, int32& OutValue, FString& OutError)
+	{
+		if (!Value.IsValid() || Value->Type != EJson::Number)
+		{
+			OutError = FString::Printf(TEXT("%s must be an integer"), FieldName);
+			return false;
+		}
+
+		const double Number = Value->AsNumber();
+		if (!FMath::IsFinite(Number) || Number < static_cast<double>(MinValue) || Number > static_cast<double>(MaxValue))
+		{
+			OutError = FString::Printf(TEXT("%s is non-finite or outside the supported range"), FieldName);
+			return false;
+		}
+		const int32 Integer = static_cast<int32>(Number);
+		if (static_cast<double>(Integer) != Number)
+		{
+			OutError = FString::Printf(TEXT("%s must be a whole integer"), FieldName);
+			return false;
+		}
+		OutValue = Integer;
+		return true;
+	}
+
+	bool ReadTargetFields(const TSharedPtr<FJsonObject>& Params, bool bForSet,
+		FString& OutAssetPath, int32& OutLodIndex, bool& bOutPreview, FString& OutError)
+	{
+		if (!RejectUnknownKeys(Params,
+			bForSet
+				? std::initializer_list<const TCHAR*>{ TEXT("asset_path"), TEXT("lod_index"), TEXT("settings"), TEXT("preview") }
+				: std::initializer_list<const TCHAR*>{ TEXT("asset_path"), TEXT("lod_index") },
+			OutError, TEXT("top-level")))
+		{
+			return false;
+		}
+		if (!ReadRequiredString(Params, TEXT("asset_path"), OutAssetPath, OutError))
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonValue>* LodValue = Params->Values.Find(TEXT("lod_index"));
+		if (!LodValue || !ReadStrictInteger(*LodValue, TEXT("lod_index"), 0, MAX_int32, OutLodIndex, OutError))
+		{
+			if (OutError.IsEmpty())
+			{
+				OutError = TEXT("lod_index is required");
+			}
+			return false;
+		}
+
+		bOutPreview = false;
+		if (bForSet)
+		{
+			if (const TSharedPtr<FJsonValue>* PreviewValue = Params->Values.Find(TEXT("preview")))
+			{
+				if (!PreviewValue->IsValid() || (*PreviewValue)->Type != EJson::Boolean)
+				{
+					OutError = TEXT("preview must be a boolean");
+					return false;
+				}
+				bOutPreview = (*PreviewValue)->AsBool();
+			}
+		}
+		return true;
+	}
+
+	bool ReadSettingsPatch(const TSharedPtr<FJsonObject>& Params,
+		FBuildSettingsPatch& OutPatch, FString& OutError)
+	{
+		const TSharedPtr<FJsonValue>* SettingsValue = Params->Values.Find(TEXT("settings"));
+		if (!SettingsValue || !SettingsValue->IsValid() || (*SettingsValue)->Type != EJson::Object)
+		{
+			OutError = TEXT("settings must be a nonempty object");
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject> Settings = (*SettingsValue)->AsObject();
+		if (!Settings.IsValid() || Settings->Values.IsEmpty())
+		{
+			OutError = TEXT("settings must be a nonempty object");
+			return false;
+		}
+		if (!RejectUnknownKeys(Settings,
+			{ TEXT("generate_lightmap_uvs"), TEXT("src_lightmap_index"), TEXT("dst_lightmap_index") },
+			OutError, TEXT("settings")))
+		{
+			return false;
+		}
+
+		if (const TSharedPtr<FJsonValue>* Value = Settings->Values.Find(TEXT("generate_lightmap_uvs")))
+		{
+			if (!Value->IsValid() || (*Value)->Type != EJson::Boolean)
+			{
+				OutError = TEXT("settings.generate_lightmap_uvs must be a boolean");
+				return false;
+			}
+			OutPatch.bHasGenerateLightmapUVs = true;
+			OutPatch.bGenerateLightmapUVs = (*Value)->AsBool();
+		}
+
+		if (const TSharedPtr<FJsonValue>* Value = Settings->Values.Find(TEXT("src_lightmap_index")))
+		{
+			OutPatch.bHasSrcLightmapIndex = true;
+			if (!ReadStrictInteger(*Value, TEXT("settings.src_lightmap_index"),
+				0, MAX_MESH_TEXTURE_COORDS_MD - 1, OutPatch.SrcLightmapIndex, OutError))
+			{
+				return false;
+			}
+		}
+
+		if (const TSharedPtr<FJsonValue>* Value = Settings->Values.Find(TEXT("dst_lightmap_index")))
+		{
+			OutPatch.bHasDstLightmapIndex = true;
+			if (!ReadStrictInteger(*Value, TEXT("settings.dst_lightmap_index"),
+				0, MAX_MESH_TEXTURE_COORDS_MD - 1, OutPatch.DstLightmapIndex, OutError))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool ResolveMeshLOD(const FString& AssetPath, int32 LodIndex, UStaticMesh*& OutMesh,
+		FMeshDescription*& OutMeshDescription, FString& OutError)
+	{
+		OutMesh = FMonolithAssetUtils::LoadAssetByPath<UStaticMesh>(AssetPath);
+		if (!OutMesh)
+		{
+			OutError = FString::Printf(TEXT("Static mesh not found or class mismatch: %s"), *AssetPath);
+			return false;
+		}
+
+		const int32 SourceLODCount = OutMesh->GetNumSourceModels();
+		if (LodIndex < 0 || LodIndex >= SourceLODCount)
+		{
+			OutError = FString::Printf(TEXT("lod_index %d is outside the mesh source LOD range [0, %d)"), LodIndex, SourceLODCount);
+			return false;
+		}
+
+		OutMeshDescription = OutMesh->GetMeshDescription(LodIndex);
+		if (!OutMeshDescription || OutMeshDescription->Vertices().Num() == 0 || OutMeshDescription->Triangles().Num() == 0)
+		{
+			OutError = FString::Printf(TEXT("Source LOD %d has no nonempty MeshDescription"), LodIndex);
+			return false;
+		}
+		return true;
+	}
+
+	FMeshBuildSettings MakeProposedSettings(const FMeshBuildSettings& Current, const FBuildSettingsPatch& Patch)
+	{
+		FMeshBuildSettings Proposed = Current;
+		if (Patch.bHasGenerateLightmapUVs)
+		{
+			Proposed.bGenerateLightmapUVs = Patch.bGenerateLightmapUVs;
+		}
+		if (Patch.bHasSrcLightmapIndex)
+		{
+			Proposed.SrcLightmapIndex = Patch.SrcLightmapIndex;
+		}
+		if (Patch.bHasDstLightmapIndex)
+		{
+			Proposed.DstLightmapIndex = Patch.DstLightmapIndex;
+		}
+		return Proposed;
+	}
+
+	bool SupportedSettingsDiffer(const FMeshBuildSettings& A, const FMeshBuildSettings& B)
+	{
+		return A.bGenerateLightmapUVs != B.bGenerateLightmapUVs
+			|| A.SrcLightmapIndex != B.SrcLightmapIndex
+			|| A.DstLightmapIndex != B.DstLightmapIndex;
+	}
+
+	TSharedPtr<FJsonObject> SettingsToJson(const FMeshBuildSettings& Settings)
+	{
+		auto Json = MakeShared<FJsonObject>();
+		Json->SetBoolField(TEXT("generate_lightmap_uvs"), Settings.bGenerateLightmapUVs);
+		Json->SetNumberField(TEXT("src_lightmap_index"), Settings.SrcLightmapIndex);
+		Json->SetNumberField(TEXT("dst_lightmap_index"), Settings.DstLightmapIndex);
+		return Json;
+	}
+
+	void SetTargetIdentity(const TSharedPtr<FJsonObject>& Result, const FString& RequestedPath,
+		const UStaticMesh* Mesh, int32 SourceLODCount, int32 LodIndex)
+	{
+		Result->SetStringField(TEXT("asset_path"), RequestedPath);
+		Result->SetStringField(TEXT("object_path"), Mesh->GetPathName());
+		Result->SetStringField(TEXT("package_name"), Mesh->GetOutermost()->GetName());
+		Result->SetNumberField(TEXT("source_lod_count"), SourceLODCount);
+		Result->SetNumberField(TEXT("lod_index"), LodIndex);
+	}
+
+	void SetDiagnostics(const TSharedPtr<FJsonObject>& Result, const TArray<FText>& Diagnostics)
+	{
+		TArray<TSharedPtr<FJsonValue>> JsonDiagnostics;
+		for (const FText& Diagnostic : Diagnostics)
+		{
+			JsonDiagnostics.Add(MakeShared<FJsonValueString>(Diagnostic.ToString()));
+		}
+		Result->SetArrayField(TEXT("diagnostics"), JsonDiagnostics);
+	}
+
+	bool ValidateFinalLightmapSettings(const FMeshBuildSettings& Proposed,
+		const FMeshDescription& MeshDescription, FString& OutError)
+	{
+		if (Proposed.SrcLightmapIndex < 0 || Proposed.SrcLightmapIndex >= MAX_MESH_TEXTURE_COORDS_MD
+			|| Proposed.DstLightmapIndex < 0 || Proposed.DstLightmapIndex >= MAX_MESH_TEXTURE_COORDS_MD)
+		{
+			OutError = TEXT("The complete proposed source/destination UV indices must be within the engine-supported range");
+			return false;
+		}
+		if (Proposed.bGenerateLightmapUVs)
+		{
+			if (Proposed.SrcLightmapIndex == Proposed.DstLightmapIndex)
+			{
+				OutError = TEXT("When generate_lightmap_uvs is true, source and destination lightmap indices must differ");
+				return false;
+			}
+			const auto SourceUVs = FStaticMeshConstAttributes(MeshDescription).GetVertexInstanceUVs();
+			if (!SourceUVs.IsValid() || Proposed.SrcLightmapIndex >= SourceUVs.GetNumChannels())
+			{
+				OutError = FString::Printf(TEXT("Source lightmap channel %d does not exist in the source MeshDescription"), Proposed.SrcLightmapIndex);
+				return false;
+			}
+			if (Proposed.DstLightmapIndex > SourceUVs.GetNumChannels())
+			{
+				OutError = TEXT("Generation destination must be an existing channel or the next source UV channel; channel gaps would be remapped by the engine");
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool HasValidRenderLOD(const UStaticMesh* Mesh, int32 LodIndex)
+	{
+		const FStaticMeshRenderData* RenderData = Mesh->GetRenderData();
+		return RenderData
+			&& RenderData->LODResources.IsValidIndex(LodIndex)
+			&& RenderData->LODResources[LodIndex].GetNumVertices() > 0
+			&& RenderData->LODResources[LodIndex].GetNumTriangles() > 0;
+	}
+}
+
 // ============================================================================
 // Registration
 // ============================================================================
@@ -274,6 +610,24 @@ void FMonolithMeshLevelDesignActions::RegisterActions(FMonolithToolRegistry& Reg
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Static mesh asset path"))
 			.Required(TEXT("screen_sizes"), TEXT("array"), TEXT("Array of screen size floats per LOD (e.g. [1.0, 0.4, 0.15])"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("mesh"), TEXT("get_lod_build_settings"),
+		TEXT("Read supported build settings for one static mesh source LOD"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMeshLevelDesignActions::GetLodBuildSettings),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Static mesh asset path"))
+			.Required(TEXT("lod_index"), TEXT("integer"), TEXT("Source LOD index"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("mesh"), TEXT("set_lod_build_settings"),
+		TEXT("Patch supported build settings for one static mesh source LOD; preview avoids mutation and build"),
+		FMonolithActionHandler::CreateStatic(&FMonolithMeshLevelDesignActions::SetLodBuildSettings),
+		FParamSchemaBuilder()
+			.RequiredAssetPath(TEXT("asset_path"), TEXT("Static mesh asset path"))
+			.Required(TEXT("lod_index"), TEXT("integer"), TEXT("Source LOD index"))
+			.Required(TEXT("settings"), TEXT("object"), TEXT("Nonempty patch: generate_lightmap_uvs (boolean), src_lightmap_index (integer), dst_lightmap_index (integer). Other fields are refused; omitted values are preserved. Generation destination must be existing or next source channel."))
+			.Optional(TEXT("preview"), TEXT("boolean"), TEXT("Report the proposed patch without mutation or build"), TEXT("false"))
 			.Build());
 
 	Registry.RegisterAction(TEXT("mesh"), TEXT("find_instancing_candidates"),
@@ -1073,6 +1427,167 @@ FMonolithActionResult FMonolithMeshLevelDesignActions::SetLodScreenSizes(const T
 	Result->SetNumberField(TEXT("lod_count"), LODCount);
 	Result->SetArrayField(TEXT("screen_sizes"), NewSizesArr);
 	Result->SetArrayField(TEXT("previous_sizes"), PrevSizesArr);
+
+	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================================
+// 6b. get_lod_build_settings
+// ============================================================================
+
+FMonolithActionResult FMonolithMeshLevelDesignActions::GetLodBuildSettings(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	int32 LodIndex = INDEX_NONE;
+	bool bPreview = false;
+	FString Error;
+	if (!MeshBuildSettingsActions::ReadTargetFields(Params, /*bForSet=*/false,
+		AssetPath, LodIndex, bPreview, Error))
+	{
+		return FMonolithActionResult::Error(Error);
+	}
+
+	UStaticMesh* Mesh = nullptr;
+	FMeshDescription* MeshDescription = nullptr;
+	if (!MeshBuildSettingsActions::ResolveMeshLOD(AssetPath, LodIndex, Mesh, MeshDescription, Error))
+	{
+		return FMonolithActionResult::Error(Error);
+	}
+
+	const FMeshBuildSettings& Settings = Mesh->GetSourceModel(LodIndex).BuildSettings;
+	auto Result = MakeShared<FJsonObject>();
+	MeshBuildSettingsActions::SetTargetIdentity(Result, AssetPath, Mesh, Mesh->GetNumSourceModels(), LodIndex);
+	Result->SetObjectField(TEXT("settings"), MeshBuildSettingsActions::SettingsToJson(Settings));
+	Result->SetNumberField(TEXT("min_lightmap_resolution"), Settings.MinLightmapResolution);
+	Result->SetNumberField(TEXT("source_uv_channel_count"), FStaticMeshConstAttributes(*MeshDescription).GetVertexInstanceUVs().GetNumChannels());
+	Result->SetNumberField(TEXT("lightmap_coordinate_index"), Mesh->GetLightMapCoordinateIndex());
+	Result->SetBoolField(TEXT("package_dirty"), Mesh->GetOutermost()->IsDirty());
+	return FMonolithActionResult::Success(Result);
+}
+
+// ============================================================================
+// 6c. set_lod_build_settings
+// ============================================================================
+
+FMonolithActionResult FMonolithMeshLevelDesignActions::SetLodBuildSettings(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	int32 LodIndex = INDEX_NONE;
+	bool bPreview = false;
+	FString Error;
+	if (!MeshBuildSettingsActions::ReadTargetFields(Params, /*bForSet=*/true,
+		AssetPath, LodIndex, bPreview, Error))
+	{
+		return FMonolithActionResult::Error(Error);
+	}
+
+	MeshBuildSettingsActions::FBuildSettingsPatch Patch;
+	if (!MeshBuildSettingsActions::ReadSettingsPatch(Params, Patch, Error))
+	{
+		return FMonolithActionResult::Error(Error);
+	}
+
+	UStaticMesh* Mesh = nullptr;
+	FMeshDescription* MeshDescription = nullptr;
+	if (!MeshBuildSettingsActions::ResolveMeshLOD(AssetPath, LodIndex, Mesh, MeshDescription, Error))
+	{
+		return FMonolithActionResult::Error(Error);
+	}
+
+	const FMeshBuildSettings BeforeSettings = Mesh->GetSourceModel(LodIndex).BuildSettings;
+	const FMeshBuildSettings ProposedSettings = MeshBuildSettingsActions::MakeProposedSettings(BeforeSettings, Patch);
+	if (!MeshBuildSettingsActions::ValidateFinalLightmapSettings(ProposedSettings, *MeshDescription, Error))
+	{
+		return FMonolithActionResult::Error(Error);
+	}
+
+	const bool bWouldChange = MeshBuildSettingsActions::SupportedSettingsDiffer(BeforeSettings, ProposedSettings);
+	const int32 LightMapCoordinateIndex = Mesh->GetLightMapCoordinateIndex();
+	if (bPreview)
+	{
+		auto Result = MakeShared<FJsonObject>();
+		MeshBuildSettingsActions::SetTargetIdentity(Result, AssetPath, Mesh, Mesh->GetNumSourceModels(), LodIndex);
+		Result->SetObjectField(TEXT("before"), MeshBuildSettingsActions::SettingsToJson(BeforeSettings));
+		Result->SetObjectField(TEXT("proposed"), MeshBuildSettingsActions::SettingsToJson(ProposedSettings));
+		Result->SetBoolField(TEXT("would_change"), bWouldChange);
+		Result->SetBoolField(TEXT("rebuild_required"), bWouldChange);
+		Result->SetBoolField(TEXT("preview"), true);
+		Result->SetNumberField(TEXT("lightmap_coordinate_index"), LightMapCoordinateIndex);
+		Result->SetBoolField(TEXT("package_dirty"), Mesh->GetOutermost()->IsDirty());
+		return FMonolithActionResult::Success(Result);
+	}
+
+	if (!bWouldChange)
+	{
+		auto Result = MakeShared<FJsonObject>();
+		MeshBuildSettingsActions::SetTargetIdentity(Result, AssetPath, Mesh, Mesh->GetNumSourceModels(), LodIndex);
+		Result->SetObjectField(TEXT("before"), MeshBuildSettingsActions::SettingsToJson(BeforeSettings));
+		Result->SetObjectField(TEXT("proposed"), MeshBuildSettingsActions::SettingsToJson(ProposedSettings));
+		Result->SetObjectField(TEXT("after"), MeshBuildSettingsActions::SettingsToJson(BeforeSettings));
+		Result->SetBoolField(TEXT("would_change"), false);
+		Result->SetBoolField(TEXT("settings_changed"), false);
+		Result->SetBoolField(TEXT("rebuild_required"), false);
+		Result->SetStringField(TEXT("rebuild_status"), TEXT("not_required"));
+		Result->SetBoolField(TEXT("package_dirty"), Mesh->GetOutermost()->IsDirty());
+		Result->SetStringField(TEXT("save_status"), TEXT("not_attempted"));
+		Result->SetNumberField(TEXT("lightmap_coordinate_index"), LightMapCoordinateIndex);
+		return FMonolithActionResult::Success(Result);
+	}
+
+	LevelDesignHelpers::FScopedMeshTransaction Transaction(
+		FText::FromString(TEXT("Monolith: Set LOD Build Settings")));
+	Mesh->Modify();
+	FMeshBuildSettings& MutableSettings = Mesh->GetSourceModel(LodIndex).BuildSettings;
+	MutableSettings.bGenerateLightmapUVs = ProposedSettings.bGenerateLightmapUVs;
+	MutableSettings.SrcLightmapIndex = ProposedSettings.SrcLightmapIndex;
+	MutableSettings.DstLightmapIndex = ProposedSettings.DstLightmapIndex;
+
+	TArray<FText> BuildDiagnostics;
+	int32 BuildCallbackCount = 0;
+	{
+		MeshBuildSettingsActions::FScopedPostMeshBuildObserver BuildObserver(Mesh);
+		Mesh->Build(false, &BuildDiagnostics);
+		BuildCallbackCount = BuildObserver.CallbackCount;
+	}
+	Mesh->MarkPackageDirty();
+
+	const FMeshBuildSettings AfterSettings = Mesh->GetSourceModel(LodIndex).BuildSettings;
+	const bool bStillCompiling = Mesh->IsCompiling();
+	const bool bValidRenderLOD = MeshBuildSettingsActions::HasValidRenderLOD(Mesh, LodIndex);
+	// Treat any build diagnostic as an unsuccessful rebuild so callers never mistake a warned build for clean proof.
+	const bool bStateMatches = AfterSettings == ProposedSettings && Mesh->GetLightMapCoordinateIndex() == LightMapCoordinateIndex;
+	const bool bBuildSucceeded = BuildCallbackCount == 1 && !bStillCompiling && bValidRenderLOD
+		&& BuildDiagnostics.IsEmpty() && bStateMatches;
+
+	auto Result = MakeShared<FJsonObject>();
+	MeshBuildSettingsActions::SetTargetIdentity(Result, AssetPath, Mesh, Mesh->GetNumSourceModels(), LodIndex);
+	Result->SetObjectField(TEXT("before"), MeshBuildSettingsActions::SettingsToJson(BeforeSettings));
+	Result->SetObjectField(TEXT("proposed"), MeshBuildSettingsActions::SettingsToJson(ProposedSettings));
+	Result->SetObjectField(TEXT("after"), MeshBuildSettingsActions::SettingsToJson(AfterSettings));
+	Result->SetBoolField(TEXT("would_change"), true);
+	Result->SetBoolField(TEXT("settings_changed"), MeshBuildSettingsActions::SupportedSettingsDiffer(BeforeSettings, AfterSettings));
+	Result->SetBoolField(TEXT("settings_mutated"), true);
+	Result->SetBoolField(TEXT("rebuild_required"), true);
+	Result->SetStringField(TEXT("rebuild_status"), bBuildSucceeded ? TEXT("succeeded") : TEXT("failed"));
+	Result->SetBoolField(TEXT("package_dirty"), Mesh->GetOutermost()->IsDirty());
+	Result->SetStringField(TEXT("save_status"), TEXT("not_attempted"));
+	Result->SetNumberField(TEXT("lightmap_coordinate_index"), Mesh->GetLightMapCoordinateIndex());
+	Result->SetNumberField(TEXT("build_callback_count"), BuildCallbackCount);
+	Result->SetBoolField(TEXT("is_compiling"), bStillCompiling);
+	Result->SetBoolField(TEXT("valid_render_lod"), bValidRenderLOD);
+	Result->SetBoolField(TEXT("state_matches_proposal"), bStateMatches);
+	MeshBuildSettingsActions::SetDiagnostics(Result, BuildDiagnostics);
+
+	if (!bBuildSucceeded)
+	{
+		const FString FailureReason = FString::Printf(
+			TEXT("Mesh build did not complete cleanly (post-build callbacks: %d, compiling: %s, valid render LOD: %s, diagnostics: %d, state matches proposal: %s). An edit was applied; inspect the observed before/after settings. The package remains dirty and was not saved."),
+			BuildCallbackCount, bStillCompiling ? TEXT("true") : TEXT("false"),
+			bValidRenderLOD ? TEXT("true") : TEXT("false"), BuildDiagnostics.Num(), bStateMatches ? TEXT("true") : TEXT("false"));
+		FMonolithActionResult Failure = FMonolithActionResult::Error(FailureReason);
+		Failure.WithErrorData(Result);
+		return Failure;
+	}
 
 	return FMonolithActionResult::Success(Result);
 }

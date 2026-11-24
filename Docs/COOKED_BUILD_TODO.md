@@ -23,6 +23,8 @@ Even though I3's sub-module is `Type: Runtime`, it's still inside the Monolith p
 - **PIE / editor:** All three features work as designed. Author content via Monolith MCP actions; runtime behaviour fires as expected during PIE.
 - **Cooked Steam build:** Content assets retain spec data, but the classes that execute that data are absent. Behaviour silently no-ops at runtime. Likely log warnings about missing classes; bindings/tasks/perception emitters do nothing.
 
+The package cook validator deliberately keeps this distinction explicit. Monolith's `Type: "Editor"` modules and its `Optional: true` plugin integrations are authoring-time metadata and are not required UFS entries. A cooker display such as `Dependent plugin "BlueprintAssist" referenced by "Monolith" ... skipping` therefore remains informational when that optional plugin is absent. The validator still checks project runtime code and any enabled, non-editor runtime plugin module that is allowed for the selected package configuration; it does not claim that `MonolithAudioRuntime` is shipped or close the runtime-class TODO below.
+
 ## Resolution Options (deferred)
 
 ### Option A — Drop runtime classes entirely (cleanest)

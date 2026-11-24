@@ -8,6 +8,383 @@
 #include "Dom/JsonValue.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "Misc/SecureHash.h"
+
+#include <limits>
+
+namespace MonolithMetadataGeneration
+{
+	enum class ECanonicalTag : uint8
+	{
+		Null = 0x00,
+		Boolean = 0x01,
+		Number = 0x02,
+		String = 0x03,
+		Array = 0x04,
+		Object = 0x05
+	};
+
+	static void AppendUInt64BigEndian(TArray<uint8>& OutBytes, uint64 Value)
+	{
+		for (int32 Shift = 56; Shift >= 0; Shift -= 8)
+		{
+			OutBytes.Add(static_cast<uint8>((Value >> Shift) & 0xff));
+		}
+	}
+
+	/** Each value is tag + uint64 big-endian payload byte length + payload. */
+	static void AppendToken(TArray<uint8>& OutBytes, ECanonicalTag Tag, const uint8* Payload, uint64 PayloadLength)
+	{
+		OutBytes.Add(static_cast<uint8>(Tag));
+		AppendUInt64BigEndian(OutBytes, PayloadLength);
+		if (PayloadLength > 0)
+		{
+			OutBytes.Append(Payload, static_cast<int32>(PayloadLength));
+		}
+	}
+
+	static void AppendStringToken(TArray<uint8>& OutBytes, const FString& Value)
+	{
+		// Include FString's terminator in the explicit source range so the conversion strips only
+		// that final terminator and preserves embedded null characters, including a trailing one.
+		FTCHARToUTF8 Utf8(*Value, Value.Len() + 1);
+		AppendToken(OutBytes, ECanonicalTag::String,
+			reinterpret_cast<const uint8*>(Utf8.Get()), static_cast<uint64>(Utf8.Length()));
+	}
+
+	static FString CopyJsonObjectKey(const FString& Key)
+	{
+		return Key;
+	}
+
+	static FString CopyJsonObjectKey(const UE::FSharedString& Key)
+	{
+		return FString(Key.ToView());
+	}
+
+	static FString JsonPathMember(const FString& Parent, const FString& Member)
+	{
+		return Parent.IsEmpty() ? Member : Parent + TEXT(".") + Member;
+	}
+
+	static bool EncodeJsonObject(
+		const TSharedPtr<FJsonObject>& Object,
+		TArray<uint8>& OutBytes,
+		const FString& Path,
+		FString& OutError);
+
+	static bool EncodeJsonValue(
+		const TSharedPtr<FJsonValue>& Value,
+		TArray<uint8>& OutBytes,
+		const FString& Path,
+		FString& OutError)
+	{
+		if (!Value.IsValid())
+		{
+			OutError = FString::Printf(TEXT("Invalid metadata JSON at %s: null value pointer."), *Path);
+			return false;
+		}
+
+		TArray<uint8> Payload;
+		switch (Value->Type)
+		{
+		case EJson::Null:
+			AppendToken(OutBytes, ECanonicalTag::Null, nullptr, 0);
+			return true;
+
+		case EJson::Boolean:
+			Payload.Add(Value->AsBool() ? 1 : 0);
+			AppendToken(OutBytes, ECanonicalTag::Boolean, Payload.GetData(), Payload.Num());
+			return true;
+
+		case EJson::Number:
+		{
+			const double Number = Value->AsNumber();
+			if (!FMath::IsFinite(Number))
+			{
+				OutError = FString::Printf(TEXT("Invalid metadata JSON at %s: non-finite number."), *Path);
+				return false;
+			}
+			static_assert(sizeof(double) == sizeof(uint64) && std::numeric_limits<double>::is_iec559,
+				"Metadata number encoding requires IEEE-754 binary64.");
+			uint64 Bits = 0;
+			FMemory::Memcpy(&Bits, &Number, sizeof(Bits));
+			AppendUInt64BigEndian(Payload, Bits);
+			AppendToken(OutBytes, ECanonicalTag::Number, Payload.GetData(), Payload.Num());
+			return true;
+		}
+
+		case EJson::String:
+		{
+			FString StringValue;
+			if (!Value->TryGetString(StringValue))
+			{
+				OutError = FString::Printf(TEXT("Invalid metadata JSON at %s: unreadable string value."), *Path);
+				return false;
+			}
+			AppendStringToken(OutBytes, StringValue);
+			return true;
+		}
+
+		case EJson::Array:
+		{
+			const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+			if (!Value->TryGetArray(Values) || !Values)
+			{
+				OutError = FString::Printf(TEXT("Invalid metadata JSON at %s: unreadable array."), *Path);
+				return false;
+			}
+			AppendUInt64BigEndian(Payload, static_cast<uint64>(Values->Num()));
+			for (int32 Index = 0; Index < Values->Num(); ++Index)
+			{
+				TArray<uint8> EncodedValue;
+				if (!EncodeJsonValue((*Values)[Index], EncodedValue,
+					FString::Printf(TEXT("%s[%d]"), *Path, Index), OutError))
+				{
+					return false;
+				}
+				Payload.Append(EncodedValue);
+			}
+			AppendToken(OutBytes, ECanonicalTag::Array, Payload.GetData(), Payload.Num());
+			return true;
+		}
+
+		case EJson::Object:
+		{
+			const TSharedPtr<FJsonObject>* Object = nullptr;
+			if (!Value->TryGetObject(Object) || !Object || !Object->IsValid())
+			{
+				OutError = FString::Printf(TEXT("Invalid metadata JSON at %s: unreadable object."), *Path);
+				return false;
+			}
+			return EncodeJsonObject(*Object, OutBytes, Path, OutError);
+		}
+
+		case EJson::None:
+		default:
+			OutError = FString::Printf(TEXT("Invalid metadata JSON at %s: unsupported JSON value type %d."),
+				*Path, static_cast<int32>(Value->Type));
+			return false;
+		}
+	}
+
+	static bool EncodeJsonObject(
+		const TSharedPtr<FJsonObject>& Object,
+		TArray<uint8>& OutBytes,
+		const FString& Path,
+		FString& OutError)
+	{
+		if (!Object.IsValid())
+		{
+			OutError = FString::Printf(TEXT("Invalid metadata JSON at %s: null object."), *Path);
+			return false;
+		}
+
+		struct FEncodedField
+		{
+			FString Key;
+			TSharedPtr<FJsonValue> Value;
+		};
+		TArray<FEncodedField> Fields;
+		Fields.Reserve(Object->Values.Num());
+		for (const auto& Pair : Object->Values)
+		{
+			FEncodedField Field;
+			Field.Key = CopyJsonObjectKey(Pair.Key);
+			Field.Value = Pair.Value;
+			Fields.Add(MoveTemp(Field));
+		}
+		Fields.Sort([](const FEncodedField& Left, const FEncodedField& Right)
+		{
+			return Left.Key.Compare(Right.Key, ESearchCase::CaseSensitive) < 0;
+		});
+
+		TArray<uint8> Payload;
+		AppendUInt64BigEndian(Payload, static_cast<uint64>(Fields.Num()));
+		for (const FEncodedField& Field : Fields)
+		{
+			AppendStringToken(Payload, Field.Key);
+			if (!EncodeJsonValue(Field.Value, Payload, JsonPathMember(Path, Field.Key), OutError))
+			{
+				if (OutError.IsEmpty())
+				{
+					OutError = FString::Printf(TEXT("Invalid metadata JSON at %s: missing object value."),
+						*JsonPathMember(Path, Field.Key));
+				}
+				return false;
+			}
+		}
+		AppendToken(OutBytes, ECanonicalTag::Object, Payload.GetData(), Payload.Num());
+		return true;
+	}
+
+	static TSharedPtr<FJsonObject> CloneJsonObject(const TSharedPtr<FJsonObject>& Object);
+
+	static TSharedPtr<FJsonValue> CloneJsonValue(const TSharedPtr<FJsonValue>& Value)
+	{
+		if (!Value.IsValid())
+		{
+			return nullptr;
+		}
+
+		switch (Value->Type)
+		{
+		case EJson::Null:
+			return MakeShared<FJsonValueNull>();
+		case EJson::Boolean:
+			return MakeShared<FJsonValueBoolean>(Value->AsBool());
+		case EJson::Number:
+			return MakeShared<FJsonValueNumber>(Value->AsNumber());
+		case EJson::String:
+			return MakeShared<FJsonValueString>(Value->AsString());
+		case EJson::Array:
+		{
+			const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+			if (!Value->TryGetArray(Values) || !Values)
+			{
+				return nullptr;
+			}
+			TArray<TSharedPtr<FJsonValue>> Cloned;
+			Cloned.Reserve(Values->Num());
+			for (const TSharedPtr<FJsonValue>& Child : *Values)
+			{
+				Cloned.Add(CloneJsonValue(Child));
+			}
+			return MakeShared<FJsonValueArray>(MoveTemp(Cloned));
+		}
+		case EJson::Object:
+		{
+			const TSharedPtr<FJsonObject>* Object = nullptr;
+			if (!Value->TryGetObject(Object) || !Object || !Object->IsValid())
+			{
+				return nullptr;
+			}
+			return MakeShared<FJsonValueObject>(CloneJsonObject(*Object));
+		}
+		case EJson::None:
+		default:
+			return nullptr;
+		}
+	}
+
+	static TSharedPtr<FJsonObject> CloneJsonObject(const TSharedPtr<FJsonObject>& Object)
+	{
+		if (!Object.IsValid())
+		{
+			return nullptr;
+		}
+		TSharedPtr<FJsonObject> Cloned = MakeShared<FJsonObject>();
+		for (const auto& Pair : Object->Values)
+		{
+			Cloned->SetField(CopyJsonObjectKey(Pair.Key), CloneJsonValue(Pair.Value));
+		}
+		return Cloned;
+	}
+
+	static FString HashToLowerHex(const TArray<uint8>& Bytes)
+	{
+		uint8 Hash[FSHA1::DigestSize];
+		FSHA1::HashBuffer(Bytes.GetData(), static_cast<uint64>(Bytes.Num()), Hash);
+		FString Hex;
+		Hex.Reserve(FSHA1::DigestSize * 2);
+		for (uint8 Byte : Hash)
+		{
+			Hex += FString::Printf(TEXT("%02x"), static_cast<uint32>(Byte));
+		}
+		return Hex;
+	}
+
+	/**
+	 * Canonical structure: a typed JSON root containing ordered action and active-dispatcher
+	 * arrays. Every value is tag + uint64 big-endian payload-byte length + payload; strings
+	 * are UTF-8, object keys are case-sensitive sorted, arrays retain order, booleans use
+	 * one byte, numbers use finite IEEE-754 binary64 bits in big-endian order, and null,
+	 * arrays, and objects have distinct tags. Container payloads start with a uint64 item
+	 * count. The root includes descriptions, categories, schemas/aliases and annotations.
+	 * The structural SHA-1 is lower-case hex. The final SHA-1 input is the same typed
+	 * encoding of a versioned domain string, that structural hex string, and an array of
+	 * handler-bound booleans ordered by namespace/action; its wire form is `v1:` plus the
+	 * 40 lower-case hex digits. This is an identity digest, not a security check.
+	 */
+	static bool BuildStructuralDigest(
+		const TArray<FMonolithActionInfo>& InActions,
+		const TMap<FString, FMonolithDispatcherAnnotations>& DispatcherAnnotations,
+		FString& OutDigest,
+		FString& OutError)
+	{
+		TArray<FMonolithActionInfo> Actions = InActions;
+		Actions.Sort([](const FMonolithActionInfo& Left, const FMonolithActionInfo& Right)
+		{
+			const int32 NamespaceOrder = Left.Namespace.Compare(Right.Namespace, ESearchCase::CaseSensitive);
+			return NamespaceOrder == 0
+				? Left.Action.Compare(Right.Action, ESearchCase::CaseSensitive) < 0
+				: NamespaceOrder < 0;
+		});
+
+		TSet<FString> ActiveNamespaceSet;
+		TArray<TSharedPtr<FJsonValue>> ActionValues;
+		ActionValues.Reserve(Actions.Num());
+		for (const FMonolithActionInfo& Info : Actions)
+		{
+			ActiveNamespaceSet.Add(Info.Namespace);
+			TSharedPtr<FJsonObject> ActionObject = MakeShared<FJsonObject>();
+			ActionObject->SetStringField(TEXT("namespace"), Info.Namespace);
+			ActionObject->SetStringField(TEXT("action"), Info.Action);
+			ActionObject->SetStringField(TEXT("description"), Info.Description);
+			ActionObject->SetStringField(TEXT("category"), Info.Category);
+			if (Info.ParamSchema.IsValid())
+			{
+				ActionObject->SetObjectField(TEXT("param_schema"), Info.ParamSchema);
+			}
+			else
+			{
+				ActionObject->SetField(TEXT("param_schema"), MakeShared<FJsonValueNull>());
+			}
+
+			TSharedPtr<FJsonObject> Annotations = MakeShared<FJsonObject>();
+			Annotations->SetBoolField(TEXT("read_only"), Info.bReadOnlyHint);
+			Annotations->SetBoolField(TEXT("destructive"), Info.bDestructiveHint);
+			Annotations->SetBoolField(TEXT("idempotent"), Info.bIdempotentHint);
+			Annotations->SetStringField(TEXT("title"), Info.Title);
+			ActionObject->SetObjectField(TEXT("annotations"), Annotations);
+			ActionValues.Add(MakeShared<FJsonValueObject>(ActionObject));
+		}
+
+		TArray<FString> ActiveNamespaces = ActiveNamespaceSet.Array();
+		ActiveNamespaces.Sort([](const FString& Left, const FString& Right)
+		{
+			return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
+		});
+		TArray<TSharedPtr<FJsonValue>> DispatcherValues;
+		DispatcherValues.Reserve(ActiveNamespaces.Num());
+		for (const FString& Namespace : ActiveNamespaces)
+		{
+			const FMonolithDispatcherAnnotations* Found = DispatcherAnnotations.Find(Namespace);
+			const FMonolithDispatcherAnnotations Annotations = Found
+				? *Found : FMonolithDispatcherAnnotations{};
+			TSharedPtr<FJsonObject> DispatcherObject = MakeShared<FJsonObject>();
+			DispatcherObject->SetStringField(TEXT("namespace"), Namespace);
+			DispatcherObject->SetBoolField(TEXT("read_only"), Annotations.bReadOnlyHint);
+			DispatcherObject->SetBoolField(TEXT("destructive"), Annotations.bDestructiveHint);
+			DispatcherObject->SetBoolField(TEXT("idempotent"), Annotations.bIdempotentHint);
+			DispatcherObject->SetStringField(TEXT("title"), Annotations.Title);
+			DispatcherValues.Add(MakeShared<FJsonValueObject>(DispatcherObject));
+		}
+
+		TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetStringField(TEXT("format"), TEXT("monolith-metadata-structural-v1"));
+		Root->SetArrayField(TEXT("actions"), ActionValues);
+		Root->SetArrayField(TEXT("dispatchers"), DispatcherValues);
+		TArray<uint8> CanonicalBytes;
+		if (!EncodeJsonObject(Root, CanonicalBytes, TEXT("metadata"), OutError))
+		{
+			OutDigest.Reset();
+			return false;
+		}
+		OutDigest = HashToLowerHex(CanonicalBytes);
+		return true;
+	}
+}
 
 // =============================================================================
 //  FMonolithParamSchema — K2 alias rewriting + K3 unknown-key detection
@@ -178,11 +555,12 @@ void FMonolithToolRegistry::RegisterAction(
 	RegAction.Info.Action = Action;
 	RegAction.Info.Description = Description;
 	RegAction.Info.Category = Category;
-	RegAction.Info.ParamSchema = ParamSchema;
+	RegAction.Info.ParamSchema = MonolithMetadataGeneration::CloneJsonObject(ParamSchema);
 	RegAction.Handler = Handler;
 
 	Actions.Add(Key, MoveTemp(RegAction));
 	NamespaceActions.FindOrAdd(Namespace).AddUnique(Key);
+	InvalidateMetadataStructuralDigest();
 
 	UE_LOG(LogMonolith, Verbose, TEXT("Registered action: %s — %s"), *Key, *Description);
 }
@@ -199,6 +577,7 @@ void FMonolithToolRegistry::UnregisterNamespace(const FString& Namespace)
 		}
 		UE_LOG(LogMonolith, Log, TEXT("Unregistered namespace: %s (%d actions)"), *Namespace, Keys->Num());
 		NamespaceActions.Remove(Namespace);
+		InvalidateMetadataStructuralDigest();
 	}
 }
 
@@ -396,15 +775,36 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 	}
 
 	// Validate required params from schema before dispatching.
-	// Skip asset_path — GetAssetPath() accepts both asset_path and system_path aliases
-	// and produces a clear error message itself.
+	//
+	// asset_path is validated like any other required param (issue #157). A small
+	// set of legacy, undeclared aliases is still honoured, each scoped to the one
+	// namespace whose handlers actually read it in place of asset_path:
+	//   - niagara: system_path (the GetAssetPath / NA_GetAssetPath / NL_GetAssetPath
+	//              helpers fall back to it)
+	//   - project: package_path (find_references / get_asset_details /
+	//              get_saved_asset_state fall back to it)
+	// When asset_path is absent and the namespace's alias is present, the alias
+	// value is rewritten onto asset_path (same shape as the K2 rewrite above), so
+	// every handler in that namespace sees it, including ones that only read
+	// asset_path. Outside those namespaces the alias is NOT accepted: the loaders
+	// there read only asset_path, and letting it through would reproduce the
+	// "<Thing> not found: " empty-path error this check exists to prevent.
 	if (ActionInfo.ParamSchema.IsValid())
 	{
+		struct FAssetPathAlias
+		{
+			const TCHAR* Namespace;
+			const TCHAR* Alias;
+		};
+		static const FAssetPathAlias AssetPathAliases[] = {
+			{ TEXT("niagara"), TEXT("system_path") },
+			{ TEXT("project"), TEXT("package_path") },
+		};
+
 		TArray<FString> Missing;
 		for (const auto& Pair : ActionInfo.ParamSchema->Values)
 		{
 			const FString PairKeyStr = MonolithKeyToString(Pair.Key);
-			if (PairKeyStr == TEXT("asset_path")) continue;
 
 			const TSharedPtr<FJsonObject>* ParamDef = nullptr;
 			if (Pair.Value->TryGetObject(ParamDef) && ParamDef)
@@ -417,6 +817,41 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 					// (only fires for schemas not migrated to K2 aliases).
 					if (PairKeyStr == TEXT("wbp_path") && EffectiveParams->HasField(TEXT("asset_path")))
 						continue;
+
+					if (PairKeyStr == TEXT("asset_path"))
+					{
+						TArray<FString> AcceptedAliases;
+						bool bSatisfied = false;
+						for (const FAssetPathAlias& Entry : AssetPathAliases)
+						{
+							if (!Namespace.Equals(Entry.Namespace, ESearchCase::IgnoreCase))
+							{
+								continue;
+							}
+							AcceptedAliases.Add(Entry.Alias);
+							if (!bSatisfied && EffectiveParams->HasField(Entry.Alias))
+							{
+								const TSharedPtr<FJsonValue> AliasValue = EffectiveParams->TryGetField(Entry.Alias);
+								if (AliasValue.IsValid())
+								{
+									EffectiveParams->SetField(TEXT("asset_path"), AliasValue);
+									EffectiveParams->RemoveField(Entry.Alias);
+									bSatisfied = true;
+								}
+							}
+						}
+						if (bSatisfied)
+						{
+							continue;
+						}
+						if (AcceptedAliases.Num() > 0)
+						{
+							Missing.Add(FString::Printf(TEXT("asset_path (or alias: %s)"),
+								*FString::Join(AcceptedAliases, TEXT(", "))));
+							continue;
+						}
+					}
+
 					Missing.Add(PairKeyStr);
 				}
 			}
@@ -428,7 +863,8 @@ FMonolithActionResult FMonolithToolRegistry::ExecuteAction(
 			return FMonolithActionResult::Error(
 				FString::Printf(TEXT("Missing required param(s): [%s]. Provided keys: [%s] — inspect the action's parameter schema via monolith_discover(\"<namespace>\") and supply all required fields."),
 					*FString::Join(Missing, TEXT(", ")),
-					*FString::Join(Provided, TEXT(", "))));
+					*FString::Join(Provided, TEXT(", "))),
+				FMonolithJsonUtils::ErrInvalidParams);
 		}
 	}
 
@@ -588,7 +1024,9 @@ TArray<FMonolithActionInfo> FMonolithToolRegistry::GetActions(const FString& Nam
 		{
 			if (const FRegisteredAction* RegAction = Actions.Find(Key))
 			{
-				Result.Add(RegAction->Info);
+				FMonolithActionInfo Info = RegAction->Info;
+				Info.ParamSchema = MonolithMetadataGeneration::CloneJsonObject(RegAction->Info.ParamSchema);
+				Result.Add(MoveTemp(Info));
 			}
 		}
 	}
@@ -601,7 +1039,9 @@ TArray<FMonolithActionInfo> FMonolithToolRegistry::GetAllActions() const
 	TArray<FMonolithActionInfo> Result;
 	for (const auto& Pair : Actions)
 	{
-		Result.Add(Pair.Value.Info);
+		FMonolithActionInfo Info = Pair.Value.Info;
+		Info.ParamSchema = MonolithMetadataGeneration::CloneJsonObject(Pair.Value.Info.ParamSchema);
+		Result.Add(MoveTemp(Info));
 	}
 	return Result;
 }
@@ -618,12 +1058,130 @@ int32 FMonolithToolRegistry::GetActionCount() const
 	return Actions.Num();
 }
 
+void FMonolithToolRegistry::InvalidateMetadataStructuralDigest()
+{
+	bMetadataStructuralDigestDirty = true;
+}
+
+bool FMonolithToolRegistry::ComputeMetadataStructuralDigest(FString& OutDigest, FString& OutError) const
+{
+	TArray<FMonolithActionInfo> Infos;
+	Infos.Reserve(Actions.Num());
+	for (const TPair<FString, FRegisteredAction>& Pair : Actions)
+	{
+		Infos.Add(Pair.Value.Info);
+	}
+#if WITH_DEV_AUTOMATION_TESTS
+	++MetadataStructuralDigestComputationCount;
+#endif
+	return MonolithMetadataGeneration::BuildStructuralDigest(
+		Infos, DispatcherAnnotations, OutDigest, OutError);
+}
+
+FMonolithMetadataSnapshot FMonolithToolRegistry::GetMetadataSnapshot() const
+{
+	FScopeLock Lock(&RegistryLock);
+	FMonolithMetadataSnapshot Snapshot;
+	Snapshot.TotalActions = Actions.Num();
+	Snapshot.NamespaceCount = NamespaceActions.Num();
+
+	if (bMetadataStructuralDigestDirty)
+	{
+		CachedMetadataStructuralDigest.Reset();
+		CachedMetadataStructuralDigestError.Reset();
+		bMetadataStructuralDigestValid = ComputeMetadataStructuralDigest(
+			CachedMetadataStructuralDigest, CachedMetadataStructuralDigestError);
+		bMetadataStructuralDigestDirty = false;
+	}
+
+	TArray<const FRegisteredAction*> OrderedActions;
+	OrderedActions.Reserve(Actions.Num());
+	for (const TPair<FString, FRegisteredAction>& Pair : Actions)
+	{
+		OrderedActions.Add(&Pair.Value);
+	}
+	// TArray::Sort dereferences raw-pointer elements before invoking its predicate.
+	OrderedActions.Sort([](const FRegisteredAction& Left, const FRegisteredAction& Right)
+	{
+		const int32 NamespaceOrder = Left.Info.Namespace.Compare(Right.Info.Namespace, ESearchCase::CaseSensitive);
+		return NamespaceOrder == 0
+			? Left.Info.Action.Compare(Right.Info.Action, ESearchCase::CaseSensitive) < 0
+			: NamespaceOrder < 0;
+	});
+
+	TArray<uint8> BindingPayload;
+	MonolithMetadataGeneration::AppendUInt64BigEndian(BindingPayload,
+		static_cast<uint64>(OrderedActions.Num()));
+	for (const FRegisteredAction* RegisteredAction : OrderedActions)
+	{
+		const bool bBound = RegisteredAction->Handler.IsBound();
+#if WITH_DEV_AUTOMATION_TESTS
+		++MetadataHandlerBindingSampleCount;
+#endif
+		const uint8 BindingByte = bBound ? 1 : 0;
+		MonolithMetadataGeneration::AppendToken(BindingPayload,
+			MonolithMetadataGeneration::ECanonicalTag::Boolean, &BindingByte, sizeof(BindingByte));
+		if (!bBound)
+		{
+			Snapshot.UnavailableActions.Add(
+				RegisteredAction->Info.Namespace + TEXT(".") + RegisteredAction->Info.Action);
+		}
+	}
+	Snapshot.UnavailableActions.Sort([](const FString& Left, const FString& Right)
+	{
+		return Left.Compare(Right, ESearchCase::CaseSensitive) < 0;
+	});
+
+	if (!bMetadataStructuralDigestValid)
+	{
+		Snapshot.MetadataGenerationError = CachedMetadataStructuralDigestError;
+		return Snapshot;
+	}
+
+	TArray<uint8> FinalInput;
+	MonolithMetadataGeneration::AppendStringToken(FinalInput,
+		FString(TEXT("monolith-metadata-generation-final-v1")));
+	MonolithMetadataGeneration::AppendStringToken(FinalInput, CachedMetadataStructuralDigest);
+	MonolithMetadataGeneration::AppendToken(FinalInput,
+		MonolithMetadataGeneration::ECanonicalTag::Array, BindingPayload.GetData(), BindingPayload.Num());
+	Snapshot.MetadataGeneration = FString(TEXT("v1:")) +
+		MonolithMetadataGeneration::HashToLowerHex(FinalInput);
+	return Snapshot;
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+bool FMonolithToolRegistry::ComputeStructuralDigestForTesting(
+	const TArray<FMonolithActionInfo>& InActions,
+	const TMap<FString, FMonolithDispatcherAnnotations>& InDispatcherAnnotations,
+	FString& OutDigest,
+	FString& OutError)
+{
+	OutDigest.Reset();
+	OutError.Reset();
+	return MonolithMetadataGeneration::BuildStructuralDigest(
+		InActions, InDispatcherAnnotations, OutDigest, OutError);
+}
+
+uint64 FMonolithToolRegistry::GetStructuralDigestComputationCountForTesting() const
+{
+	FScopeLock Lock(&RegistryLock);
+	return MetadataStructuralDigestComputationCount;
+}
+
+uint64 FMonolithToolRegistry::GetHandlerBindingSampleCountForTesting() const
+{
+	FScopeLock Lock(&RegistryLock);
+	return MetadataHandlerBindingSampleCount;
+}
+#endif
+
 void FMonolithToolRegistry::SetDispatcherAnnotations(
 	const FString& Namespace,
 	const FMonolithDispatcherAnnotations& Annotations)
 {
 	FScopeLock Lock(&RegistryLock);
 	DispatcherAnnotations.Add(Namespace, Annotations);
+	InvalidateMetadataStructuralDigest();
 }
 
 FMonolithDispatcherAnnotations FMonolithToolRegistry::GetDispatcherAnnotations(const FString& Namespace) const
@@ -652,5 +1210,6 @@ void FMonolithToolRegistry::SetActionAnnotations(
 		RegAction->Info.bDestructiveHint = bDestructive;
 		RegAction->Info.bIdempotentHint = bIdempotent;
 		RegAction->Info.Title = Title;
+		InvalidateMetadataStructuralDigest();
 	}
 }

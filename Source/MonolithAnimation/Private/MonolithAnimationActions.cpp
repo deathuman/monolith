@@ -47,6 +47,7 @@
 #include "JsonObjectConverter.h" // T2-1 get_ikrig_info: reflective solver/bone/goal settings struct -> JSON
 #include "RigEditor/IKRigController.h"
 #include "UObject/UObjectIterator.h"     // TObjectIterator<UStruct> — enumerate live IKRig solver-struct table
+#include "UObject/StrongObjectPtr.h"
 #include "Retargeter/IKRetargeter.h"
 #include "Retargeter/IKRetargetOps.h" // FIKRetargetOpBase / FIKRetargetOpSettingsBase — get_retargeter_info ops[] reflective read
 #include "Retargeter/IKRetargetChainMapping.h"
@@ -358,7 +359,7 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 
 	Registry.RegisterAction(TEXT("animation"), TEXT("get_anim_node_pin_bindings"),
 		TEXT("Read the property-access PIN bindings on an animation graph node (distinct from function bindings). ")
-		TEXT("Each entry reports pin, path (the property-access chain), type (Property/Function) and is_bound. ")
+		TEXT("Each entry reports pin, path (the property-access chain), type (Property/Function), is_bound and array_index (-1 = whole property; >= 0 = array element). ")
 		TEXT("Omit node_id to list every node that has any pin binding. ")
 		TEXT("Example: { asset_path: '/Game/Anim/ABP_Char', node_id: 'AnimGraphNode_ModifyBone_0' }."),
 		FMonolithActionHandler::CreateStatic(&HandleGetAnimNodePinBindings),
@@ -380,6 +381,7 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("node_id"), TEXT("string"), TEXT("Node name or NodeGuid"))
 			.Required(TEXT("pin"), TEXT("string"), TEXT("Pin (property) name to bind"))
 			.Optional(TEXT("path"), TEXT("array"), TEXT("Property-access chain as a string array. Empty/omitted clears the binding."))
+			.Optional(TEXT("array_index"), TEXT("integer"), TEXT("Element index for an array-element pin (e.g. BlendWeights_2 -> 2). -1 = whole-property binding. Omitted: keeps the existing binding's index, else derives it from the pin name suffix when the pin is an element of an FNode array property."))
 			.Optional(TEXT("graph_name"), TEXT("string"), TEXT("Filter to a specific graph"))
 			.Optional(TEXT("recompile"), TEXT("bool"), TEXT("Recompile the Animation Blueprint after the change"), TEXT("true"))
 			.Build());
@@ -1239,10 +1241,11 @@ void FMonolithAnimationActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("enable_gravity"), TEXT("boolean"), TEXT("Enable gravity"))
 			.Build());
 	Registry.RegisterAction(TEXT("animation"), TEXT("set_constraint_properties"),
-		TEXT("Modify angular/linear limits on a physics constraint by index or bone pair"),
+		TEXT("Modify physics constraint properties by index or bone pair, or toggle collision for an explicit body pair"),
 		FMonolithActionHandler::CreateStatic(&HandleSetConstraintProperties),
 		FParamSchemaBuilder()
 			.RequiredAssetPath(TEXT("asset_path"), TEXT("Physics asset path"))
+			.Optional(TEXT("collision_pair_only"), TEXT("boolean"), TEXT("Only toggle collision for the specified body pair; defaults to false"), TEXT("false"))
 			.Optional(TEXT("constraint_index"), TEXT("integer"), TEXT("Constraint index (alternative to bone pair)"))
 			.Optional(TEXT("bone_1"), TEXT("string"), TEXT("Child bone name (with bone_2, alternative to constraint_index)"))
 			.Optional(TEXT("bone_2"), TEXT("string"), TEXT("Parent bone name (with bone_1, alternative to constraint_index)"))
@@ -10721,6 +10724,127 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetBodyProperties(const T
 FMonolithActionResult FMonolithAnimationActions::HandleSetConstraintProperties(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath = Params->GetStringField(TEXT("asset_path"));
+	bool bCollisionPairOnly = false;
+	const TSharedPtr<FJsonValue>* PairModeValue = Params->Values.Find(TEXT("collision_pair_only"));
+	if (PairModeValue && (!PairModeValue->IsValid() || (*PairModeValue)->Type != EJson::Boolean
+		|| !Params->TryGetBoolField(TEXT("collision_pair_only"), bCollisionPairOnly)))
+	{
+		return FMonolithActionResult::Error(TEXT("collision_pair_only must be a boolean when provided"));
+	}
+
+	if (bCollisionPairOnly)
+	{
+		if (Params->HasField(TEXT("constraint_index")))
+		{
+			return FMonolithActionResult::Error(TEXT("collision_pair_only cannot be combined with constraint_index"));
+		}
+
+		const TArray<FString> ConstraintProfileFields = {
+			TEXT("swing1_motion"), TEXT("swing1_limit"),
+			TEXT("swing2_motion"), TEXT("swing2_limit"),
+			TEXT("twist_motion"), TEXT("twist_limit"),
+			TEXT("linear_x_motion"), TEXT("linear_x_limit"),
+			TEXT("linear_y_motion"), TEXT("linear_y_limit"),
+			TEXT("linear_z_motion"), TEXT("linear_z_limit"),
+			TEXT("angular_x_motion"), TEXT("angular_x_limit"),
+			TEXT("angular_y_motion"), TEXT("angular_y_limit"),
+			TEXT("angular_z_motion"), TEXT("angular_z_limit")
+		};
+		for (const FString& FieldName : ConstraintProfileFields)
+		{
+			if (Params->HasField(FieldName))
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("collision_pair_only cannot be combined with constraint profile parameter '%s'"), *FieldName));
+			}
+		}
+
+		FString Bone1;
+		FString Bone2;
+		if (!Params->TryGetStringField(TEXT("bone_1"), Bone1)
+			|| !Params->TryGetStringField(TEXT("bone_2"), Bone2))
+		{
+			return FMonolithActionResult::Error(TEXT("collision_pair_only requires nonempty bone_1 and bone_2"));
+		}
+		Bone1.TrimStartAndEndInline();
+		Bone2.TrimStartAndEndInline();
+		if (Bone1.IsEmpty() || Bone2.IsEmpty())
+		{
+			return FMonolithActionResult::Error(TEXT("collision_pair_only requires nonempty bone_1 and bone_2"));
+		}
+
+		const FName BoneName1(*Bone1);
+		const FName BoneName2(*Bone2);
+		if (BoneName1.IsNone() || BoneName2.IsNone() || BoneName1 == BoneName2)
+		{
+			return FMonolithActionResult::Error(TEXT("collision_pair_only requires two distinct body bone names"));
+		}
+
+		bool bDisableCollision = false;
+		const TSharedPtr<FJsonValue>* DisableValue = Params->Values.Find(TEXT("disable_collision"));
+		if (!DisableValue || !DisableValue->IsValid() || (*DisableValue)->Type != EJson::Boolean
+			|| !Params->TryGetBoolField(TEXT("disable_collision"), bDisableCollision))
+		{
+			return FMonolithActionResult::Error(TEXT("collision_pair_only requires an explicit boolean disable_collision"));
+		}
+
+		// UPhysicsAsset collision-pair edits are unsafe while PIE or simulate-in-editor
+		// is active or queued; the engine's collision table is read by the running world.
+		if (!GEditor || GEditor->IsPlaySessionInProgress())
+		{
+			return FMonolithActionResult::Error(TEXT("collision_pair_only is unavailable while an editor play/simulation session is active or queued"));
+		}
+
+		UPhysicsAsset* PairPhysAsset = FMonolithAssetUtils::LoadAssetByPath<UPhysicsAsset>(AssetPath);
+		if (!PairPhysAsset)
+		{
+			return FMonolithActionResult::Error(FString::Printf(TEXT("Physics asset not found: %s"), *AssetPath));
+		}
+
+		const int32 BodyIndex1 = PairPhysAsset->FindBodyIndex(BoneName1);
+		const int32 BodyIndex2 = PairPhysAsset->FindBodyIndex(BoneName2);
+		if (BodyIndex1 == INDEX_NONE || BodyIndex2 == INDEX_NONE)
+		{
+			return FMonolithActionResult::Error(FString::Printf(
+				TEXT("collision_pair_only body not found: bone_1='%s' index=%d, bone_2='%s' index=%d"),
+				*Bone1, BodyIndex1, *Bone2, BodyIndex2));
+		}
+		if (BodyIndex1 == BodyIndex2)
+		{
+			return FMonolithActionResult::Error(TEXT("collision_pair_only requires two distinct physics bodies"));
+		}
+
+		const bool bCollisionEnabledBefore = PairPhysAsset->IsCollisionEnabled(BodyIndex1, BodyIndex2);
+		GEditor->BeginTransaction(FText::FromString(TEXT("Set Physics Asset Body Pair Collision")));
+		PairPhysAsset->Modify();
+		if (bDisableCollision)
+		{
+			PairPhysAsset->DisableCollision(BodyIndex1, BodyIndex2);
+		}
+		else
+		{
+			PairPhysAsset->EnableCollision(BodyIndex1, BodyIndex2);
+		}
+		GEditor->EndTransaction();
+		PairPhysAsset->MarkPackageDirty();
+
+		const bool bCollisionEnabledAfter = PairPhysAsset->IsCollisionEnabled(BodyIndex1, BodyIndex2);
+		TSharedPtr<FJsonObject> PairRoot = MakeShared<FJsonObject>();
+		PairRoot->SetStringField(TEXT("action"), TEXT("set_constraint_properties"));
+		PairRoot->SetStringField(TEXT("asset_path"), AssetPath);
+		PairRoot->SetStringField(TEXT("mode"), TEXT("collision_pair_only"));
+		PairRoot->SetStringField(TEXT("bone_1"), Bone1);
+		PairRoot->SetNumberField(TEXT("body_index_1"), BodyIndex1);
+		PairRoot->SetStringField(TEXT("bone_2"), Bone2);
+		PairRoot->SetNumberField(TEXT("body_index_2"), BodyIndex2);
+		PairRoot->SetBoolField(TEXT("disable_collision_requested"), bDisableCollision);
+		PairRoot->SetBoolField(TEXT("collision_disable_table_contains_before"), !bCollisionEnabledBefore);
+		PairRoot->SetBoolField(TEXT("collision_disable_table_contains_after"), !bCollisionEnabledAfter);
+		PairRoot->SetBoolField(TEXT("collision_enabled_before"), bCollisionEnabledBefore);
+		PairRoot->SetBoolField(TEXT("collision_enabled_after"), bCollisionEnabledAfter);
+		PairRoot->SetBoolField(TEXT("collision_state_matches_request"), bCollisionEnabledAfter == !bDisableCollision);
+		return FMonolithActionResult::Success(PairRoot);
+	}
 
 	UPhysicsAsset* PhysAsset = FMonolithAssetUtils::LoadAssetByPath<UPhysicsAsset>(AssetPath);
 	if (!PhysAsset) return FMonolithActionResult::Error(FString::Printf(TEXT("Physics asset not found: %s"), *AssetPath));
@@ -11345,7 +11469,11 @@ FMonolithActionResult FMonolithAnimationActions::HandleBatchRetargetAnimations(c
 	}
 
 	// Run the synchronous batch retarget (uses FScopedSlowTask internally).
-	UIKRetargetBatchOperation* BatchOp = NewObject<UIKRetargetBatchOperation>(GetTransientPackage());
+	// OverwriteExistingAssets deletes the old assets and can collect garbage.
+	// Keep the batch object alive across RunRetarget, just as the engine's
+	// RunBatchRetarget helper does; a raw local pointer is not a GC reference.
+	TStrongObjectPtr<UIKRetargetBatchOperation> BatchOp(
+		NewObject<UIKRetargetBatchOperation>(GetTransientPackage()));
 	BatchOp->RunRetarget(Context);
 
 	// Verify created assets by loading the expected output paths.
@@ -11829,6 +11957,43 @@ FMonolithActionResult FMonolithAnimationActions::HandleGetAnimNodePinBindings(co
 		FString Note;
 		MonolithAnimNodeBindingReader::ReadPinBindings(AnimNode, Entries, Note);
 
+		// Annotate each property/function binding with its ArrayIndex. Array-element pins
+		// (BlendWeights_0, DesiredAlphas_1, ...) only drive their element when ArrayIndex
+		// is >= 0; INDEX_NONE (-1) means the binding targets the whole property.
+		{
+			FMapProperty* MapProp = nullptr;
+			void* MapPtr = nullptr;
+			UObject* BindingObj = nullptr;
+			FStructProperty* ValueStructProp = nullptr;
+			if (MonolithAnimNodeBindingReader::ResolvePropertyBindingsMap(AnimNode, MapProp, MapPtr, BindingObj)
+				&& (ValueStructProp = CastField<FStructProperty>(MapProp->ValueProp)) != nullptr
+				&& ValueStructProp->Struct == FAnimGraphNodePropertyBinding::StaticStruct())
+			{
+				TMap<FString, int32> ArrayIndexByPin;
+				FScriptMapHelper Helper(MapProp, MapPtr);
+				for (FScriptMapHelper::FIterator It(Helper); It; ++It)
+				{
+					const FAnimGraphNodePropertyBinding* PinBinding =
+						reinterpret_cast<const FAnimGraphNodePropertyBinding*>(Helper.GetValuePtr(It.GetInternalIndex()));
+					if (PinBinding)
+					{
+						ArrayIndexByPin.Add(PinBinding->PropertyName.ToString(), PinBinding->ArrayIndex);
+					}
+				}
+				for (const TSharedPtr<FJsonValue>& V : Entries)
+				{
+					const TSharedPtr<FJsonObject>* EntryObj = nullptr;
+					if (!V.IsValid() || !V->TryGetObject(EntryObj) || !EntryObj || !EntryObj->IsValid()) continue;
+					FString EntryPin;
+					if (!(*EntryObj)->TryGetStringField(TEXT("pin"), EntryPin)) continue;
+					if (const int32* Found = ArrayIndexByPin.Find(EntryPin))
+					{
+						(*EntryObj)->SetNumberField(TEXT("array_index"), *Found);
+					}
+				}
+			}
+		}
+
 		// --- T3-1: ALSO emit WIRE-LINKED input pins (graph-edge bindings). ---
 		// The reader above surfaces only PROPERTY/FUNCTION bindings (the node's
 		// PropertyBindings map). A pin can instead be driven by a graph wire from an
@@ -11945,6 +12110,20 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetAnimNodePinBinding(con
 	}
 	const bool bClearing = (Path.Num() == 0);
 
+	// array_index: optional element index for array-element pins (BlendWeights_N etc.).
+	// -1 forces a whole-property binding. Omitted -> preserved from the existing entry,
+	// else derived from the pin name's numeric suffix.
+	int32 ExplicitArrayIndex = INDEX_NONE;
+	double ArrayIndexNumber = 0.0;
+	const bool bHasExplicitArrayIndex = Params->TryGetNumberField(TEXT("array_index"), ArrayIndexNumber);
+	if (bHasExplicitArrayIndex)
+	{
+		ExplicitArrayIndex = FMath::FloorToInt32(ArrayIndexNumber);
+	}
+	int32 ResolvedArrayIndex = INDEX_NONE;
+	FString ArrayIndexSource = TEXT("none");
+	TArray<TSharedPtr<FJsonValue>> RemovedConflictingKeys;
+
 	if (Pin.IsEmpty()) return FMonolithActionResult::Error(TEXT("pin (PropertyName) is required"));
 
 	UAnimBlueprint* ABP = FMonolithAssetUtils::LoadAssetByPath<UAnimBlueprint>(AssetPath);
@@ -12060,11 +12239,91 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetAnimNodePinBinding(con
 		NewBinding.Type = EAnimGraphNodePropertyBindingType::Property;
 		NewBinding.bIsBound = true;
 
+		// --- ArrayIndex resolution (array-element pins such as BlendWeights_0) ---
+		// The engine splits an FNode array property into one pin per element; each pin's
+		// FName carries the element in its number suffix ("BlendWeights_0" == FName
+		// "BlendWeights" number 1). Its own binding write (AnimGraphNodeBinding_Base.cpp,
+		// OnAddBinding) keys the map by that pin name and sets
+		// ArrayIndex = PinName.GetNumber() - 1 when the pin property is an array that
+		// lives on the FNode. With ArrayIndex left at INDEX_NONE the compiler copies the
+		// source into the WHOLE array ("Cannot copy property (float -> TArray)") and the
+		// element is never driven. Precedence: explicit array_index param > the existing
+		// entry's non-INDEX_NONE value (rebind preserves it) > derived from the pin name.
+		FProperty* PinProperty = AnimNode->GetPinProperty(PinName);
+		const bool bPinIsArray = PinProperty && PinProperty->IsA<FArrayProperty>();
+		bool bPropertyIsOnFNode = false;
+		if (PinProperty)
+		{
+			const FStructProperty* FNodeProp = AnimNode->GetFNodeProperty();
+			const UScriptStruct* OwnerStruct = PinProperty->GetOwner<UScriptStruct>();
+			bPropertyIsOnFNode = FNodeProp && FNodeProp->Struct && OwnerStruct && FNodeProp->Struct->IsChildOf(OwnerStruct);
+		}
+		const bool bIsArrayElementPin = bPinIsArray && bPropertyIsOnFNode && PinName.GetNumber() > 0;
+		const bool bIsWholeArrayPin = bPinIsArray && bPropertyIsOnFNode && PinName.GetNumber() == 0;
+
+		FScriptMapHelper Helper(MapProp, MapPtr);
+
+		int32 ExistingArrayIndex = INDEX_NONE;
+		if (const uint8* ExistingValue = Helper.FindValueFromHash(&PinName))
+		{
+			ExistingArrayIndex = reinterpret_cast<const FAnimGraphNodePropertyBinding*>(ExistingValue)->ArrayIndex;
+		}
+
+		if (bHasExplicitArrayIndex)
+		{
+			if (ExplicitArrayIndex < INDEX_NONE)
+			{
+				return FMonolithActionResult::Error(TEXT("array_index must be >= 0, or -1 for a whole-property binding"));
+			}
+			if (ExplicitArrayIndex >= 0 && !bPinIsArray)
+			{
+				return FMonolithActionResult::Error(FString::Printf(
+					TEXT("array_index %d given but pin '%s' does not resolve to an array property on this node"),
+					ExplicitArrayIndex, *Pin));
+			}
+			NewBinding.ArrayIndex = ExplicitArrayIndex;
+			ArrayIndexSource = TEXT("param");
+		}
+		else if (ExistingArrayIndex != INDEX_NONE)
+		{
+			NewBinding.ArrayIndex = ExistingArrayIndex;
+			ArrayIndexSource = TEXT("preserved");
+		}
+		else if (bIsArrayElementPin)
+		{
+			NewBinding.ArrayIndex = PinName.GetNumber() - 1;
+			ArrayIndexSource = TEXT("pin_name");
+		}
+		ResolvedArrayIndex = NewBinding.ArrayIndex;
+
 		if (BindingObj) BindingObj->Modify();
+
+		// Mirror the engine's whole-array / element exclusivity (OnAddBinding): binding the
+		// whole array drops every element binding of that property; binding an element
+		// drops a whole-array binding of the same property.
+		if (bIsWholeArrayPin || bIsArrayElementPin)
+		{
+			const FName BaseName(PinName, 0);
+			TArray<FName> KeysToRemove;
+			for (FScriptMapHelper::FIterator It(Helper); It; ++It)
+			{
+				const FName Key = *reinterpret_cast<const FName*>(Helper.GetKeyPtr(It.GetInternalIndex()));
+				if (Key == PinName) continue; // overwritten by AddPair below
+				const bool bSameProperty = (FName(Key, 0) == BaseName);
+				if (bIsWholeArrayPin ? bSameProperty : (Key == BaseName))
+				{
+					KeysToRemove.Add(Key);
+				}
+			}
+			for (const FName& Key : KeysToRemove)
+			{
+				Helper.RemovePair(&Key);
+				RemovedConflictingKeys.Add(MakeShared<FJsonValueString>(Key.ToString()));
+			}
+		}
 
 		// AddPair overwrites an existing entry for the same key (engine PropertyBindings.Add
 		// semantics) and rehashes internally — no manual pre-remove / Rehash needed.
-		FScriptMapHelper Helper(MapProp, MapPtr);
 		Helper.AddPair(&PinName, &NewBinding);
 	}
 
@@ -12099,6 +12358,12 @@ FMonolithActionResult FMonolithAnimationActions::HandleSetAnimNodePinBinding(con
 		TArray<TSharedPtr<FJsonValue>> PathOut;
 		for (const FString& Seg : Path) PathOut.Add(MakeShared<FJsonValueString>(Seg));
 		Root->SetArrayField(TEXT("path"), PathOut);
+		Root->SetNumberField(TEXT("array_index"), ResolvedArrayIndex);
+		Root->SetStringField(TEXT("array_index_source"), ArrayIndexSource);
+		if (RemovedConflictingKeys.Num() > 0)
+		{
+			Root->SetArrayField(TEXT("removed_conflicting_bindings"), RemovedConflictingKeys);
+		}
 	}
 	Root->SetBoolField(TEXT("recompiled"), bCompiled);
 	return FMonolithActionResult::Success(Root);

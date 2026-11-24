@@ -79,6 +79,8 @@ struct FMonolithDeprecationRow
 	FString Version;
 	FString Message;
 	FString Kind;
+	/** qualified_name of the linked symbols row (empty when symbol_id is NULL). Filled by GetDeprecationRows only. */
+	FString LinkedQualifiedName;
 };
 
 /**
@@ -194,15 +196,24 @@ public:
 	FString GetMeta(const FString& Key);
 
 	// --- Deprecation queries (item 3) ---
-	// symbol_id is NULLABLE: pass 0 to store NULL (class-body methods have no
-	// symbols row — Step-0 finding). file_id identifies the owning source file
-	// so project replacement can remove unresolved rows without touching Engine.
+	// symbol_id is NULLABLE: pass 0 to store NULL when a declaration has no
+	// matching symbol row. file_id identifies the owning source file so project
+	// replacement can remove unresolved rows without touching Engine.
 	void InsertDeprecation(int64 SymbolId, const FString& SymbolName, const FString& Version, const FString& Message, const FString& Kind);
 	void InsertDeprecation(int64 SymbolId, int64 FileId, const FString& SymbolName, const FString& Version, const FString& Message, const FString& Kind);
 	/** Returns the deprecation row for the first matching symbol, or unset when not deprecated. */
 	TOptional<FMonolithDeprecationRow> GetDeprecation(const FString& SymbolName);
-	/** Batch lookup: maps each input symbol name that IS deprecated to its row. Absent keys = not deprecated. */
+	/**
+	 * Batch lookup: maps each input symbol name that has a deprecation row to that row.
+	 * Keys are exact bare names (symbol_name never holds `Class::`). An absent key means
+	 * "no deprecation row for that exact string" — NOT proof the symbol exists and is
+	 * current; use HasSymbolNamed to tell an unindexed name from a non-deprecated one.
+	 */
 	TMap<FString, FMonolithDeprecationRow> GetDeprecationsBatch(const TArray<FString>& SymbolNames);
+	/** Every deprecation row for an exact bare name, with the linked symbol's qualified_name (LEFT JOIN symbols). */
+	TArray<FMonolithDeprecationRow> GetDeprecationRows(const FString& SymbolName);
+	/** True when any symbols row has exactly this bare name. */
+	bool HasSymbolNamed(const FString& Name);
 	/** Total rows in symbol_deprecations (used to detect the "index empty" state — Decision 3). */
 	int32 GetDeprecationCount();
 
@@ -220,8 +231,20 @@ public:
 	int32 LoadExistingSymbols(TMap<FString, int64>& OutSymbolNameToId, TMap<FString, int64>& OutClassNameToId,
 		TMap<FString, TPair<int32,int32>>& OutSymbolSpans, TMap<FString, TPair<int32,int32>>& OutClassSpans);
 
-	/** True when the database was created by an incompatible older indexer. */
+	/** True when the schema or parser generation requires an explicit full source rebuild. */
 	bool RequiresFullReindex() const;
+	/**
+	 * Delete every indexed file whose path lies under one of RootDirs, together with
+	 * all rows derived from those files: symbols (symbols_fts follows via the
+	 * symbols_ad trigger), references, inheritance, includes, source_fts chunks and
+	 * symbol_deprecations. Surviving symbols whose parent_symbol_id pointed into the
+	 * purged set are re-parented to NULL, and modules under the roots that are left
+	 * with no files are removed. Participates in an existing transaction, if any.
+	 *
+	 * Paths are compared with backslashes folded to '/' and ASCII case-insensitively.
+	 * Returns the number of files purged, or -1 on failure (transaction rolled back).
+	 */
+	int32 PurgeFilesUnderPaths(const TArray<FString>& RootDirs);
 
 private:
 	FMonolithSourceSymbol ReadSymbolFromStatement(FSQLitePreparedStatement& Stmt);

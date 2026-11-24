@@ -1,4 +1,5 @@
 #include "MonolithMaterialActions.h"
+#include "MonolithMaterialSamplerCompat.h"
 #include "MonolithToolRegistry.h"
 #include "MonolithParamSchema.h"
 #include "MonolithPackagePathValidator.h"
@@ -96,6 +97,138 @@ static FString NormalizeInputPinName(const FString& PinName)
 		}
 	}
 	return Result;
+}
+
+// ============================================================================
+// Material property wiring + shading-model helpers
+// ============================================================================
+
+namespace MonolithMaterialPropertyWiring
+{
+	// A material output that was never wired in the editor keeps UseConstant=1 on its
+	// FMaterialInput, and the compiler (CompileWithDefault) then emits the constant even
+	// though an expression is connected. The material editor clears the flag in
+	// UMaterialGraphNode_Root::UpdateInputUseConstant when it links a root pin; scripted
+	// connects (UMaterialEditingLibrary::ConnectMaterialProperty) do not. This mirrors the
+	// editor's per-property switch for the "connected" case.
+	static void ClearUseConstant(UMaterial* Mat, EMaterialProperty Property)
+	{
+		UMaterialEditorOnlyData* EditorOnly = Mat ? Mat->GetEditorOnlyData() : nullptr;
+		if (!EditorOnly)
+		{
+			return;
+		}
+		switch (Property)
+		{
+		case MP_EmissiveColor:       EditorOnly->EmissiveColor.UseConstant = 0; break;
+		case MP_Opacity:             EditorOnly->Opacity.UseConstant = 0; break;
+		case MP_OpacityMask:         EditorOnly->OpacityMask.UseConstant = 0; break;
+		case MP_BaseColor:           EditorOnly->BaseColor.UseConstant = 0; break;
+		case MP_Metallic:            EditorOnly->Metallic.UseConstant = 0; break;
+		case MP_Specular:            EditorOnly->Specular.UseConstant = 0; break;
+		case MP_Roughness:           EditorOnly->Roughness.UseConstant = 0; break;
+		case MP_Anisotropy:          EditorOnly->Anisotropy.UseConstant = 0; break;
+		case MP_Normal:              EditorOnly->Normal.UseConstant = 0; break;
+		case MP_Tangent:             EditorOnly->Tangent.UseConstant = 0; break;
+		case MP_WorldPositionOffset: EditorOnly->WorldPositionOffset.UseConstant = 0; break;
+		case MP_Displacement:        EditorOnly->Displacement.UseConstant = 0; break;
+		case MP_SubsurfaceColor:     EditorOnly->SubsurfaceColor.UseConstant = 0; break;
+		case MP_CustomData0:         EditorOnly->ClearCoat.UseConstant = 0; break;
+		case MP_CustomData1:         EditorOnly->ClearCoatRoughness.UseConstant = 0; break;
+		case MP_AmbientOcclusion:    EditorOnly->AmbientOcclusion.UseConstant = 0; break;
+		case MP_Refraction:          EditorOnly->Refraction.UseConstant = 0; break;
+		case MP_PixelDepthOffset:    EditorOnly->PixelDepthOffset.UseConstant = 0; break;
+		case MP_SurfaceThickness:    EditorOnly->SurfaceThickness.UseConstant = 0; break;
+		default:
+			if (Property >= MP_CustomizedUVs0 && Property <= MP_CustomizedUVs7)
+			{
+				EditorOnly->CustomizedUVs[Property - MP_CustomizedUVs0].UseConstant = 0;
+			}
+			// MP_ShadingModel / MP_FrontMaterial / MP_MaterialAttributes carry no constant.
+			break;
+		}
+	}
+
+	// UMaterialEditingLibrary::ConnectMaterialProperty + clear the input's UseConstant so
+	// the wired expression is what actually compiles.
+	static bool ConnectMaterialProperty(UMaterialExpression* FromExpression, const FString& FromOutputName, EMaterialProperty Property)
+	{
+		const bool bConnected = UMaterialEditingLibrary::ConnectMaterialProperty(FromExpression, FromOutputName, Property);
+		if (bConnected)
+		{
+			ClearUseConstant(Cast<UMaterial>(FromExpression->GetOuter()), Property);
+		}
+		return bConnected;
+	}
+}
+
+namespace MonolithMaterialShadingModel
+{
+	// Snapshot of the RAW authored UMaterial::ShadingModel. GetShadingModels() is not a
+	// substitute: for MSM_FromMaterialExpression it returns the field gathered from the
+	// graph's ShadingModel expressions (so GetFirstShadingModel() yields e.g. DefaultLit),
+	// and for decal / post-process / UI domains it returns a domain override.
+	// UMaterial::ShadingModel is a private UPROPERTY, so it is read/written reflectively.
+	static FByteProperty* FindRawShadingModelProperty()
+	{
+		return FindFProperty<FByteProperty>(UMaterial::StaticClass(), TEXT("ShadingModel"));
+	}
+
+	static EMaterialShadingModel GetRaw(const UMaterial* Mat)
+	{
+		if (Mat)
+		{
+			if (Mat->IsShadingModelFromMaterialExpression())
+			{
+				return MSM_FromMaterialExpression;
+			}
+			if (const FByteProperty* Prop = FindRawShadingModelProperty())
+			{
+				return static_cast<EMaterialShadingModel>(Prop->GetPropertyValue_InContainer(Mat));
+			}
+			return Mat->GetShadingModels().GetFirstShadingModel();
+		}
+		return MSM_DefaultLit;
+	}
+
+	// Set the authored shading model without tripping engine asserts.
+	// UMaterial::SetShadingModel builds FMaterialShadingModelField(NewModel), whose
+	// AddShadingModel does check(InShadingModel < MSM_NUM) -- MSM_FromMaterialExpression
+	// sits above MSM_NUM, so passing it there is a fatal assert. For that value the raw
+	// property is written directly and the field is rebuilt from the graph via
+	// UMaterial::RebuildShadingModelField (the same path a recompile takes).
+	// Returns false (and leaves the material untouched) for MSM_NUM / out-of-range values.
+	static bool Set(UMaterial* Mat, EMaterialShadingModel NewModel)
+	{
+		if (!Mat)
+		{
+			return false;
+		}
+		if (NewModel < MSM_NUM)
+		{
+			// SetShadingModel opens with ensure(ShadingModel < MSM_NUM) on the CURRENT value,
+			// which fires when switching away from MSM_FromMaterialExpression. Write the raw
+			// value first so that ensure sees a valid model.
+			if (FByteProperty* Prop = FindRawShadingModelProperty())
+			{
+				Prop->SetPropertyValue_InContainer(Mat, static_cast<uint8>(NewModel));
+			}
+			Mat->SetShadingModel(NewModel);
+			return true;
+		}
+		if (NewModel == MSM_FromMaterialExpression)
+		{
+			FByteProperty* Prop = FindRawShadingModelProperty();
+			if (!Prop)
+			{
+				return false;
+			}
+			Prop->SetPropertyValue_InContainer(Mat, static_cast<uint8>(MSM_FromMaterialExpression));
+			Mat->RebuildShadingModelField();
+			return true;
+		}
+		return false;
+	}
 }
 
 // ============================================================================
@@ -1403,7 +1536,7 @@ FMonolithActionResult FMonolithMaterialActions::BuildMaterialGraph(const TShared
 	// Bug fix: save material-level properties before clear — DeleteAllMaterialExpressions
 	// triggers PostEditChange which can reset BlendMode and other scalar properties
 	const EBlendMode SavedBlendMode = Mat->BlendMode;
-	const EMaterialShadingModel SavedShadingModel = Mat->GetShadingModels().GetFirstShadingModel();
+	const EMaterialShadingModel SavedShadingModel = MonolithMaterialShadingModel::GetRaw(Mat);
 	const bool bSavedTwoSided = Mat->TwoSided;
 	const float SavedOpacityMaskClipValue = Mat->OpacityMaskClipValue;
 
@@ -1428,7 +1561,7 @@ FMonolithActionResult FMonolithMaterialActions::BuildMaterialGraph(const TShared
 
 	// Restore material-level properties that may have been reset by PostEditChange
 	Mat->BlendMode = SavedBlendMode;
-	Mat->SetShadingModel(SavedShadingModel);
+	MonolithMaterialShadingModel::Set(Mat, SavedShadingModel);
 	Mat->TwoSided = bSavedTwoSided;
 	Mat->OpacityMaskClipValue = SavedOpacityMaskClipValue;
 
@@ -1519,7 +1652,7 @@ FMonolithActionResult FMonolithMaterialActions::BuildMaterialGraph(const TShared
 				}
 			}
 
-			bool bConnected = UMaterialEditingLibrary::ConnectMaterialProperty(*FromPtr, FromPin, MatProp);
+			bool bConnected = MonolithMaterialPropertyWiring::ConnectMaterialProperty(*FromPtr, FromPin, MatProp);
 			if (bConnected)
 			{
 				ConnectionsMade++;
@@ -2112,9 +2245,11 @@ FMonolithActionResult FMonolithMaterialActions::ValidateMaterial(const TSharedPt
 		}
 
 		// Subsurface outputs on non-subsurface shading model
-		EMaterialShadingModel SM = Mat->GetShadingModels().GetFirstShadingModel();
-		if (bHasSubsurface && SM != MSM_Subsurface && SM != MSM_SubsurfaceProfile
-			&& SM != MSM_PreintegratedSkin && SM != MSM_TwoSidedFoliage)
+		// Check the whole resolved field, not its first entry: a FromMaterialExpression
+		// material can resolve to several models, and the first one is not representative.
+		const FMaterialShadingModelField SMField = Mat->GetShadingModels();
+		if (bHasSubsurface && !SMField.HasShadingModel(MSM_Subsurface) && !SMField.HasShadingModel(MSM_SubsurfaceProfile)
+			&& !SMField.HasShadingModel(MSM_PreintegratedSkin) && !SMField.HasShadingModel(MSM_TwoSidedFoliage))
 		{
 			AddBlendWarning(TEXT("subsurface_wrong_model"),
 				TEXT("SubsurfaceColor connected but shading model is not Subsurface/SubsurfaceProfile/PreintegratedSkin/TwoSidedFoliage — SubsurfaceColor will be ignored"));
@@ -2649,9 +2784,13 @@ FMonolithActionResult FMonolithMaterialActions::CreateMaterial(const TSharedPtr<
 	{
 		return FMonolithActionResult::Error(FString::Printf(TEXT("shading_model: %s"), *EnumError));
 	}
+	if (ShadingModel >= MSM_NUM && ShadingModel != MSM_FromMaterialExpression)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("shading_model: '%s' is not an assignable shading model"), *ShadingModelStr));
+	}
 	NewMat->MaterialDomain = Domain;
 	NewMat->BlendMode = BlendMode;
-	NewMat->SetShadingModel(ShadingModel);
+	MonolithMaterialShadingModel::Set(NewMat, ShadingModel);
 	NewMat->TwoSided = bTwoSided;
 
 	// Register with asset registry and mark dirty
@@ -2665,6 +2804,7 @@ FMonolithActionResult FMonolithMaterialActions::CreateMaterial(const TSharedPtr<
 	// Save to disk so LoadAsset can find it later
 	FString PackageFilename = FPackageName::LongPackageNameToFilename(AssetPath, FPackageName::GetAssetPackageExtension());
 	FSavePackageArgs SaveArgs;
+	SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 	UPackage::SavePackage(Pkg, NewMat, *PackageFilename, SaveArgs);
 
@@ -2873,7 +3013,11 @@ FMonolithActionResult FMonolithMaterialActions::SetMaterialProperty(const TShare
 			GEditor->EndTransaction();
 			return FMonolithActionResult::Error(FString::Printf(TEXT("shading_model: %s"), *EnumError));
 		}
-		Mat->SetShadingModel(ParsedModel);
+		if (!MonolithMaterialShadingModel::Set(Mat, ParsedModel))
+		{
+			GEditor->EndTransaction();
+			return FMonolithActionResult::Error(FString::Printf(TEXT("shading_model: '%s' is not an assignable shading model"), *Val));
+		}
 		RecordChange(TEXT("shading_model"), Val);
 	}
 	if (Params->HasField(TEXT("material_domain")))
@@ -3767,7 +3911,7 @@ FMonolithActionResult FMonolithMaterialActions::ConnectExpressions(const TShared
 		}
 
 		// Connect to material output property
-		bConnected = UMaterialEditingLibrary::ConnectMaterialProperty(FromExpr, FromOutput, MatProp);
+		bConnected = MonolithMaterialPropertyWiring::ConnectMaterialProperty(FromExpr, FromOutput, MatProp);
 		ConnectionDesc = FString::Printf(TEXT("%s -> %s"), *FromExprName, *ToProperty);
 	}
 	else if (ToExpr)
@@ -4434,23 +4578,40 @@ FMonolithActionResult FMonolithMaterialActions::GetMaterialProperties(const TSha
 	const UEnum* BlendEnum = StaticEnum<EBlendMode>();
 	ResultJson->SetStringField(TEXT("blend_mode"), BlendEnum->GetNameStringByIndex(static_cast<int32>(BlendMode)));
 
-	// Get shading model(s)
+	// Shading model: report the AUTHORED value. GetShadingModels() is the resolved field
+	// (graph-gathered for MSM_FromMaterialExpression, domain-overridden for decal / UI /
+	// post-process), so its first entry misreports FromMaterialExpression as DefaultLit.
 	FMaterialShadingModelField ShadingModels = MatInterface->GetShadingModels();
-	EMaterialShadingModel FirstModel = ShadingModels.GetFirstShadingModel();
 	const UEnum* ShadingEnum = StaticEnum<EMaterialShadingModel>();
-	ResultJson->SetStringField(TEXT("shading_model"), ShadingEnum->GetNameStringByIndex(static_cast<int32>(FirstModel)));
+	EMaterialShadingModel AuthoredModel;
+	if (MatInterface->IsShadingModelFromMaterialExpression())
+	{
+		AuthoredModel = MSM_FromMaterialExpression;
+	}
+	else if (const UMaterial* AsMaterial = Cast<UMaterial>(MatInterface))
+	{
+		AuthoredModel = MonolithMaterialShadingModel::GetRaw(AsMaterial);
+	}
+	else
+	{
+		// Material instance with a single (parent or overridden) model.
+		AuthoredModel = ShadingModels.GetFirstShadingModel();
+	}
+	ResultJson->SetStringField(TEXT("shading_model"), ShadingEnum->GetNameStringByValue(static_cast<int64>(AuthoredModel)));
 
-	// If multiple shading models, list them all
+	// Resolved set the renderer actually compiles against.
+	TArray<TSharedPtr<FJsonValue>> ModelsArr;
+	for (int32 i = 0; i < static_cast<int32>(MSM_NUM); ++i)
+	{
+		if (ShadingModels.HasShadingModel(static_cast<EMaterialShadingModel>(i)))
+		{
+			ModelsArr.Add(MakeShared<FJsonValueString>(ShadingEnum->GetNameStringByIndex(i)));
+		}
+	}
+	ResultJson->SetArrayField(TEXT("resolved_shading_models"), ModelsArr);
+	// Kept for compatibility: previously emitted only when more than one model resolved.
 	if (ShadingModels.CountShadingModels() > 1)
 	{
-		TArray<TSharedPtr<FJsonValue>> ModelsArr;
-		for (int32 i = 0; i < static_cast<int32>(MSM_NUM); ++i)
-		{
-			if (ShadingModels.HasShadingModel(static_cast<EMaterialShadingModel>(i)))
-			{
-				ModelsArr.Add(MakeShared<FJsonValueString>(ShadingEnum->GetNameStringByIndex(i)));
-			}
-		}
 		ResultJson->SetArrayField(TEXT("shading_models"), ModelsArr);
 	}
 
@@ -5563,7 +5724,7 @@ FMonolithActionResult FMonolithMaterialActions::ReplaceExpression(const TSharedP
 			else
 			{
 				// Material output connection
-				bReconnected = UMaterialEditingLibrary::ConnectMaterialProperty(
+				bReconnected = MonolithMaterialPropertyWiring::ConnectMaterialProperty(
 					NewExpr, NewOutputName, Rec.MatProperty);
 			}
 
@@ -6256,7 +6417,7 @@ void FMonolithMaterialActions::BuildGraphFromSpec(
 					OutErrors.Add(MakeShared<FJsonValueObject>(ErrJson));
 					continue;
 				}
-				bool bConnected = UMaterialEditingLibrary::ConnectMaterialProperty(*FromPtr, FromPin, MatProp);
+				bool bConnected = MonolithMaterialPropertyWiring::ConnectMaterialProperty(*FromPtr, FromPin, MatProp);
 				if (bConnected)
 				{
 					OutConnectionsMade++;
@@ -6414,6 +6575,7 @@ FMonolithActionResult FMonolithMaterialActions::CreateMaterialFunction(const TSh
 	// Save to disk
 	FString PackageFilename = FPackageName::LongPackageNameToFilename(AssetPath, FPackageName::GetAssetPackageExtension());
 	FSavePackageArgs SaveArgs;
+	SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 	UPackage::SavePackage(Pkg, NewFunc, *PackageFilename, SaveArgs);
 
@@ -7490,8 +7652,14 @@ FMonolithActionResult FMonolithMaterialActions::BatchSetMaterialProperty(const T
 			EMaterialShadingModel ParsedModel;
 			if (ParseEnum<EMaterialShadingModel>(Val, ParsedModel, EnumError))
 			{
-				Mat->SetShadingModel(ParsedModel);
-				RecordChange(TEXT("shading_model"), Val);
+				if (MonolithMaterialShadingModel::Set(Mat, ParsedModel))
+				{
+					RecordChange(TEXT("shading_model"), Val);
+				}
+				else
+				{
+					Errors.Add(FString::Printf(TEXT("shading_model: '%s' is not an assignable shading model"), *Val));
+				}
 			}
 			else
 			{
@@ -8114,6 +8282,10 @@ FMonolithActionResult FMonolithMaterialActions::CreatePbrMaterialFromDisk(const 
 	{
 		return FMonolithActionResult::Error(FString::Printf(TEXT("shading_model: %s"), *EnumError));
 	}
+	if (ShadingModel >= MSM_NUM && ShadingModel != MSM_FromMaterialExpression)
+	{
+		return FMonolithActionResult::Error(FString::Printf(TEXT("shading_model: '%s' is not an assignable shading model"), *ShadingModelStr));
+	}
 
 	const TMap<FString, FPBRMapSettings>& SettingsTable = GetPBRMapSettingsTable();
 
@@ -8225,7 +8397,7 @@ FMonolithActionResult FMonolithMaterialActions::CreatePbrMaterialFromDisk(const 
 	// Set material properties BEFORE creating expressions
 	NewMat->MaterialDomain = Domain;
 	NewMat->BlendMode = BlendMode;
-	NewMat->SetShadingModel(ShadingModel);
+	MonolithMaterialShadingModel::Set(NewMat, ShadingModel);
 	NewMat->TwoSided = bTwoSided;
 
 	FAssetRegistryModule::AssetCreated(NewMat);
@@ -8275,7 +8447,7 @@ FMonolithActionResult FMonolithMaterialActions::CreatePbrMaterialFromDisk(const 
 		}
 
 		// Connect to the appropriate material property pin
-		bool bConnected = UMaterialEditingLibrary::ConnectMaterialProperty(
+		bool bConnected = MonolithMaterialPropertyWiring::ConnectMaterialProperty(
 			TexSample, Imported.Settings.OutputPin, Imported.Settings.MaterialProperty);
 
 		if (bConnected)
@@ -8297,7 +8469,7 @@ FMonolithActionResult FMonolithMaterialActions::CreatePbrMaterialFromDisk(const 
 	// Wire basecolor alpha to Opacity if requested (useful for decals)
 	if (bOpacityFromAlpha && BaseColorNode)
 	{
-		bool bAlphaConnected = UMaterialEditingLibrary::ConnectMaterialProperty(
+		bool bAlphaConnected = MonolithMaterialPropertyWiring::ConnectMaterialProperty(
 			BaseColorNode, TEXT("A"), MP_Opacity);
 		if (bAlphaConnected)
 		{
@@ -8318,6 +8490,7 @@ FMonolithActionResult FMonolithMaterialActions::CreatePbrMaterialFromDisk(const 
 	// Save to disk
 	FString PackageFilename = FPackageName::LongPackageNameToFilename(MaterialPath, FPackageName::GetAssetPackageExtension());
 	FSavePackageArgs SaveArgs;
+	SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
 	SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
 	UPackage::SavePackage(Pkg, NewMat, *PackageFilename, SaveArgs);
 
@@ -9181,7 +9354,7 @@ FMonolithActionResult FMonolithMaterialActions::ClearGraph(const TSharedPtr<FJso
 
 	// Save material-level properties — PostEditChange can reset them
 	const EBlendMode SavedBlendMode = Mat->BlendMode;
-	const EMaterialShadingModel SavedShadingModel = Mat->GetShadingModels().GetFirstShadingModel();
+	const EMaterialShadingModel SavedShadingModel = MonolithMaterialShadingModel::GetRaw(Mat);
 	const bool bSavedTwoSided = Mat->TwoSided;
 	const float SavedOpacityMaskClipValue = Mat->OpacityMaskClipValue;
 
@@ -9215,7 +9388,7 @@ FMonolithActionResult FMonolithMaterialActions::ClearGraph(const TSharedPtr<FJso
 
 	// Restore material-level properties
 	Mat->BlendMode = SavedBlendMode;
-	Mat->SetShadingModel(SavedShadingModel);
+	MonolithMaterialShadingModel::Set(Mat, SavedShadingModel);
 	Mat->TwoSided = bSavedTwoSided;
 	Mat->OpacityMaskClipValue = SavedOpacityMaskClipValue;
 
@@ -9344,7 +9517,7 @@ static void PopulateTextureMetadata(UTexture* Tex, const TSharedPtr<FJsonObject>
 #endif
 
 	// Recommended sampler type for material usage
-	EMaterialSamplerType SamplerType = UMaterialExpressionTextureBase::GetSamplerTypeForTexture(Tex);
+	const EMaterialSamplerType SamplerType = MonolithMaterialSamplerCompat::GetSamplerTypeForTexture(Tex);
 	UEnum* SamplerEnum = StaticEnum<EMaterialSamplerType>();
 	if (SamplerEnum)
 	{

@@ -109,8 +109,9 @@ private:
 	TMap<FString, TPair<int32, int32>> SymbolSpans;
 	TMap<FString, int64> ClassNameToId;
 	TMap<FString, TPair<int32, int32>> ClassSpans;
-	TMap<FString, TArray<FString>> PendingBaseClasses; // className -> [baseClassName, ...]
+	TMap<int64, TArray<FString>> PendingBaseClasses; // exact child symbol id -> base class names
 	TSet<int64> NewFileIds;
+	TSet<FString> IndexedFilePaths; // paths parsed this run (dedupes overlapping module roots)
 
 	// Stats
 	mutable FCriticalSection DiagLock;

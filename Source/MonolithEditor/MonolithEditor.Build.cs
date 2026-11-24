@@ -57,7 +57,12 @@ public class MonolithEditor : ModuleRules
 			// MaterialEditor = UMaterialEditingLibrary (Phase 2 inspect_material_pbr — declared up front so the dep delta lands in one cohesive Build.cs edit).
 			"UMG",
 			"UMGEditor",
-			"MaterialEditor"
+			"MaterialEditor",
+			// save_packages: check out read-only (e.g. Perforce) targets before saving (issue #147).
+			"SourceControl",
+			// PIE pre-flight test (MonolithPiePreflightTests.cpp) builds a transient Blueprint
+			// graph from UK2Node_CustomEvent + UK2Node_CallFunction. Stock editor module.
+			"BlueprintGraph"
 		});
 
 		if (Target.Platform == UnrealTargetPlatform.Win64)

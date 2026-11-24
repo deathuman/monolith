@@ -265,6 +265,13 @@ namespace MonolithBlueprintInternal
 		return MonolithPinTypeGrammar::ContainerPrefix(PinType);
 	}
 
+	// Per-parameter by-reference / const flags, mirroring set_function_params' is_reference / is_const.
+	inline void SetParamRefConstFields(const TSharedPtr<FJsonObject>& Obj, const FEdGraphPinType& PinType)
+	{
+		Obj->SetBoolField(TEXT("is_reference"), PinType.bIsReference);
+		Obj->SetBoolField(TEXT("is_const"), PinType.bIsConst);
+	}
+
 	inline TSharedPtr<FJsonObject> SerializePin(const UEdGraphPin* Pin)
 	{
 		TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
@@ -274,10 +281,24 @@ namespace MonolithBlueprintInternal
 			Pin->Direction == EGPD_Input ? TEXT("input") : TEXT("output"));
 		PinObj->SetStringField(TEXT("type"),
 			ContainerPrefix(Pin->PinType) + PinTypeToString(Pin->PinType));
+		// Only emitted when set, to keep graph dumps compact.
+		if (Pin->PinType.bIsReference)
+		{
+			PinObj->SetBoolField(TEXT("is_reference"), true);
+		}
+		if (Pin->PinType.bIsConst)
+		{
+			PinObj->SetBoolField(TEXT("is_const"), true);
+		}
 
 		if (!Pin->DefaultValue.IsEmpty())
 		{
 			PinObj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
+		}
+		// Text pins keep their literal in DefaultTextValue, not DefaultValue
+		if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Text && !Pin->DefaultTextValue.IsEmpty())
+		{
+			PinObj->SetStringField(TEXT("default_text"), Pin->DefaultTextValue.ToString());
 		}
 		if (Pin->DefaultObject)
 		{

@@ -12,6 +12,73 @@
 #include "Editor.h"
 #include "Internationalization/Regex.h"
 
+namespace MonolithSourceQualifiedLookup
+{
+	/** "A::B::Method" -> Tail "Method". Returns false for an unqualified name. */
+	static bool SplitTail(const FString& Symbol, FString& OutTail)
+	{
+		const int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+		if (ScopeIdx == INDEX_NONE || ScopeIdx + 2 >= Symbol.Len())
+		{
+			return false;
+		}
+		OutTail = Symbol.Mid(ScopeIdx + 2);
+		return true;
+	}
+
+	/**
+	 * True when a stored qualified_name (`Parent::Name`, parent = innermost scope only)
+	 * is compatible with a user-supplied qualified name (which may carry extra outer
+	 * scopes, e.g. `UE::Foo::Bar::Method` vs stored `Bar::Method`).
+	 */
+	static bool QualifiedNameMatches(const FString& Requested, const FString& Stored)
+	{
+		return Requested == Stored || Requested.EndsWith(TEXT("::") + Stored, ESearchCase::CaseSensitive);
+	}
+
+	/**
+	 * Symbol rows for a possibly-qualified name. symbols.name only ever holds the bare
+	 * identifier, so a `Class::Method` request is retried with the tail and narrowed to
+	 * rows whose qualified_name matches the owner. If no row carries that owner, all
+	 * tail rows are returned and bOutOwnerUnmatched is set so callers can say so.
+	 */
+	static TArray<FMonolithSourceSymbol> ResolveRows(FMonolithSourceDatabase* DB, const FString& Symbol,
+		const FString& Kind, bool& bOutOwnerUnmatched)
+	{
+		bOutOwnerUnmatched = false;
+		TArray<FMonolithSourceSymbol> Rows = DB->GetSymbolsByName(Symbol, Kind);
+		FString Tail;
+		if (Rows.Num() > 0 || !SplitTail(Symbol, Tail))
+		{
+			return Rows;
+		}
+
+		TArray<FMonolithSourceSymbol> TailRows = DB->GetSymbolsByName(Tail, Kind);
+		TArray<FMonolithSourceSymbol> OwnerRows;
+		for (const FMonolithSourceSymbol& Row : TailRows)
+		{
+			if (QualifiedNameMatches(Symbol, Row.QualifiedName))
+			{
+				OwnerRows.Add(Row);
+			}
+		}
+		if (OwnerRows.Num() > 0)
+		{
+			return OwnerRows;
+		}
+		bOutOwnerUnmatched = TailRows.Num() > 0;
+		return TailRows;
+	}
+
+	/** Note prepended to text output when a qualified request fell back to the bare name. */
+	static FString OwnerFallbackNote(const FString& Symbol)
+	{
+		FString Tail;
+		SplitTail(Symbol, Tail);
+		return FString::Printf(TEXT("Note: no indexed '%s' with that owner; showing every '%s' match.\n"), *Symbol, *Tail);
+	}
+}
+
 // ============================================================================
 // Registration
 // ============================================================================
@@ -34,7 +101,7 @@ void FMonolithSourceActions::RegisterAll()
 		TEXT("Find all usage sites of a symbol (calls, includes, type references)"),
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleFindReferences),
 		FParamSchemaBuilder()
-			.Required(TEXT("symbol"), TEXT("string"), TEXT("Symbol name to find references for"))
+			.Required(TEXT("symbol"), TEXT("string"), TEXT("Symbol name to find references for (bare or Class::Method)"))
 			.Optional(TEXT("ref_kind"), TEXT("string"), TEXT("Filter by reference kind"))
 			.Optional(TEXT("limit"), TEXT("integer"), TEXT("Max results"), TEXT("50"))
 			.Build());
@@ -43,7 +110,7 @@ void FMonolithSourceActions::RegisterAll()
 		TEXT("Find all functions that call the given function"),
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleFindCallers),
 		FParamSchemaBuilder()
-			.Required(TEXT("symbol"), TEXT("string"), TEXT("Function name"))
+			.Required(TEXT("symbol"), TEXT("string"), TEXT("Function name (bare or Class::Method)"))
 			.Optional(TEXT("limit"), TEXT("integer"), TEXT("Max results"), TEXT("50"))
 			.Build());
 
@@ -51,7 +118,7 @@ void FMonolithSourceActions::RegisterAll()
 		TEXT("Find all functions called by the given function"),
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleFindCallees),
 		FParamSchemaBuilder()
-			.Required(TEXT("symbol"), TEXT("string"), TEXT("Function name"))
+			.Required(TEXT("symbol"), TEXT("string"), TEXT("Function name (bare or Class::Method)"))
 			.Optional(TEXT("limit"), TEXT("integer"), TEXT("Max results"), TEXT("50"))
 			.Build());
 
@@ -130,7 +197,7 @@ void FMonolithSourceActions::RegisterAll()
 			.Build());
 
 	Registry.RegisterAction(TEXT("source"), TEXT("get_signature"),
-		TEXT("Get the declaration signature(s) for a symbol or Class::Method. Reads the declaration line(s) from source (engine class-body methods are not indexed as symbols); strips inline bodies and macro line-continuations. Overloads returned as separate entries."),
+		TEXT("Get declaration signatures for a symbol or Class::Method. Qualified names return only the requested owner methods. Uses indexed signatures when available; older indexes fall back to the owning class declaration or explicitly qualified definition. Overloads returned separately."),
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleGetSignature),
 		FParamSchemaBuilder()
 			.Required(TEXT("symbol"), TEXT("string"), TEXT("Symbol name or Class::Method"))
@@ -138,7 +205,7 @@ void FMonolithSourceActions::RegisterAll()
 			.Build());
 
 	Registry.RegisterAction(TEXT("source"), TEXT("check_deprecations"),
-		TEXT("Batch-check whether symbols are UE_DEPRECATED. Returns per-symbol {deprecated, version, message, kind}. If the deprecation index is empty (schema v2 landed but no reindex yet), returns index_state:\"empty\" with a hint to run source.trigger_reindex."),
+		TEXT("Batch-check whether symbols are UE_DEPRECATED. Accepts bare names or Class::Method (qualified names are matched on the trailing identifier; match:\"qualified\" when the owner is confirmed, \"name\" otherwise). Returns per-symbol {deprecated, found, match, version, message, kind}; match is present whenever found:true and omitted when found:false; version/message/kind only when deprecated:true; found:false means the name is not in the source index at all, so deprecated:false is not a verdict. If the deprecation index is empty (schema v2 landed but no reindex yet), returns index_state:\"empty\" with a hint to run source.trigger_reindex."),
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleCheckDeprecations),
 		FParamSchemaBuilder()
 			.Required(TEXT("symbols"), TEXT("array"), TEXT("Array of symbol names to check"))
@@ -165,7 +232,7 @@ void FMonolithSourceActions::RegisterAll()
 	// --- Phase 2: round-trip compression (items 4-5) ---
 
 	Registry.RegisterAction(TEXT("source"), TEXT("verify_symbols"),
-		TEXT("Batch pre-flight verdict for a list of symbols. Per symbol composes include path, declaration signature, deprecation status, and existence into one record. `exists` for a Class::Method is decided by the owning class row + a source-line declaration hit (engine class-body methods are not indexed as symbols), NOT by symbols-table presence; a missing symbol reports exists:false with no error."),
+		TEXT("Batch pre-flight verdict for a list of symbols. Per symbol composes include path, declaration signature, deprecation status, and existence into one record. `exists` for a Class::Method is decided by the owning class row + a source-line declaration hit (indexes built before parser v2 lack UCLASS/USTRUCT member rows), NOT by symbols-table presence; a missing symbol reports exists:false with no error."),
 		FMonolithActionHandler::CreateStatic(&FMonolithSourceActions::HandleVerifySymbols),
 		FParamSchemaBuilder()
 			.Required(TEXT("symbols"), TEXT("array"), TEXT("Array of symbol names or Class::Method strings to verify"))
@@ -381,56 +448,11 @@ bool FMonolithSourceActions::ResolveFirstSignature(FMonolithSourceDatabase* DB, 
 {
 	OutSignature.Empty();
 	OutSource.Empty();
-	if (!DB) return false;
-
-	// Method name = trailing identifier.
-	FString MethodName = Symbol;
-	const int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-	if (ScopeIdx != INDEX_NONE)
-	{
-		MethodName = Symbol.Mid(ScopeIdx + 2);
-	}
-
-	// Fast path: body-free signature column.
-	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(MethodName, TEXT("function"));
-	for (const FMonolithSourceSymbol& S : Symbols)
-	{
-		if (S.Signature.IsEmpty()) continue;
-		if (S.Signature.Contains(TEXT("{")) || S.Signature.Contains(TEXT("\\"))) continue;
-		OutSignature = S.Signature.TrimStartAndEnd();
-		OutSource = TEXT("column");
-		return true;
-	}
-
-	// Primary: declaration-read over source_fts.
-	const FString NeedlePattern = MethodName + TEXT("(");
-	TArray<FMonolithSourceChunk> Chunks = DB->SearchSourceFTS(Symbol, TEXT("all"), 50);
-	for (const FMonolithSourceChunk& Chunk : Chunks)
-	{
-		const FString FilePath = DB->GetFilePath(Chunk.FileId);
-		TArray<FString> FileLines;
-		if (!FFileHelper::LoadFileToStringArray(FileLines, *FilePath)) continue;
-
-		const int32 WinStart = FMath::Max(0, Chunk.LineNumber - 1);
-		const int32 WinEnd = FMath::Min(FileLines.Num(), WinStart + 10);
-		for (int32 i = WinStart; i < WinEnd; ++i)
-		{
-			const FString& L = FileLines[i];
-			const int32 DeclIdx = L.Find(NeedlePattern, ESearchCase::CaseSensitive);
-			if (DeclIdx == INDEX_NONE) continue;
-			if (DeclIdx > 0)
-			{
-				const TCHAR Prev = L[DeclIdx - 1];
-				if (FChar::IsAlnum(Prev) || Prev == TEXT('_')) continue;
-			}
-			const FString Sig = CompactDeclaration(FileLines, i);
-			if (Sig.IsEmpty() || !Sig.Contains(NeedlePattern)) continue;
-			OutSignature = Sig;
-			OutSource = TEXT("declaration_read");
-			return true;
-		}
-	}
-	return false;
+	const TArray<FResolvedSignature> Matches = ResolveSignatures(DB, Symbol, 1);
+	if (Matches.IsEmpty()) return false;
+	OutSignature = Matches[0].Signature;
+	OutSource = Matches[0].Source;
+	return true;
 }
 
 bool FMonolithSourceActions::SymbolExists(FMonolithSourceDatabase* DB, const FString& Symbol)
@@ -837,7 +859,8 @@ FMonolithActionResult FMonolithSourceActions::HandleFindReferences(const TShared
 	FString RefKind = Params->HasField(TEXT("ref_kind")) ? Params->GetStringField(TEXT("ref_kind")) : TEXT("");
 	int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 50;
 
-	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(Symbol);
+	bool bOwnerUnmatched = false;
+	TArray<FMonolithSourceSymbol> Symbols = MonolithSourceQualifiedLookup::ResolveRows(DB, Symbol, FString(), bOwnerUnmatched);
 	if (Symbols.Num() == 0) Symbols = DB->SearchSymbolsFTS(Symbol, 5);
 	if (Symbols.Num() == 0)
 	{
@@ -858,6 +881,10 @@ FMonolithActionResult FMonolithSourceActions::HandleFindReferences(const TShared
 	FString ResultText = Lines.Num() > 0
 		? FString::Join(Lines, TEXT("\n"))
 		: FString::Printf(TEXT("No references found for '%s'."), *Symbol);
+	if (bOwnerUnmatched)
+	{
+		ResultText = MonolithSourceQualifiedLookup::OwnerFallbackNote(Symbol) + ResultText;
+	}
 
 	auto ResultObj = MakeShared<FJsonObject>();
 	TArray<TSharedPtr<FJsonValue>> ContentArr;
@@ -884,7 +911,8 @@ FMonolithActionResult FMonolithSourceActions::HandleFindCallers(const TSharedPtr
 	FString Function = Params->GetStringField(TEXT("symbol"));
 	int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 50;
 
-	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(Function, TEXT("function"));
+	bool bOwnerUnmatched = false;
+	TArray<FMonolithSourceSymbol> Symbols = MonolithSourceQualifiedLookup::ResolveRows(DB, Function, TEXT("function"), bOwnerUnmatched);
 	if (Symbols.Num() == 0)
 	{
 		TArray<FMonolithSourceSymbol> AllSyms = DB->SearchSymbolsFTS(Function, 5);
@@ -919,6 +947,10 @@ FMonolithActionResult FMonolithSourceActions::HandleFindCallers(const TSharedPtr
 	{
 		ResultText = FString::Join(Lines, TEXT("\n"));
 	}
+	if (bOwnerUnmatched)
+	{
+		ResultText = MonolithSourceQualifiedLookup::OwnerFallbackNote(Function) + ResultText;
+	}
 
 	auto ResultObj = MakeShared<FJsonObject>();
 	TArray<TSharedPtr<FJsonValue>> ContentArr;
@@ -945,7 +977,8 @@ FMonolithActionResult FMonolithSourceActions::HandleFindCallees(const TSharedPtr
 	FString Function = Params->GetStringField(TEXT("symbol"));
 	int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 50;
 
-	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(Function, TEXT("function"));
+	bool bOwnerUnmatched = false;
+	TArray<FMonolithSourceSymbol> Symbols = MonolithSourceQualifiedLookup::ResolveRows(DB, Function, TEXT("function"), bOwnerUnmatched);
 	if (Symbols.Num() == 0)
 	{
 		TArray<FMonolithSourceSymbol> AllSyms = DB->SearchSymbolsFTS(Function, 5);
@@ -972,6 +1005,10 @@ FMonolithActionResult FMonolithSourceActions::HandleFindCallees(const TSharedPtr
 	FString ResultText = Lines.Num() > 0
 		? FString::Join(Lines, TEXT("\n"))
 		: FString::Printf(TEXT("No callees found for '%s'."), *Function);
+	if (bOwnerUnmatched)
+	{
+		ResultText = MonolithSourceQualifiedLookup::OwnerFallbackNote(Function) + ResultText;
+	}
 
 	auto ResultObj = MakeShared<FJsonObject>();
 	TArray<TSharedPtr<FJsonValue>> ContentArr;
@@ -1003,12 +1040,6 @@ FMonolithActionResult FMonolithSourceActions::HandleSearchSource(const TSharedPt
 	// chooses the simpler single-pair scheme for v1. The interleaved
 	// de-dup at the slice site continues to use the existing TSet<FString>
 	// keyed on (FileId, LineNumber).
-
-	FMonolithSourceDatabase* DB = GetDB();
-	if (!DB || !DB->IsOpen())
-	{
-		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
-	}
 
 	const FString Query = Params->GetStringField(TEXT("query"));
 	const FString Scope = Params->HasField(TEXT("scope")) ? Params->GetStringField(TEXT("scope")) : TEXT("all");
@@ -1064,6 +1095,14 @@ FMonolithActionResult FMonolithSourceActions::HandleSearchSource(const TSharedPt
 		SourcePage = State.SourcePage;
 		CachedTotalEstimate = State.CachedTotalEstimate;
 		bHasCursor = true;
+	}
+
+	// The params, cursor included, are validated before the environment: a bad cursor is the
+	// caller's error whether or not the source index has been built on this machine.
+	FMonolithSourceDatabase* DB = GetDB();
+	if (!DB || !DB->IsOpen())
+	{
+		return FMonolithActionResult::Error(TEXT("Engine source DB not available; run source.trigger_reindex and poll source.get_index_status."));
 	}
 
 	const bool bIsPageZero = !bHasCursor;
@@ -1498,23 +1537,45 @@ FMonolithActionResult FMonolithSourceActions::HandleReadFile(const TSharedPtr<FJ
 	}
 	else
 	{
-		// Normalize separators to backslashes to match DB-stored paths
-		FString NormalizedPath = Path;
-		NormalizedPath.ReplaceInline(TEXT("/"), TEXT("\\"));
+		// The index stores forward-slash absolute paths
+		// (C:/Program Files (x86)/UE_5.7/Engine/Source/...). Look up with forward
+		// slashes first (exact, then suffix anchored at a path separator, so an
+		// engine-relative "Engine/Source/..." or module-relative "Runtime/Engine/..."
+		// path resolves), then fall back to the legacy backslash form for older
+		// indexes. Same resolution order as the offline monolith_query read_file.
+		FString Fwd = Path;
+		Fwd.ReplaceInline(TEXT("\\"), TEXT("/"));
+		while (Fwd.RemoveFromStart(TEXT("./"))) {}
+		while (Fwd.RemoveFromStart(TEXT("/"))) {}
+		FString Back = Fwd;
+		Back.ReplaceInline(TEXT("/"), TEXT("\\"));
 
-		// Try DB lookup by exact path
-		TOptional<FMonolithSourceFile> F = DB->FindFileByPath(NormalizedPath);
+		TOptional<FMonolithSourceFile> F = DB->FindFileByPath(Fwd);
+		if (!F.IsSet()) F = DB->FindFileBySuffix(TEXT("/") + Fwd);
+		if (!F.IsSet()) F = DB->FindFileByPath(Back);
+		if (!F.IsSet()) F = DB->FindFileBySuffix(Back);
+
 		if (F.IsSet())
 		{
 			ResolvedPath = F->Path;
 		}
-		else
+		else if (Fwd.StartsWith(TEXT("Engine/")))
 		{
-			// Try suffix match (e.g. "Runtime\Engine\Classes\GameFramework\Actor.h")
-			F = DB->FindFileBySuffix(NormalizedPath);
-			if (F.IsSet())
+			// Not indexed: join an engine-relative path onto the engine root derived
+			// from any indexed engine file. FindFileBySuffix prepends '%', so this is
+			// LIKE '%/Engine/Source/%'.
+			TOptional<FMonolithSourceFile> EngineFile = DB->FindFileBySuffix(TEXT("/Engine/Source/%"));
+			if (EngineFile.IsSet())
 			{
-				ResolvedPath = F->Path;
+				const int32 Idx = EngineFile->Path.Find(TEXT("/Engine/Source/"), ESearchCase::CaseSensitive);
+				if (Idx != INDEX_NONE)
+				{
+					const FString Candidate = EngineFile->Path.Left(Idx + 1) + Fwd;
+					if (FPaths::FileExists(Candidate))
+					{
+						ResolvedPath = Candidate;
+					}
+				}
 			}
 		}
 	}
@@ -1731,12 +1792,10 @@ FMonolithActionResult FMonolithSourceActions::HandleGetIncludePath(const TShared
 // ============================================================================
 // Phase 1 — item 2: get_signature
 //
-// Declaration-read is the PRIMARY mechanism (Step-0 finding): class-body method
-// declarations are NOT indexed as `symbols`, so we resolve via the owning class
-// row + source-line FTS over source_fts, read the declaration line(s) from the
-// file (continuation lines forward to the closing paren), and strip the trailing
-// macro `\` + any inline body. The `signature` column is an opportunistic fast
-// path ONLY when present AND body-free. Reports source: "declaration_read"|"column".
+// Use body-free indexed signatures when available. The declaration-read fallback
+// supports older indexes without member rows by reading the owning class range
+// or an explicitly qualified out-of-line definition. Strip trailing macro
+// continuations and inline bodies. Reports source: "declaration_read"|"column".
 // ============================================================================
 
 FString FMonolithSourceActions::CompactDeclaration(const TArray<FString>& Lines, int32 StartIdx)
@@ -1798,6 +1857,200 @@ FString FMonolithSourceActions::CompactDeclaration(const TArray<FString>& Lines,
 	return Out.TrimStartAndEnd();
 }
 
+TArray<FMonolithSourceActions::FResolvedSignature> FMonolithSourceActions::ResolveSignatures(
+	FMonolithSourceDatabase* DB, const FString& Symbol, int32 Limit)
+{
+	TArray<FResolvedSignature> Overloads;
+	if (!DB || !DB->IsOpen() || Symbol.IsEmpty() || Limit <= 0) return Overloads;
+
+	// Indexed function rows retain their owner in qualified_name.
+	FString MethodName = Symbol;
+	const int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	const bool bQualified = ScopeIdx != INDEX_NONE;
+	if (bQualified) MethodName = Symbol.Mid(ScopeIdx + 2);
+
+	for (const FMonolithSourceSymbol& S : DB->GetSymbolsByName(MethodName, TEXT("function")))
+	{
+		if (Overloads.Num() >= Limit) break;
+		if (bQualified && (!S.QualifiedName.Contains(TEXT("::"))
+			|| !MonolithSourceQualifiedLookup::QualifiedNameMatches(Symbol, S.QualifiedName))) continue;
+		if (S.Signature.IsEmpty()) continue;
+		if (S.Signature.Contains(TEXT("{")) || S.Signature.Contains(TEXT("\\"))) continue;
+		FResolvedSignature O;
+		O.Signature = S.Signature.TrimStartAndEnd();
+		O.Source = TEXT("column");
+		O.File = ShortPath(DB->GetFilePath(S.FileId));
+		O.Line = S.LineStart;
+		Overloads.Add(MoveTemp(O));
+	}
+	if (Overloads.Num() > 0) return Overloads;
+
+	// Older indexes may lack member rows. A qualified fallback must belong to
+	// the owning class declaration or contain the explicit out-of-line owner.
+	const FString MethodNeedle = MethodName + TEXT("(");
+	const FString QualifiedNeedle = Symbol + TEXT("(");
+	const FString OwnerName = bQualified ? Symbol.Left(ScopeIdx) : FString();
+	FString OwnerTail = OwnerName;
+	const int32 OwnerScopeIdx = OwnerName.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+	if (OwnerScopeIdx != INDEX_NONE) OwnerTail = OwnerName.Mid(OwnerScopeIdx + 2);
+
+	TSet<FString> SeenSignatures;
+	auto HasDefinitionBody = [](const TArray<FString>& Lines, int32 LineIdx, int32 ParenIdx)
+	{
+		int32 ParenDepth = 0;
+		bool bSawParams = false;
+		bool bInBlockComment = false;
+		for (int32 i = LineIdx; i < Lines.Num() && i < LineIdx + 12; ++i)
+		{
+			const FString& Line = Lines[i];
+			for (int32 c = 0; c < Line.Len(); ++c)
+			{
+				const TCHAR Ch = Line[c];
+				const TCHAR Next = c + 1 < Line.Len() ? Line[c + 1] : 0;
+				if (bInBlockComment)
+				{
+					if (Ch == TEXT('*') && Next == TEXT('/')) { bInBlockComment = false; ++c; }
+					continue;
+				}
+				if (Ch == TEXT('/') && Next == TEXT('/')) break;
+				if (Ch == TEXT('/') && Next == TEXT('*')) { bInBlockComment = true; ++c; continue; }
+				if (Ch == TEXT('"') || Ch == TEXT('\''))
+				{
+					const TCHAR Quote = Ch;
+					while (++c < Line.Len())
+					{
+						if (Line[c] == TEXT('\\')) { ++c; }
+						else if (Line[c] == Quote) break;
+					}
+					continue;
+				}
+				if (i == LineIdx && c < ParenIdx) continue;
+				if (Ch == TEXT('(')) { ++ParenDepth; bSawParams = true; }
+				else if (Ch == TEXT(')')) { ParenDepth = FMath::Max(0, ParenDepth - 1); }
+				else if (bSawParams && ParenDepth == 0 && (Ch == TEXT('{') || Ch == TEXT(';')))
+				{
+					return Ch == TEXT('{');
+				}
+			}
+		}
+		return false;
+	};
+
+	auto AddDeclaration = [&](const TArray<FString>& FileLines, int32 LineIdx,
+		const FString& FilePath, const FString& Needle, bool bInsideOwner)
+	{
+		const FString& Line = FileLines[LineIdx];
+		const int32 DeclIdx = Line.Find(Needle, ESearchCase::CaseSensitive);
+		if (DeclIdx == INDEX_NONE) return;
+		if (DeclIdx > 0)
+		{
+			const TCHAR Prev = Line[DeclIdx - 1];
+			if (FChar::IsAlnum(Prev) || Prev == TEXT('_')) return;
+		}
+		if (bQualified)
+		{
+			const FString Prefix = Line.Left(DeclIdx).TrimStartAndEnd();
+			// A suffix of a longer qualified name belongs to a different owner.
+			if (!bInsideOwner && Prefix.EndsWith(TEXT("::"))) return;
+			// Reject obvious calls from inline bodies and unrelated functions.
+			if (Prefix.Contains(TEXT("(")) || Prefix.Contains(TEXT("="))
+				|| Prefix.Contains(TEXT("->")) || Prefix.Contains(TEXT("."))
+				|| Prefix.StartsWith(TEXT("//")) || Prefix.StartsWith(TEXT("*"))
+				|| (Prefix.IsEmpty() && (bInsideOwner || MethodName != OwnerTail))) return;
+			// An out-of-line method must have a body. A qualified call such as
+			// "return Owner::Method();" ends at ';' and is not a declaration.
+			if (!bInsideOwner && !HasDefinitionBody(FileLines, LineIdx, DeclIdx + Needle.Len() - 1)) return;
+		}
+		const FString Sig = CompactDeclaration(FileLines, LineIdx);
+		if (Sig.IsEmpty() || !Sig.Contains(Needle) || SeenSignatures.Contains(Sig)) return;
+		SeenSignatures.Add(Sig);
+		FResolvedSignature O;
+		O.Signature = Sig;
+		O.Source = TEXT("declaration_read");
+		O.File = ShortPath(FilePath);
+		O.Line = LineIdx + 1;
+		Overloads.Add(MoveTemp(O));
+	};
+
+	// Track lexical brace depth from the class opening. Only direct members at
+	// depth 1 belong to this class; nested types and inline bodies are deeper.
+	auto IsDirectOwnerMember = [&](const FString& Line, const FString& Needle,
+		int32& BraceDepth, bool& bInBlockComment)
+	{
+		const int32 DeclIdx = Line.Find(Needle, ESearchCase::CaseSensitive);
+		bool bDirect = false;
+		for (int32 c = 0; c < Line.Len(); ++c)
+		{
+			const TCHAR Ch = Line[c];
+			const TCHAR Next = c + 1 < Line.Len() ? Line[c + 1] : 0;
+			if (bInBlockComment)
+			{
+				if (Ch == TEXT('*') && Next == TEXT('/')) { bInBlockComment = false; ++c; }
+				continue;
+			}
+			if (Ch == TEXT('/') && Next == TEXT('/')) break;
+			if (Ch == TEXT('/') && Next == TEXT('*')) { bInBlockComment = true; ++c; continue; }
+			if (Ch == TEXT('"') || Ch == TEXT('\''))
+			{
+				const TCHAR Quote = Ch;
+				while (++c < Line.Len())
+				{
+					if (Line[c] == TEXT('\\')) { ++c; }
+					else if (Line[c] == Quote) break;
+				}
+				continue;
+			}
+			if (c == DeclIdx && BraceDepth == 1) bDirect = true;
+			if (Ch == TEXT('{')) ++BraceDepth;
+			else if (Ch == TEXT('}')) --BraceDepth;
+		}
+		return bDirect;
+	};
+
+	if (bQualified)
+	{
+		for (const FMonolithSourceSymbol& Owner : DB->GetSymbolsByName(OwnerTail))
+		{
+			if (Overloads.Num() >= Limit) break;
+			if (Owner.Kind != TEXT("class") && Owner.Kind != TEXT("struct")) continue;
+			if (!MonolithSourceQualifiedLookup::QualifiedNameMatches(OwnerName, Owner.QualifiedName)) continue;
+			const FString FilePath = DB->GetFilePath(Owner.FileId);
+			TArray<FString> FileLines;
+			if (!FFileHelper::LoadFileToStringArray(FileLines, *FilePath)) continue;
+			const int32 StartIdx = FMath::Max(0, Owner.LineStart - 1);
+			const int32 EndIdx = FMath::Min(FileLines.Num(), Owner.LineEnd);
+			int32 BraceDepth = 0;
+			bool bInBlockComment = false;
+			for (int32 i = StartIdx; i < EndIdx && Overloads.Num() < Limit; ++i)
+			{
+				if (IsDirectOwnerMember(FileLines[i], MethodNeedle, BraceDepth, bInBlockComment))
+				{
+					AddDeclaration(FileLines, i, FilePath, MethodNeedle, /*bInsideOwner=*/true);
+				}
+			}
+		}
+		if (Overloads.Num() > 0) return Overloads;
+	}
+
+	// Unqualified requests retain their existing broad FTS fallback.
+	// Qualified requests require an explicit owner on the source line.
+	const FString& Needle = bQualified ? QualifiedNeedle : MethodNeedle;
+	for (const FMonolithSourceChunk& Chunk : DB->SearchSourceFTS(Symbol, TEXT("all"), 50))
+	{
+		if (Overloads.Num() >= Limit) break;
+		const FString FilePath = DB->GetFilePath(Chunk.FileId);
+		TArray<FString> FileLines;
+		if (!FFileHelper::LoadFileToStringArray(FileLines, *FilePath)) continue;
+		const int32 WinStart = FMath::Max(0, Chunk.LineNumber - 1);
+		const int32 WinEnd = FMath::Min(FileLines.Num(), WinStart + 10);
+		for (int32 i = WinStart; i < WinEnd && Overloads.Num() < Limit; ++i)
+		{
+			AddDeclaration(FileLines, i, FilePath, Needle, /*bInsideOwner=*/false);
+		}
+	}
+	return Overloads;
+}
+
 FMonolithActionResult FMonolithSourceActions::HandleGetSignature(const TSharedPtr<FJsonObject>& Params)
 {
 	FMonolithSourceDatabase* DB = GetDB();
@@ -1812,90 +2065,8 @@ FMonolithActionResult FMonolithSourceActions::HandleGetSignature(const TSharedPt
 		return FMonolithActionResult::Error(TEXT("'symbol' is required."));
 	}
 	const int32 Limit = Params->HasField(TEXT("limit")) ? static_cast<int32>(Params->GetNumberField(TEXT("limit"))) : 10;
-
-	// The method name for FTS / column matching is the trailing identifier.
-	FString MethodName = Symbol;
-	int32 ScopeIdx = Symbol.Find(TEXT("::"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-	if (ScopeIdx != INDEX_NONE)
-	{
-		MethodName = Symbol.Mid(ScopeIdx + 2);
-	}
-
-	struct FOverload { FString Signature; FString Source; FString File; int32 Line = 0; };
-	TArray<FOverload> Overloads;
-
-	// --- Fast path: a body-free `signature` column on an indexed symbol row. ---
-	TArray<FMonolithSourceSymbol> Symbols = DB->GetSymbolsByName(MethodName, TEXT("function"));
-	for (const FMonolithSourceSymbol& S : Symbols)
-	{
-		if (Overloads.Num() >= Limit) break;
-		if (S.Signature.IsEmpty()) continue;
-		// Body-free only — reject anything carrying an inline body or continuation.
-		if (S.Signature.Contains(TEXT("{")) || S.Signature.Contains(TEXT("\\"))) continue;
-		FOverload O;
-		O.Signature = S.Signature.TrimStartAndEnd();
-		O.Source = TEXT("column");
-		O.File = ShortPath(DB->GetFilePath(S.FileId));
-		O.Line = S.LineStart;
-		Overloads.Add(MoveTemp(O));
-	}
-
-	// --- Primary: declaration-read via source-line FTS over source_fts. ---
-	if (Overloads.Num() == 0)
-	{
-		// Search for the call/decl token. EscapeFTS strips the trailing '(' and the
-		// `::`, so we query the method name and verify the `Name(` shape per hit.
-		const FString FtsQuery = Symbol; // FTS escape handles :: -> space
-		TArray<FMonolithSourceChunk> Chunks = DB->SearchSourceFTS(FtsQuery, TEXT("all"), 50);
-
-		TSet<FString> SeenSignatures;
-		for (const FMonolithSourceChunk& Chunk : Chunks)
-		{
-			if (Overloads.Num() >= Limit) break;
-
-			const FString FilePath = DB->GetFilePath(Chunk.FileId);
-			TArray<FString> FileLines;
-			if (!FFileHelper::LoadFileToStringArray(FileLines, *FilePath)) continue;
-
-			// The chunk's line_number is the 1-based first line of a 10-line batch.
-			// Scan the batch window for a declaration line containing `MethodName(`.
-			const int32 WinStart = FMath::Max(0, Chunk.LineNumber - 1);
-			const int32 WinEnd = FMath::Min(FileLines.Num(), WinStart + 10);
-			const FString NeedlePattern = MethodName + TEXT("(");
-
-			for (int32 i = WinStart; i < WinEnd; ++i)
-			{
-				if (Overloads.Num() >= Limit) break;
-
-				const FString& L = FileLines[i];
-				int32 DeclIdx = L.Find(NeedlePattern, ESearchCase::CaseSensitive);
-				if (DeclIdx == INDEX_NONE) continue;
-				// Require the char before the name to be a non-identifier (so we don't
-				// match a substring of a longer identifier).
-				if (DeclIdx > 0)
-				{
-					const TCHAR Prev = L[DeclIdx - 1];
-					if (FChar::IsAlnum(Prev) || Prev == TEXT('_')) continue;
-				}
-
-				const FString Sig = CompactDeclaration(FileLines, i);
-				if (Sig.IsEmpty()) continue;
-				// Must look like a declaration: contains the method name and a paren.
-				if (!Sig.Contains(NeedlePattern)) continue;
-				if (SeenSignatures.Contains(Sig)) continue;
-				SeenSignatures.Add(Sig);
-
-				FOverload O;
-				O.Signature = Sig;
-				O.Source = TEXT("declaration_read");
-				O.File = ShortPath(FilePath);
-				O.Line = i + 1;
-				Overloads.Add(MoveTemp(O));
-			}
-		}
-	}
-
-	if (Overloads.Num() == 0)
+	const TArray<FResolvedSignature> Overloads = ResolveSignatures(DB, Symbol, Limit);
+	if (Overloads.IsEmpty())
 	{
 		return FMonolithActionResult::Error(FString::Printf(TEXT("No signature found for '%s'."), *Symbol));
 	}
@@ -1904,7 +2075,7 @@ FMonolithActionResult FMonolithSourceActions::HandleGetSignature(const TSharedPt
 	auto ResultObj = MakeShared<FJsonObject>();
 	TArray<TSharedPtr<FJsonValue>> OverloadArr;
 	TArray<FString> TextLines;
-	for (const FOverload& O : Overloads)
+	for (const FResolvedSignature& O : Overloads)
 	{
 		auto Obj = MakeShared<FJsonObject>();
 		Obj->SetStringField(TEXT("signature"), O.Signature);
@@ -1978,27 +2149,83 @@ FMonolithActionResult FMonolithSourceActions::HandleCheckDeprecations(const TSha
 		return FMonolithActionResult::Success(ResultObj);
 	}
 
-	TMap<FString, FMonolithDeprecationRow> Deprecated = DB->GetDeprecationsBatch(SymbolNames);
-
+	// symbol_deprecations.symbol_name only holds bare identifiers, so a `Class::Method`
+	// request is retried with the tail (issue #155). When the deprecation row is linked
+	// to a symbols row whose qualified_name matches the requested owner, the verdict is
+	// owner-confirmed (match:"qualified"); otherwise it is a bare-name hit
+	// (match:"name"). A name with no deprecation row reports found:false when the index
+	// has no symbol by that name at all, so "unknown" is never reported as "current".
 	TArray<TSharedPtr<FJsonValue>> Verdicts;
 	TArray<FString> TextLines;
 	for (const FString& Name : SymbolNames)
 	{
 		auto Obj = MakeShared<FJsonObject>();
 		Obj->SetStringField(TEXT("symbol"), Name);
-		const FMonolithDeprecationRow* Found = Deprecated.Find(Name);
-		if (Found)
+
+		FString Tail;
+		const bool bQualified = MonolithSourceQualifiedLookup::SplitTail(Name, Tail);
+
+		FString LookupName = Name;
+		TArray<FMonolithDeprecationRow> Rows = DB->GetDeprecationRows(Name);
+		if (Rows.Num() == 0 && bQualified)
 		{
+			LookupName = Tail;
+			Rows = DB->GetDeprecationRows(Tail);
+		}
+
+		if (Rows.Num() > 0)
+		{
+			const FMonolithDeprecationRow* Chosen = &Rows[0];
+			bool bOwnerConfirmed = false;
+			if (bQualified)
+			{
+				for (const FMonolithDeprecationRow& Row : Rows)
+				{
+					if (!Row.LinkedQualifiedName.IsEmpty()
+						&& MonolithSourceQualifiedLookup::QualifiedNameMatches(Name, Row.LinkedQualifiedName))
+					{
+						Chosen = &Row;
+						bOwnerConfirmed = true;
+						break;
+					}
+				}
+			}
+
 			Obj->SetBoolField(TEXT("deprecated"), true);
-			Obj->SetStringField(TEXT("version"), Found->Version);
-			Obj->SetStringField(TEXT("message"), Found->Message);
-			Obj->SetStringField(TEXT("kind"), Found->Kind);
-			TextLines.Add(FString::Printf(TEXT("%s: DEPRECATED (%s) [%s] %s"), *Name, *Found->Version, *Found->Kind, *Found->Message));
+			Obj->SetBoolField(TEXT("found"), true);
+			Obj->SetStringField(TEXT("version"), Chosen->Version);
+			Obj->SetStringField(TEXT("message"), Chosen->Message);
+			Obj->SetStringField(TEXT("kind"), Chosen->Kind);
+			// match is reported on every found:true verdict; an unqualified request is
+			// always a bare-name match.
+			Obj->SetStringField(TEXT("match"), bOwnerConfirmed ? TEXT("qualified") : TEXT("name"));
+			if (LookupName != Name)
+			{
+				Obj->SetStringField(TEXT("matched_name"), LookupName);
+			}
+			TextLines.Add(FString::Printf(TEXT("%s: DEPRECATED (%s) [%s] %s%s"), *Name, *Chosen->Version, *Chosen->Kind, *Chosen->Message,
+				(bQualified && !bOwnerConfirmed) ? TEXT(" (matched by bare name; owner not verified)") : TEXT("")));
 		}
 		else
 		{
+			const bool bFound = DB->HasSymbolNamed(Name) || (bQualified && DB->HasSymbolNamed(Tail));
 			Obj->SetBoolField(TEXT("deprecated"), false);
-			TextLines.Add(FString::Printf(TEXT("%s: not deprecated"), *Name));
+			Obj->SetBoolField(TEXT("found"), bFound);
+			if (bFound)
+			{
+				bool bOwnerConfirmed = false;
+				if (bQualified)
+				{
+					bool bOwnerUnmatched = false;
+					const TArray<FMonolithSourceSymbol> SymRows =
+						MonolithSourceQualifiedLookup::ResolveRows(DB, Name, FString(), bOwnerUnmatched);
+					bOwnerConfirmed = SymRows.Num() > 0 && !bOwnerUnmatched;
+				}
+				Obj->SetStringField(TEXT("match"), bOwnerConfirmed ? TEXT("qualified") : TEXT("name"));
+			}
+			TextLines.Add(bFound
+				? FString::Printf(TEXT("%s: not deprecated"), *Name)
+				: FString::Printf(TEXT("%s: not found in the source index (deprecation status unknown)"), *Name));
 		}
 		Verdicts.Add(MakeShared<FJsonValueObject>(Obj));
 	}

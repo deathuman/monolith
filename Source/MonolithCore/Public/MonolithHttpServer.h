@@ -42,6 +42,10 @@ public:
 	int32 GetPort() const { return BoundPort; }
 
 private:
+	#if WITH_DEV_AUTOMATION_TESTS
+	friend class FMonolithHttpTransportPolicyTest;
+	#endif
+
 	// --- Route Handlers ---
 	bool HandlePostMcp(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);
 	bool HandleGetMcp(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete);

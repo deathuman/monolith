@@ -7,6 +7,7 @@
 #include "MonolithUpdateSubsystem.h"
 #include "EditorSubsystem.h"
 #include "Misc/App.h"
+#include "Misc/Paths.h"
 #include "Editor.h"
 
 // Known optional modules — namespaces that may not have registered actions
@@ -564,14 +565,36 @@ FMonolithActionResult FMonolithCoreTools::HandleStatus(const TSharedPtr<FJsonObj
 
 	// Registry stats
 	FMonolithToolRegistry& Registry = FMonolithToolRegistry::Get();
-	Result->SetNumberField(TEXT("total_actions"), Registry.GetActionCount());
-	Result->SetNumberField(TEXT("namespaces"), Registry.GetNamespaces().Num());
+	const FMonolithMetadataSnapshot Metadata = Registry.GetMetadataSnapshot();
+	Result->SetNumberField(TEXT("total_actions"), Metadata.TotalActions);
+	Result->SetNumberField(TEXT("namespaces"), Metadata.NamespaceCount);
+	Result->SetStringField(TEXT("metadata_generation"), Metadata.MetadataGeneration);
+	TArray<TSharedPtr<FJsonValue>> UnavailableActions;
+	UnavailableActions.Reserve(Metadata.UnavailableActions.Num());
+	for (const FString& ActionName : Metadata.UnavailableActions)
+	{
+		UnavailableActions.Add(MakeShared<FJsonValueString>(ActionName));
+	}
+	Result->SetArrayField(TEXT("unavailable_actions"), UnavailableActions);
+	if (!Metadata.MetadataGenerationError.IsEmpty())
+	{
+		Result->SetStringField(TEXT("metadata_generation_error"), Metadata.MetadataGenerationError);
+	}
 
 	// Engine info
 	Result->SetStringField(TEXT("engine_version"), FApp::GetBuildVersion());
 
 	// Project info
 	Result->SetStringField(TEXT("project_name"), FApp::GetProjectName());
+	FString ProjectDirectory = FPaths::ConvertRelativePathToFull(FPaths::ProjectDir());
+	FPaths::NormalizeDirectoryName(ProjectDirectory);
+	FPaths::CollapseRelativeDirectories(ProjectDirectory);
+	Result->SetStringField(TEXT("project_directory"), ProjectDirectory);
+	// An application session can span processes. Instance identity changes only
+	// when this editor process changes, including across Live Coding patches.
+	const FGuid EditorSessionId = FApp::GetInstanceId();
+	Result->SetStringField(TEXT("editor_session_id"),
+		EditorSessionId.IsValid() ? EditorSessionId.ToString(EGuidFormats::Digits) : FString());
 
 	return FMonolithActionResult::Success(Result);
 }

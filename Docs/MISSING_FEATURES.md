@@ -6,12 +6,33 @@
 
 ---
 
+## 2026-10-18 — OPEN: source index follow-ups (after the #155 / #156 parser and lookup fixes)
+
+1. **Parser gaps that remain after parser v2.** Template out-of-line definitions (`TFoo<T>::Bar`), out-of-line operator definitions, and caller bodies whose definition header spans several lines (the reference pass matches single-line headers only) are still missed. Call references also resolve callees by bare name through a first-wins map, so a call is attributed to one same-named symbol rather than the right overload or owner.
+2. **No automatic rebuild on a parser bump.** `meta.parser_version` is only checked to log a warning on DB open; an index built by parser v1 keeps serving incomplete results until someone runs `source.trigger_reindex`.
+
+## 2026-09-28 — OPEN: source / asset index follow-ups (after the incremental project reindex fix)
+
+Scoped out while making `source.trigger_project_reindex` (and the Live Coding / hot-reload auto-kick) purge previously indexed project rows before re-indexing, bumping the source DB schema to v3, and making the startup asset delta rename `asset_name` on moves. None of these block that fix.
+
+1. **The purge's `source_fts` delete is a full-table scan on every incremental reindex.** `source_fts.file_id` is `UNINDEXED`, so `DELETE FROM source_fts WHERE file_id IN (...)` walks every chunk of the engine index (~2.3M rows) even when the project owns a small fraction of them. Measured on the real `EngineSource.db`: about 17 s with a cold page cache, about 1 s warm. The auto-kick runs this after every Live Coding patch. `references` and `includes` have no `file_id` index either, so they scan too, though more cheaply.
+   - **Add:** a way to reach a file's FTS rows without the scan — an external-content FTS table keyed by a rowid range per file, a side table mapping `file_id` to FTS rowids, or a separate FTS table for project source — plus `file_id` indexes on `references` and `includes`.
+
+2. **The Python offline indexer's schema is out of sync with the C++ schema.** `Scripts/source_indexer/db/schema.py` has no `symbol_deprecations` table and still stamps `schema_version = 1`, while the native indexer is at v3. The Python indexer is legacy and not invoked by MonolithSource, but a DB it builds would report v1 and give `check_deprecations` / `verify_symbols` nothing to read.
+   - **Add:** bring `schema.py` to v3 (the `symbol_deprecations` table with nullable `symbol_id` / `file_id`, and `SCHEMA_VERSION = 3`), or retire the Python indexer's DB-writing path outright.
+
+3. **The startup asset delta never runs the sentinel indexers.** Phase 9 of `UMonolithIndexSubsystem::StartIncrementalIndex` is a commented-out stub, so dependencies, tag references and level actors are not refreshed for assets added or modified while the editor was closed. The live Asset Registry drain does call `RunScopedSentinels`, but that function only invokes indexers whose `SupportsIncrementalIndex()` returns true, and no indexer overrides the `false` default — so the live path does not refresh that data either.
+   - **Add:** implement `IndexScoped` / `SupportsIncrementalIndex` on the sentinels that own per-asset data (`FDependencyIndexer`, `FGameplayTagIndexer`, `FLevelIndexer`), then enable Phase 9. This overlaps the `ClearOwnedData` hook proposed under *full-index resume follow-ups* item 1: a scoped pass has to clear the asset's old rows before writing new ones.
+
+---
+
 ## 2026-09-10 — OPEN: carried into 0.23.0
 
 Four items known-open at the 0.23.0 release. None of them blocks it; each is stated here so nobody rediscovers them.
 
-1. **PR #123 (index memory-pressure hardening) is deferred, not rejected.** It overlaps the editor-exit deadlock fix that shipped in 0.23.0 — both rework the same indexing-worker wait/dispatch paths in the same file, and the deadlock fix changed the shape those waits have (bounded polling with a provably-stopped abandon condition, plus an abort token on game-thread dispatches). Landing #123 on top of that as a merge would produce a file neither change was designed against.
-   - **Add:** a combined design pass over the worker's wait, dispatch and memory-pressure behaviour, then reimplement #123's intent against the post-0.23.0 shape.
+1. **PR #123 (index memory-pressure hardening) — LANDED (Unreleased), rebased onto the post-0.23.0 worker.** Remaining follow-ups:
+   - **A degraded level pass has no per-map resume.** Skipped maps are listed in `level_index_state` and the log, but only a later full reindex retries them. **Add:** a scoped level reindex for just the skipped maps.
+   - **Dependency assets a map pulls in stay resident.** The post-load release only touches the map's own packages (map, streaming sub-levels, external actor/object packages); meshes, materials and textures loaded as dependencies keep `RF_Standalone`, as they did before #123. **Add:** a safe way to tell map-only dependencies from packages something else is using, if map-heavy projects still run out of memory.
 
 2. **PR #104 (updater release-asset selection) is still open, pending an end-to-end Windows install rehearsal.** The auto-update path is client-side and time-shifted — it only runs when a NEWER release exists, and the code that runs is the *old installed version's*, not HEAD. "It compiles and the dialog appears" is not the path; v0.14.7 shipped an install path that could never once succeed on Windows and no release in fifteen cycles noticed (issues #90/#94).
    - **Add:** point a client at a real release and drive the full Install click through hash verification to staged swap, on Windows, before merging. This is the standing rule for any change to the update path, not a one-off for this PR.

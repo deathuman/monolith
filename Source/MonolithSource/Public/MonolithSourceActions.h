@@ -35,6 +35,23 @@ public:
 	 */
 	static FString CompactDeclaration(const TArray<FString>& Lines, int32 StartIdx);
 
+	/** A resolved signature and its indexed or source-declaration provenance. */
+	struct FResolvedSignature
+	{
+		FString Signature;
+		FString Source;
+		FString File;
+		int32 Line = 0;
+	};
+
+	/**
+	 * Resolve overloads for an unqualified name or a precisely owned Class::Method.
+	 * Indexed function rows are preferred; older indexes can fall back to an
+	 * owning class declaration or an explicitly qualified out-of-line definition.
+	 */
+	static TArray<FResolvedSignature> ResolveSignatures(FMonolithSourceDatabase* DB,
+		const FString& Symbol, int32 Limit);
+
 	// --- Phase 2 shared composition helpers (item 4 calls these, NOT the JSON
 	//     handlers; public for unit testing — see MonolithCppErgonomicsTest.cpp).
 
@@ -48,9 +65,8 @@ public:
 		FString& OutInclude, bool& OutIncludable, FString& OutModule, FString& OutWarning);
 
 	/**
-	 * Resolve the first declaration signature for a symbol. Mirrors the item-2
-	 * (get_signature) resolution: body-free `signature` column fast path, else
-	 * declaration-read over source_fts. OutSource is "column" | "declaration_read".
+	 * Resolve the first declaration signature for a symbol using the same
+	 * owner-aware resolution as get_signature. OutSource is "column" | "declaration_read".
 	 * Returns false when no signature is found (does NOT by itself imply
 	 * non-existence — an existing class with no resolvable method signature still
 	 * has a class row).

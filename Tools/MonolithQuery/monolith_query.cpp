@@ -528,7 +528,7 @@ static Args parse_args(int argc, char* argv[]) {
                   << "  get_class_hierarchy <symbol> [--direction=up|down|both] [--depth=N]\n"
                   << "  get_module_info <module_name>\n"
                   << "  get_symbol_context <symbol> [--context-lines=N]\n"
-                  << "  read_file <file_path> [--start=N] [--end=N]\n"
+                  << "  read_file <file_path> [<start> [<end>]] [--start=N] [--end=N]\n"
                   << "  get_include_path <symbol>\n"
                   << "  get_signature <symbol> [--limit=N]\n"
                   << "  check_deprecations <symbol> [<symbol> ...]\n"
@@ -853,6 +853,50 @@ public:
         std::cout << result << std::endl;
     }
 
+    // --- qualified-name lookup (mirrors MonolithSourceQualifiedLookup in the live module) ---
+
+    // "A::B::Method" -> "Method"; false for an unqualified name.
+    static bool split_tail(const std::string& symbol, std::string& out_tail) {
+        size_t scope = symbol.rfind("::");
+        if (scope == std::string::npos || scope + 2 >= symbol.size()) return false;
+        out_tail = symbol.substr(scope + 2);
+        return true;
+    }
+
+    static bool qualified_name_matches(const std::string& requested, const std::string& stored) {
+        if (requested == stored) return true;
+        const std::string suffix = "::" + stored;
+        return requested.size() >= suffix.size()
+            && requested.compare(requested.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    // Rows (id, name, qualified_name) for a possibly-qualified name. owner_unmatched is
+    // set when a Class::Method request fell back to every trailing-identifier match.
+    Rows resolve_symbol_rows(const std::string& symbol, const std::string& kind, bool& owner_unmatched) {
+        owner_unmatched = false;
+        auto by_name = [&](const std::string& name) -> Rows {
+            if (!kind.empty())
+                return query(db, "SELECT id, name, qualified_name FROM symbols WHERE name = ? AND kind = ?", {name, kind});
+            return query(db, "SELECT id, name, qualified_name FROM symbols WHERE name = ?", {name});
+        };
+        Rows rows = by_name(symbol);
+        std::string tail;
+        if (!rows.empty() || !split_tail(symbol, tail)) return rows;
+        Rows tail_rows = by_name(tail);
+        Rows owner_rows;
+        for (auto& r : tail_rows)
+            if (qualified_name_matches(symbol, r.get("qualified_name"))) owner_rows.push_back(r);
+        if (!owner_rows.empty()) return owner_rows;
+        owner_unmatched = !tail_rows.empty();
+        return tail_rows;
+    }
+
+    static std::string owner_fallback_note(const std::string& symbol) {
+        std::string tail;
+        split_tail(symbol, tail);
+        return "Note: no indexed '" + symbol + "' with that owner; showing every '" + tail + "' match.\n";
+    }
+
     // --- find_references ---
     void find_references(const Args& args) {
         if (args.positional.empty()) die("find_references requires a symbol argument");
@@ -860,7 +904,8 @@ public:
         std::string ref_kind = args.opt("ref_kind");
         int limit = args.opt_int("limit", 50);
 
-        auto sym_rows = query(db, "SELECT id, name FROM symbols WHERE name = ?", {symbol});
+        bool owner_unmatched = false;
+        auto sym_rows = resolve_symbol_rows(symbol, "", owner_unmatched);
         if (sym_rows.empty()) {
             std::string fts_q = escape_fts(symbol);
             sym_rows = query(db, "SELECT s.id, s.name FROM symbols_fts f JOIN symbols s ON s.id = f.rowid "
@@ -890,6 +935,7 @@ public:
             }
         }
 
+        if (owner_unmatched) std::cout << owner_fallback_note(symbol);
         if (lines.empty())
             std::cout << "No references found for '" << symbol << "'." << std::endl;
         else
@@ -902,7 +948,8 @@ public:
         std::string symbol = args.positional[0];
         int limit = args.opt_int("limit", 50);
 
-        auto sym_rows = query(db, "SELECT id FROM symbols WHERE name = ? AND kind = 'function'", {symbol});
+        bool owner_unmatched = false;
+        auto sym_rows = resolve_symbol_rows(symbol, "function", owner_unmatched);
         if (sym_rows.empty()) {
             std::string fts_q = escape_fts(symbol);
             sym_rows = query(db,
@@ -922,6 +969,7 @@ public:
                 lines.push_back(ref.get("from_name") + " -- " + short_path(ref.get("path")) + ":" + ref.get("line"));
         }
 
+        if (owner_unmatched) std::cout << owner_fallback_note(symbol);
         if (lines.empty())
             std::cout << "No callers found for '" << symbol << "'." << std::endl;
         else
@@ -934,7 +982,8 @@ public:
         std::string symbol = args.positional[0];
         int limit = args.opt_int("limit", 50);
 
-        auto sym_rows = query(db, "SELECT id FROM symbols WHERE name = ? AND kind = 'function'", {symbol});
+        bool owner_unmatched = false;
+        auto sym_rows = resolve_symbol_rows(symbol, "function", owner_unmatched);
         if (sym_rows.empty()) {
             std::string fts_q = escape_fts(symbol);
             sym_rows = query(db,
@@ -954,6 +1003,7 @@ public:
                 lines.push_back(ref.get("to_name") + " -- " + short_path(ref.get("path")) + ":" + ref.get("line"));
         }
 
+        if (owner_unmatched) std::cout << owner_fallback_note(symbol);
         if (lines.empty())
             std::cout << "No callees found for '" << symbol << "'." << std::endl;
         else
@@ -1116,25 +1166,69 @@ public:
     // --- read_file ---
     void read_file(const Args& args) {
         if (args.positional.empty()) die("read_file requires a file_path argument");
+        if (args.positional.size() > 3)
+            die("read_file takes at most 3 positional arguments: <file_path> [<start> [<end>]]");
         std::string file_path = args.positional[0];
-        int start = args.opt_int("start", 1);
-        int end = args.opt_int("end", 0);
+
+        // Line range: --start/--end, or positional <start> [<end>]. Positional
+        // numbers were previously ignored silently; a non-integer or a
+        // conflicting duplicate now fails loudly instead.
+        auto parse_line = [](const std::string& s, const char* what) -> int {
+            size_t pos = 0;
+            int v = 0;
+            try { v = std::stoi(s, &pos); } catch (...) { pos = 0; }
+            if (pos == 0 || pos != s.size())
+                die(std::string("read_file: ") + what + " line must be an integer, got '" + s + "'");
+            return v;
+        };
+        if (args.positional.size() >= 2 && args.options.count("start"))
+            die("read_file: start line given both positionally and via --start");
+        if (args.positional.size() >= 3 && args.options.count("end"))
+            die("read_file: end line given both positionally and via --end");
+        int start = args.positional.size() >= 2 ? parse_line(args.positional[1], "start")
+                                                : args.opt_int("start", 1);
+        int end = args.positional.size() >= 3 ? parse_line(args.positional[2], "end")
+                                              : args.opt_int("end", 0);
 
         std::string resolved;
 
         if (fs::exists(file_path)) {
             resolved = file_path;
         } else {
-            // Normalize slashes to backslash for DB lookup
-            std::string normalized = file_path;
-            std::replace(normalized.begin(), normalized.end(), '/', '\\');
+            // The index stores forward-slash absolute paths
+            // (C:/Program Files (x86)/UE_5.7/Engine/Source/...). Look up with
+            // forward slashes first (exact, then suffix anchored at a path
+            // separator, so an engine-relative "Engine/Source/..." or
+            // module-relative "Runtime/Engine/..." path resolves), then fall
+            // back to the legacy backslash form for older indexes.
+            std::string fwd = file_path;
+            std::replace(fwd.begin(), fwd.end(), '\\', '/');
+            while (fwd.rfind("./", 0) == 0) fwd.erase(0, 2);
+            while (!fwd.empty() && fwd.front() == '/') fwd.erase(0, 1);
+            std::string back = fwd;
+            std::replace(back.begin(), back.end(), '/', '\\');
 
-            auto rows = query(db, "SELECT path FROM files WHERE path = ?", {normalized});
+            auto rows = query(db, "SELECT path FROM files WHERE path = ?", {fwd});
             if (rows.empty())
-                rows = query(db, "SELECT path FROM files WHERE path LIKE ? LIMIT 1", {"%" + normalized});
+                rows = query(db, "SELECT path FROM files WHERE path LIKE ? LIMIT 1", {"%/" + fwd});
+            if (rows.empty())
+                rows = query(db, "SELECT path FROM files WHERE path = ?", {back});
+            if (rows.empty())
+                rows = query(db, "SELECT path FROM files WHERE path LIKE ? LIMIT 1", {"%" + back});
 
-            if (!rows.empty())
+            if (!rows.empty()) {
                 resolved = rows[0].get("path");
+            } else if (fwd.rfind("Engine/", 0) == 0) {
+                // Not indexed: join an engine-relative path onto the engine
+                // root derived from any indexed engine file.
+                auto er = query(db, "SELECT path FROM files WHERE path LIKE ? LIMIT 1", {"%/Engine/Source/%"});
+                if (!er.empty()) {
+                    std::string p = er[0].get("path");
+                    auto idx = p.find("/Engine/Source/");
+                    std::string candidate = p.substr(0, idx + 1) + fwd;
+                    if (fs::exists(candidate)) resolved = candidate;
+                }
+            }
         }
 
         if (resolved.empty()) die("No file found matching '" + file_path + "'.");
@@ -1318,18 +1412,25 @@ public:
         int limit = args.opt_int("limit", 10);
 
         std::string method = symbol;
-        size_t scope = symbol.rfind("::");
-        if (scope != std::string::npos) method = symbol.substr(scope + 2);
+        bool qualified = split_tail(symbol, method);
+        const std::string owner = qualified ? symbol.substr(0, symbol.rfind("::")) : "";
+        std::string owner_tail = owner;
+        if (qualified) split_tail(owner, owner_tail);
+
+        if (limit <= 0) die("No signature found for '" + symbol + "'.");
 
         struct Overload { std::string sig, source, file; int line = 0; };
         std::vector<Overload> overloads;
 
-        // Fast path: body-free signature column.
+        // Indexed signatures must belong to the requested owner for qualified lookups.
         auto fnrows = query(db,
-            "SELECT signature, file_id, line_start FROM symbols WHERE name = ? AND kind = 'function'",
+            "SELECT signature, file_id, line_start, qualified_name FROM symbols "
+            "WHERE name = ? AND kind = 'function'",
             {method});
         for (auto& r : fnrows) {
             if ((int)overloads.size() >= limit) break;
+            if (qualified && (r.get("qualified_name").find("::") == std::string::npos
+                || !qualified_name_matches(symbol, r.get("qualified_name")))) continue;
             std::string sig = r.get("signature");
             if (sig.empty()) continue;
             if (sig.find('{') != std::string::npos || sig.find('\\') != std::string::npos) continue;
@@ -1340,38 +1441,198 @@ public:
             overloads.push_back({sig, "column", short_path(get_file_path(r.get_int("file_id"))), r.get_int("line_start")});
         }
 
-        // Primary: declaration-read via source_fts.
+        // Older indexes may lack member rows. Read only the matching class/struct
+        // source range, or an explicitly qualified out-of-line definition.
         if (overloads.empty()) {
-            std::string fts_q = escape_fts(symbol);
-            auto chunks = query(db,
-                "SELECT file_id, line_number, text FROM source_fts WHERE source_fts MATCH ? "
-                "ORDER BY bm25(source_fts) LIMIT 50", {fts_q});
             std::set<std::string> seen;
-            std::string needle = method + "(";
-            for (auto& ch : chunks) {
-                if ((int)overloads.size() >= limit) break;
-                std::string fp = get_file_path(ch.get_int("file_id"));
-                std::ifstream f(fp);
-                if (!f.is_open()) continue;
-                std::vector<std::string> file_lines;
-                std::string l;
-                while (std::getline(f, l)) file_lines.push_back(l);
-                int win_start = std::max(0, ch.get_int("line_number") - 1);
-                int win_end = std::min((int)file_lines.size(), win_start + 10);
-                for (int i = win_start; i < win_end; ++i) {
-                    if ((int)overloads.size() >= limit) break;
-                    const std::string& line = file_lines[i];
-                    size_t didx = line.find(needle);
-                    if (didx == std::string::npos) continue;
-                    if (didx > 0) {
-                        char prev = line[didx - 1];
-                        if (std::isalnum((unsigned char)prev) || prev == '_') continue;
+            const std::string method_needle = method + "(";
+            const std::string qualified_needle = symbol + "(";
+
+            struct LexicalState {
+                bool in_block_comment = false;
+                bool in_string = false;
+                bool in_char = false;
+                bool escaped = false;
+            };
+            auto code_lines = [](const std::vector<std::string>& source) {
+                std::vector<std::string> masked;
+                masked.reserve(source.size());
+                LexicalState state;
+                for (const auto& line : source) {
+                    std::string code(line.size(), ' ');
+                    bool in_line_comment = false;
+                    for (size_t i = 0; i < line.size(); ++i) {
+                        const char ch = line[i];
+                        if (in_line_comment) break;
+                        if (state.in_block_comment) {
+                            if (ch == '*' && i + 1 < line.size() && line[i + 1] == '/') {
+                                state.in_block_comment = false;
+                                ++i;
+                            }
+                            continue;
+                        }
+                        if (state.in_string || state.in_char) {
+                            if (state.escaped) state.escaped = false;
+                            else if (ch == '\\') state.escaped = true;
+                            else if (state.in_string && ch == '"') state.in_string = false;
+                            else if (state.in_char && ch == '\'') state.in_char = false;
+                            continue;
+                        }
+                        if (ch == '/' && i + 1 < line.size() && line[i + 1] == '/') {
+                            in_line_comment = true;
+                        } else if (ch == '/' && i + 1 < line.size() && line[i + 1] == '*') {
+                            state.in_block_comment = true;
+                            ++i;
+                        } else if (ch == '"') {
+                            state.in_string = true;
+                        } else if (ch == '\'') {
+                            state.in_char = true;
+                        } else {
+                            code[i] = ch;
+                        }
                     }
-                    std::string sig = compact_declaration(file_lines, i);
-                    if (sig.empty() || sig.find(needle) == std::string::npos) continue;
-                    if (seen.count(sig)) continue;
-                    seen.insert(sig);
-                    overloads.push_back({sig, "declaration_read", short_path(fp), i + 1});
+                    // A backslash-newline continues a quoted literal; otherwise an
+                    // unterminated quote cannot carry into the next physical line.
+                    if (state.in_string && !state.escaped) state.in_string = false;
+                    if (state.in_char && !state.escaped) state.in_char = false;
+                    state.escaped = false;
+                    masked.push_back(std::move(code));
+                }
+                return masked;
+            };
+
+            auto has_definition_body = [&](const std::vector<std::string>& code, int index,
+                                           size_t pos, const std::string& needle) {
+                if (needle.empty() || needle.back() != '(' || index < 0
+                    || index >= (int)code.size() || pos + needle.size() > code[index].size()) return false;
+                int paren_depth = 1;
+                const int end = std::min((int)code.size(), index + 12);
+                for (int i = index; i < end; ++i) {
+                    const std::string& line = code[i];
+                    const size_t begin = i == index ? pos + needle.size() : 0;
+                    for (size_t c = begin; c < line.size(); ++c) {
+                        if (line[c] == '(') {
+                            ++paren_depth;
+                        } else if (line[c] == ')') {
+                            if (paren_depth <= 0) return false;
+                            --paren_depth;
+                        } else if (paren_depth == 0) {
+                            if (line[c] == '{') return true;
+                            if (line[c] == ';' || line[c] == '}') return false;
+                        }
+                    }
+                }
+                return false;
+            };
+
+            auto add_declaration = [&](const std::vector<std::string>& lines,
+                                       const std::vector<std::string>& code, int index, size_t pos,
+                                       const std::string& file_path, const std::string& needle,
+                                       bool inside_owner, bool require_definition) {
+                if ((int)overloads.size() >= limit || index < 0 || index >= (int)lines.size()) return;
+                const std::string& line = lines[index];
+                if (pos + needle.size() > line.size()) return;
+                if (pos > 0 && (std::isalnum((unsigned char)line[pos - 1]) || line[pos - 1] == '_')) return;
+                if (qualified) {
+                    std::string prefix = line.substr(0, pos);
+                    size_t first = prefix.find_first_not_of(" \t\r\n");
+                    if (first == std::string::npos) prefix.clear();
+                    else {
+                        size_t last = prefix.find_last_not_of(" \t\r\n");
+                        prefix = prefix.substr(first, last - first + 1);
+                    }
+                    if ((!inside_owner && prefix.size() >= 2
+                            && prefix.compare(prefix.size() - 2, 2, "::") == 0)
+                        || prefix.find('(') != std::string::npos
+                        || prefix.find('=') != std::string::npos
+                        || prefix.find("->") != std::string::npos
+                        || prefix.find('.') != std::string::npos
+                        || prefix.rfind("//", 0) == 0
+                        || prefix.rfind("*", 0) == 0
+                        || (prefix.empty() && (inside_owner || method != owner_tail))) return;
+                }
+                if (require_definition && !has_definition_body(code, index, pos, needle)) return;
+
+                std::string sig = compact_declaration(lines, index);
+                if (sig.empty() || sig.find(needle) == std::string::npos || !seen.insert(sig).second) return;
+                overloads.push_back({sig, "declaration_read", short_path(file_path), index + 1});
+            };
+
+            if (qualified) {
+                auto owner_rows = query(db,
+                    "SELECT qualified_name, file_id, line_start, line_end FROM symbols "
+                    "WHERE name = ? AND kind IN ('class', 'struct')", {owner_tail});
+                for (auto& r : owner_rows) {
+                    if ((int)overloads.size() >= limit) break;
+                    if (!qualified_name_matches(owner, r.get("qualified_name"))) continue;
+                    std::string fp = get_file_path(r.get_int("file_id"));
+                    std::ifstream f(fp);
+                    if (!f.is_open()) continue;
+                    std::vector<std::string> lines;
+                    std::string line;
+                    while (std::getline(f, line)) lines.push_back(line);
+                    const auto code = code_lines(lines);
+                    int depth = 0;
+                    bool opened_owner = false;
+                    bool closed_owner = false;
+                    int start = std::max(0, r.get_int("line_start") - 1);
+                    int end = std::min((int)lines.size(), r.get_int("line_end"));
+                    for (int i = start; i < end && !closed_owner
+                         && (int)overloads.size() < limit; ++i) {
+                        for (size_t c = 0; c < code[i].size(); ++c) {
+                            if (depth == 1 && c + method_needle.size() <= code[i].size()
+                                && code[i].compare(c, method_needle.size(), method_needle) == 0) {
+                                add_declaration(lines, code, i, c, fp, method_needle, true, false);
+                            }
+                            if (code[i][c] == '{') {
+                                ++depth;
+                                opened_owner = true;
+                            } else if (code[i][c] == '}' && depth > 0) {
+                                --depth;
+                                if (opened_owner && depth == 0) {
+                                    closed_owner = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (overloads.empty()) {
+                auto chunks = query(db,
+                    "SELECT file_id, line_number, text FROM source_fts WHERE source_fts MATCH ? "
+                    "ORDER BY bm25(source_fts) LIMIT 50", {escape_fts(symbol)});
+                const std::string& needle = qualified ? qualified_needle : method_needle;
+                for (auto& ch : chunks) {
+                    if ((int)overloads.size() >= limit) break;
+                    std::string fp = get_file_path(ch.get_int("file_id"));
+                    std::ifstream f(fp);
+                    if (!f.is_open()) continue;
+                    std::vector<std::string> lines;
+                    std::string line;
+                    while (std::getline(f, line)) lines.push_back(line);
+                    int start = std::max(0, ch.get_int("line_number") - 1);
+                    int end = std::min((int)lines.size(), start + 10);
+                    if (qualified) {
+                        const auto code = code_lines(lines);
+                        for (int i = start; i < end && (int)overloads.size() < limit; ++i) {
+                            size_t pos = 0;
+                            while (pos < code[i].size() && (int)overloads.size() < limit) {
+                                pos = code[i].find(needle, pos);
+                                if (pos == std::string::npos) break;
+                                add_declaration(lines, code, i, pos, fp, needle, false, true);
+                                ++pos;
+                            }
+                        }
+                    } else {
+                        const std::vector<std::string> no_code;
+                        for (int i = start; i < end && (int)overloads.size() < limit; ++i) {
+                            size_t pos = lines[i].find(needle);
+                            if (pos != std::string::npos)
+                                add_declaration(lines, no_code, i, pos, fp, needle, false, false);
+                        }
+                    }
                 }
             }
         }
@@ -1399,16 +1660,45 @@ public:
             return;
         }
 
+        // Mirrors the live handler (#155): a Class::Method with no exact row is retried
+        // with its trailing identifier; an owner-confirmed hit needs the linked symbol's
+        // qualified_name to match; a name with no row and no symbol is "not found".
+        auto dep_rows = [&](const std::string& n) -> Rows {
+            return query(db,
+                "SELECT d.version, d.message, d.kind, COALESCE(s.qualified_name, '') AS linked "
+                "FROM symbol_deprecations d LEFT JOIN symbols s ON s.id = d.symbol_id "
+                "WHERE d.symbol_name = ? ORDER BY d.id", {n});
+        };
+        auto has_symbol = [&](const std::string& n) -> bool {
+            return !query(db, "SELECT 1 AS one FROM symbols WHERE name = ? LIMIT 1", {n}).empty();
+        };
+
         std::vector<std::string> lines;
         for (const auto& name : args.positional) {
-            auto rows = query(db,
-                "SELECT version, message, kind FROM symbol_deprecations WHERE symbol_name = ? LIMIT 1",
-                {name});
+            std::string tail;
+            const bool qualified = split_tail(name, tail);
+            Rows rows = dep_rows(name);
+            if (rows.empty() && qualified) rows = dep_rows(tail);
             if (!rows.empty()) {
-                lines.push_back(name + ": DEPRECATED (" + rows[0].get("version") + ") ["
-                    + rows[0].get("kind") + "] " + rows[0].get("message"));
+                const Row* chosen = &rows[0];
+                bool owner_confirmed = false;
+                if (qualified) {
+                    for (const auto& r : rows) {
+                        if (!r.get("linked").empty() && qualified_name_matches(name, r.get("linked"))) {
+                            chosen = &r;
+                            owner_confirmed = true;
+                            break;
+                        }
+                    }
+                }
+                lines.push_back(name + ": DEPRECATED (" + chosen->get("version") + ") ["
+                    + chosen->get("kind") + "] " + chosen->get("message")
+                    + ((qualified && !owner_confirmed) ? " (matched by bare name; owner not verified)" : ""));
             } else {
-                lines.push_back(name + ": not deprecated");
+                const bool found = has_symbol(name) || (qualified && has_symbol(tail));
+                lines.push_back(found
+                    ? name + ": not deprecated"
+                    : name + ": not found in the source index (deprecation status unknown)");
             }
         }
         for (size_t i = 0; i < lines.size(); ++i) {

@@ -15,6 +15,12 @@ namespace MonolithSourceSchema
 	// file ownership for every deprecation row (including unresolved symbols).
 	// Older generated databases must be explicitly rebuilt with trigger_reindex.
 	static const int32 SchemaVersion = 4;
+	// Bump whenever MonolithCppParser / MonolithReferenceBuilder output changes, so an
+	// index built by an older parser can be detected (meta.parser_version) and rebuilt
+	// with source.trigger_reindex. Parser revisions do not change the schema.
+	//   2: class-body members of UCLASS/USTRUCT/UINTERFACE types, allman out-of-line
+	//      definitions (incl. constructors) and allman caller bodies (issue #156).
+	static const int32 ParserVersion = 2;
 
 	// ----------------------------------------------------------------
 	// Core tables + indexes
@@ -87,11 +93,14 @@ namespace MonolithSourceSchema
 		TEXT(");")
 
 		// Schema v2 (item 3): UE_DEPRECATED extraction. symbol_id is NULLABLE —
-		// class-body method declarations are NOT indexed as `symbols` rows
-		// (Step-0 finding), so the extractor parses the symbol NAME from the
-		// declaration text after the macro and stores symbol_id = NULL when it
-		// cannot resolve a symbols row. Lookups (check_deprecations) key on
+		// the extractor parses the symbol NAME from the declaration text after the
+		// macro and stores symbol_id = NULL when it cannot resolve a symbols row.
+		// (The original "Step-0 finding" that class-body methods had no rows was a
+		// parser bug, fixed in ParserVersion 2 — issue #156.) Lookups (check_deprecations) key on
 		// symbol_name, so a NULL symbol_id does not break the read path.
+		//
+		// Schema v4: every deprecation is owned by its source file, including
+		// unresolved symbols. Older schemas require a full rebuild.
 		TEXT("CREATE TABLE IF NOT EXISTS symbol_deprecations (")
 		TEXT("    id          INTEGER PRIMARY KEY AUTOINCREMENT,")
 		TEXT("    symbol_id   INTEGER REFERENCES symbols(id),")

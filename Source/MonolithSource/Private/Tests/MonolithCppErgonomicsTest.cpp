@@ -119,7 +119,12 @@ bool FCppErgoDeterministicIdentityAndMigrationTest::RunTest(const FString& /*Par
 		DB.InsertFile(TEXT("C:/Project/Source/Other/Bar.cpp"), SecondModule, TEXT("source"), 1, 1.0);
 		const int64 RepeatedFile = DB.InsertFile(TEXT("C:/Project/Source/Fixture/Foo.cpp"), FirstModule, TEXT("source"), 2, 2.0);
 		TestTrue(TEXT("file path identity is stable"), FirstFile != 0 && FirstFile == RepeatedFile);
-		TestFalse(TEXT("new schema is usable"), DB.RequiresFullReindex());
+		TestTrue(TEXT("missing parser marker requires full reindex"), DB.RequiresFullReindex());
+		DB.SetMeta(TEXT("parser_version"), TEXT("2"));
+		TestFalse(TEXT("current schema and parser are usable"), DB.RequiresFullReindex());
+		DB.SetMeta(TEXT("parser_version"), TEXT("1"));
+		TestTrue(TEXT("old parser requires explicit full reindex"), DB.RequiresFullReindex());
+		DB.SetMeta(TEXT("parser_version"), TEXT("2"));
 		DB.SetMeta(TEXT("schema_version"), TEXT("2"));
 		DB.CreateTablesIfNeeded();
 		TestTrue(TEXT("old schema requires explicit full reindex"), DB.RequiresFullReindex());
@@ -203,6 +208,8 @@ bool FProjectReplacementCleanupAndRollbackTest::RunTest(const FString& /*Paramet
 		Current = DB.GetDeprecation(TEXT("CurrentUnresolved"));
 		TestTrue(TEXT("rollback preserves current deprecation"), Current.IsSet());
 		TestEqual(TEXT("rollback removes uncommitted replacement"), DB.GetModuleStats(TEXT("Temporary")).IsSet(), false);
+		TestTrue(TEXT("repeated rollback is idempotent"), DB.RollbackTransaction());
+		TestFalse(TEXT("repeated rollback leaves no operation error"), DB.HasOperationError());
 		DB.Close();
 	}
 	IFileManager::Get().Delete(*DbPath, /*bRequireExists=*/false, /*bEvenReadOnly=*/true);
@@ -334,6 +341,44 @@ bool FIndexerProjectReplacementIdentityTest::RunTest(const FString& /*Parameters
 		TestEqual(TEXT("inheritance rows do not grow"), Scalar(DB, TEXT("SELECT COUNT(*) FROM inheritance;")), FirstInheritanceCount);
 		TestEqual(TEXT("no orphan inheritance edges"), Scalar(DB, TEXT("SELECT COUNT(*) FROM inheritance i LEFT JOIN symbols c ON c.id=i.child_id LEFT JOIN symbols p ON p.id=i.parent_id WHERE c.id IS NULL OR p.id IS NULL;")), FirstOrphanInheritance);
 		TestEqual(TEXT("no orphan reference edges"), Scalar(DB, TEXT("SELECT COUNT(*) FROM \"references\" r LEFT JOIN symbols f ON f.id=r.from_symbol_id LEFT JOIN symbols t ON t.id=r.to_symbol_id WHERE (r.from_symbol_id != 0 AND f.id IS NULL) OR t.id IS NULL;")), FirstOrphanReferences);
+	}
+	DB.Close();
+
+	// A preserved Engine class can share a short name with a project class.
+	// Reindex must attach the project base to the newly inserted project ID.
+	FMonolithSourceDatabase Writer;
+	TestTrue(TEXT("open collision fixture for writing"), Writer.OpenForWriting(DbPath));
+	const int64 EngineModule = Writer.InsertModule(TEXT("Engine"), TEXT("C:/Engine/Source/Runtime/Engine"), TEXT("Engine"));
+	const int64 EngineFile = Writer.InsertFile(TEXT("C:/Engine/Source/Runtime/Engine/Collision.h"), EngineModule, TEXT("header"), 4, 1.0);
+	const int64 EngineCollisionId = Writer.InsertSymbol(TEXT("FFixtureDerived"), TEXT("Engine::FFixtureDerived"),
+		TEXT("class"), EngineFile, 1, 4, 0, TEXT("public"), TEXT("class FFixtureDerived"), TEXT(""), false);
+	TestTrue(TEXT("engine collision fixture inserted"), EngineCollisionId > 0 && !Writer.HasOperationError());
+	Writer.Close();
+
+	TestTrue(TEXT("reindex with Engine class name collision succeeds"), RunIndexer(false));
+	TestTrue(TEXT("reopen class collision index"), DB.Open(DbPath));
+	const TArray<FMonolithSourceSymbol> CollisionRows = DB.GetSymbolsByName(TEXT("FFixtureDerived"), TEXT("class"));
+	const TArray<FMonolithSourceSymbol> CurrentBaseRows = DB.GetSymbolsByName(TEXT("FFixtureBase"), TEXT("class"));
+	TestEqual(TEXT("engine and project classes both survive"), CollisionRows.Num(), 2);
+	TestEqual(TEXT("current base class survives"), CurrentBaseRows.Num(), 1);
+	if (CollisionRows.Num() == 2 && CurrentBaseRows.Num() == 1)
+	{
+		int64 ProjectChildId = 0;
+		for (const FMonolithSourceSymbol& Row : CollisionRows)
+		{
+			if (Row.Id != EngineCollisionId) ProjectChildId = Row.Id;
+		}
+		TestTrue(TEXT("project child identity remains distinct"), ProjectChildId > 0);
+		if (ProjectChildId > 0)
+		{
+			const TArray<FMonolithSourceInheritance> ProjectParents = DB.GetParents(ProjectChildId);
+			TestEqual(TEXT("project child inherits one base despite name collision"), ProjectParents.Num(), 1);
+			if (ProjectParents.Num() == 1)
+			{
+				TestEqual(TEXT("project inheritance uses current project base"), ProjectParents[0].Id, CurrentBaseRows[0].Id);
+			}
+		}
+		TestEqual(TEXT("engine class receives no project inheritance"), DB.GetParents(EngineCollisionId).Num(), 0);
 	}
 	DB.Close();
 	IFileManager::Get().DeleteDirectory(*ProjectRoot, false, true);
@@ -691,6 +736,130 @@ bool FCppErgoSignatureCompactionTest::RunTest(const FString& /*Parameters*/)
 		TestFalse(TEXT("macro no brace"), Sig.Contains(TEXT("{")));
 	}
 
+	return true;
+}
+
+// ---------------------------------------------------------------------------
+// Qualified lookups must keep overloads from the requested owner only, in both
+// the public handler and the shared first-signature composition path.
+// ---------------------------------------------------------------------------
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FCppErgoQualifiedSignatureOwnerTest,
+	"Monolith.Source.CppErgonomics.QualifiedSignatureOwner",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FCppErgoQualifiedSignatureOwnerTest::RunTest(const FString& /*Parameters*/)
+{
+	using namespace MonolithCppErgoTestDetail;
+	const FString DbPath = MakeTempDbPath();
+	FMonolithSourceDatabase DB;
+	if (!TestTrue(TEXT("OpenForWriting"), DB.OpenForWriting(DbPath))) return false;
+	if (!TestTrue(TEXT("CreateTablesIfNeeded"), DB.CreateTablesIfNeeded())) return false;
+
+	const FString HeaderPath = GetFixtureCorpusDir()
+		/ TEXT("Source") / TEXT("CppErgoTestMod") / TEXT("UsageExamples.h");
+	const int64 Module = DB.InsertModule(TEXT("CppErgoTestMod"),
+		GetFixtureCorpusDir(), TEXT("Project"));
+	const int64 File = DB.InsertFile(HeaderPath, Module, TEXT("header"), 21, 1.0);
+	const int64 Owner = DB.InsertSymbol(TEXT("UCppErgoUsage"), TEXT("UCppErgoUsage"),
+		TEXT("class"), File, 15, 21, 0, TEXT("public"),
+		TEXT("class UCppErgoUsage"), TEXT(""), false);
+	DB.InsertSymbol(TEXT("CallMe"), TEXT("UCppErgoUsage::CallMe"), TEXT("function"),
+		File, 20, 20, Owner, TEXT("public"), TEXT("void CallMe(int32 Value);"), TEXT(""), false);
+	DB.InsertSymbol(TEXT("CallMe"), TEXT("UOtherUsage::CallMe"), TEXT("function"),
+		File, 20, 20, 0, TEXT("public"), TEXT("void CallMe(float Value);"), TEXT(""), false);
+	DB.InsertSymbol(TEXT("CallMe"), TEXT("CallMe"), TEXT("function"),
+		File, 20, 20, 0, TEXT("public"), TEXT("void CallMe(double Value);"), TEXT(""), false);
+
+	const TArray<FMonolithSourceActions::FResolvedSignature> Matched =
+		FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UCppErgoUsage::CallMe"), 10);
+	TestEqual(TEXT("qualified lookup returns one owner"), Matched.Num(), 1);
+	if (Matched.Num() == 1)
+	{
+		TestTrue(TEXT("qualified lookup keeps requested declaration"),
+			Matched[0].Signature.Contains(TEXT("int32 Value")));
+	}
+
+	const TArray<FMonolithSourceActions::FResolvedSignature> Other =
+		FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UOtherUsage::CallMe"), 10);
+	TestEqual(TEXT("second owner remains independently queryable"), Other.Num(), 1);
+	if (Other.Num() == 1)
+	{
+		TestTrue(TEXT("second owner signature"), Other[0].Signature.Contains(TEXT("float Value")));
+	}
+	TestEqual(TEXT("bare method query keeps both owners and the unowned function"),
+		FMonolithSourceActions::ResolveSignatures(&DB, TEXT("CallMe"), 10).Num(), 3);
+	TestEqual(TEXT("unknown qualified owner has no signatures"),
+		FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UGhostUsage::CallMe"), 10).Num(), 0);
+
+	// No indexed function row for Run: the owning class range supplies a safe fallback.
+	const TArray<FMonolithSourceActions::FResolvedSignature> Fallback =
+		FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UCppErgoUsage::Run"), 10);
+	TestEqual(TEXT("owning class declaration fallback"), Fallback.Num(), 1);
+	if (Fallback.Num() == 1)
+	{
+		TestEqual(TEXT("fallback source"), Fallback[0].Source, FString(TEXT("declaration_read")));
+		TestTrue(TEXT("fallback declaration"), Fallback[0].Signature.Contains(TEXT("void Run()")));
+	}
+	TestEqual(TEXT("other class cannot borrow declaration fallback"),
+		FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UOtherUsage::Run"), 10).Num(), 0);
+
+	// Legacy index: reject nested members, qualified calls, misleading comment
+	// braces, and longer namespaced owners while retaining real definitions.
+	const FString ScopedPath = FPaths::AutomationTransientDir()
+		/ FString::Printf(TEXT("cppergo-scoped-%s.h"), *FGuid::NewGuid().ToString());
+	const TArray<FString> ScopedLines = {
+		TEXT("class UCppErgoOuter {"),
+		TEXT("public:"),
+		TEXT("  struct FInner {"),
+		TEXT("    void NestedOnly();"),
+		TEXT("  };"),
+		TEXT("  void OuterOnly();"),
+		TEXT("};"),
+		TEXT("void SomeCaller() {"),
+		TEXT("  return UCppErgoOuter::CalledOnly();"),
+		TEXT("  return UCppErgoOuter::CommentBraceCall() /* { */;"),
+		TEXT("}"),
+		TEXT("void UCppErgoOuter::DefinedOutside()"),
+		TEXT("{"),
+		TEXT("}"),
+		TEXT("void Real::UCppErgoOuter::OtherOwnerOnly() { }")
+	};
+	if (TestTrue(TEXT("write scoped fallback fixture"),
+		FFileHelper::SaveStringToFile(FString::Join(ScopedLines, TEXT("\n")) + TEXT("\n"), *ScopedPath)))
+	{
+		const int64 ScopedFile = DB.InsertFile(ScopedPath, Module, TEXT("header"), ScopedLines.Num(), 1.0);
+		DB.InsertSymbol(TEXT("UCppErgoOuter"), TEXT("UCppErgoOuter"), TEXT("class"),
+			ScopedFile, 1, 7, 0, TEXT("public"), TEXT("class UCppErgoOuter"), TEXT(""), false);
+		DB.InsertSourceChunks(ScopedFile, ScopedLines);
+		TestEqual(TEXT("nested type method excluded from owner fallback"),
+			FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UCppErgoOuter::NestedOnly"), 10).Num(), 0);
+		TestEqual(TEXT("direct outer method remains readable"),
+			FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UCppErgoOuter::OuterOnly"), 10).Num(), 1);
+		TestTrue(TEXT("qualified call is indexed for fallback test"),
+			DB.SearchSourceFTS(TEXT("UCppErgoOuter::CalledOnly"), TEXT("all"), 50).Num() > 0);
+		TestEqual(TEXT("qualified call excluded from out-of-line fallback"),
+			FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UCppErgoOuter::CalledOnly"), 10).Num(), 0);
+		TestEqual(TEXT("comment brace cannot turn a call into a definition"),
+			FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UCppErgoOuter::CommentBraceCall"), 10).Num(), 0);
+		TestEqual(TEXT("longer namespaced owner cannot satisfy suffix-only lookup"),
+			FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UCppErgoOuter::OtherOwnerOnly"), 10).Num(), 0);
+		TestEqual(TEXT("complete namespaced out-of-line owner resolves"),
+			FMonolithSourceActions::ResolveSignatures(&DB, TEXT("Real::UCppErgoOuter::OtherOwnerOnly"), 10).Num(), 1);
+		TestTrue(TEXT("qualified definition is indexed for fallback test"),
+			DB.SearchSourceFTS(TEXT("UCppErgoOuter::DefinedOutside"), TEXT("all"), 50).Num() > 0);
+		TestEqual(TEXT("real out-of-line definition remains readable"),
+			FMonolithSourceActions::ResolveSignatures(&DB, TEXT("UCppErgoOuter::DefinedOutside"), 10).Num(), 1);
+	}
+	IFileManager::Get().Delete(*ScopedPath, false, true);
+
+	FString FirstSignature, FirstSource;
+	TestTrue(TEXT("first signature resolves matching owner"),
+		FMonolithSourceActions::ResolveFirstSignature(
+			&DB, TEXT("UCppErgoUsage::CallMe"), FirstSignature, FirstSource));
+	TestTrue(TEXT("first signature has expected argument"), FirstSignature.Contains(TEXT("int32 Value")));
+	DB.Close();
+	IFileManager::Get().Delete(*DbPath, false, true);
 	return true;
 }
 

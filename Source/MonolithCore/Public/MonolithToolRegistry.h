@@ -91,6 +91,16 @@ struct FMonolithDispatcherAnnotations
 	}
 };
 
+/** One lock-consistent view of registry metadata and live handler binding. */
+struct FMonolithMetadataSnapshot
+{
+	int32 TotalActions = 0;
+	int32 NamespaceCount = 0;
+	FString MetadataGeneration;
+	FString MetadataGenerationError;
+	TArray<FString> UnavailableActions;
+};
+
 /**
  * Central registry for all Monolith tool actions.
  * Domain modules register actions here. The HTTP server dispatches through this.
@@ -138,6 +148,9 @@ public:
 	/** Get total number of registered actions */
 	int32 GetActionCount() const;
 
+	/** Capture counts, metadata generation and live unbound-handler names under one registry lock. */
+	FMonolithMetadataSnapshot GetMetadataSnapshot() const;
+
 	/**
 	 * Survivor A (plan §3.A) — Set MCP hint annotations for a namespace dispatcher
 	 * tool (e.g. `source_query`). These are serialized into `tools/list` under the
@@ -173,6 +186,21 @@ public:
 		bool bIdempotent,
 		const FString& Title);
 
+#if WITH_DEV_AUTOMATION_TESTS
+	/** Test seam for the canonical structural encoder; does not inspect or mutate the live registry. */
+	static bool ComputeStructuralDigestForTesting(
+		const TArray<FMonolithActionInfo>& InActions,
+		const TMap<FString, FMonolithDispatcherAnnotations>& InDispatcherAnnotations,
+		FString& OutDigest,
+		FString& OutError);
+
+	/** Number of structural encoding attempts; used to prove unchanged snapshots reuse the memoized digest. */
+	uint64 GetStructuralDigestComputationCountForTesting() const;
+
+	/** Number of handler IsBound samples taken by metadata snapshots. */
+	uint64 GetHandlerBindingSampleCountForTesting() const;
+#endif
+
 private:
 	FMonolithToolRegistry() = default;
 
@@ -191,10 +219,23 @@ private:
 	/** Survivor A — Map of namespace → dispatcher-level MCP hint annotations. */
 	TMap<FString, FMonolithDispatcherAnnotations> DispatcherAnnotations;
 
+	/** Memoized canonical structural digest; all fields below are protected by RegistryLock. */
+	mutable bool bMetadataStructuralDigestDirty = true;
+	mutable bool bMetadataStructuralDigestValid = false;
+	mutable FString CachedMetadataStructuralDigest;
+	mutable FString CachedMetadataStructuralDigestError;
+#if WITH_DEV_AUTOMATION_TESTS
+	mutable uint64 MetadataStructuralDigestComputationCount = 0;
+	mutable uint64 MetadataHandlerBindingSampleCount = 0;
+#endif
+
 	static FString MakeKey(const FString& Namespace, const FString& Action)
 	{
 		return Namespace + TEXT(".") + Action;
 	}
+
+	void InvalidateMetadataStructuralDigest();
+	bool ComputeMetadataStructuralDigest(FString& OutDigest, FString& OutError) const;
 
 	mutable FCriticalSection RegistryLock;
 };

@@ -1028,6 +1028,7 @@ bool FMonolithSourceDatabase::CreateTablesIfNeeded()
 		MarkOperationErrorLocked(TEXT("CreateTablesIfNeeded: DDL_Tables failed"));
 		return false;
 	}
+
 	if (!ExecuteMulti(*Database, MonolithSourceSchema::DDL_FTS))
 	{
 		UE_LOG(LogMonolithSource, Error, TEXT("CreateTablesIfNeeded: DDL_FTS failed — %s"), *Database->GetLastError());
@@ -1221,6 +1222,12 @@ bool FMonolithSourceDatabase::RollbackTransaction()
 		MarkOperationErrorLocked(TEXT("RollbackTransaction: database unavailable"));
 		return false;
 	}
+	// A nested indexing stage may have already rolled back the outer replacement.
+	// Repeating cleanup must not execute a second ROLLBACK with no transaction.
+	if (TransactionDepth == 0)
+	{
+		return true;
+	}
 	TransactionDepth = 0;
 	if (!Database->Execute(TEXT("ROLLBACK;")))
 	{
@@ -1232,77 +1239,17 @@ bool FMonolithSourceDatabase::RollbackTransaction()
 
 bool FMonolithSourceDatabase::BeginProjectReplacement(const FString& ProjectRoot)
 {
-	FScopeLock Lock(&DbLock);
-	if (!Database || !Database->IsValid())
+	// A single outer transaction protects both the purge and all replacement rows.
+	// Select by actual file path so removed modules and plugin roots are included.
+	if (!BeginTransaction())
 	{
-		MarkOperationErrorLocked(TEXT("BeginProjectReplacement: database unavailable"));
 		return false;
 	}
-	if (TransactionDepth++ == 0 && !Database->Execute(TEXT("BEGIN;")))
+	const TArray<FString> Roots = { ProjectRoot / TEXT("Source"), ProjectRoot / TEXT("Plugins") };
+	if (PurgeFilesUnderPaths(Roots) < 0 || HasOperationError())
 	{
-		TransactionDepth = 0;
-		MarkOperationErrorLocked(TEXT("BeginProjectReplacement: BEGIN failed"));
+		RollbackTransaction();
 		return false;
-	}
-
-	FString Root = ProjectRoot;
-	while (Root.EndsWith(TEXT("/"))) Root.LeftChopInline(1);
-	const FString SourcePrefix = Root + TEXT("/Source/%");
-	const FString PluginsPrefix = Root + TEXT("/Plugins/%/Source/%");
-	const FString SourcePrefixWin = SourcePrefix.Replace(TEXT("/"), TEXT("\\"));
-	const FString PluginsPrefixWin = PluginsPrefix.Replace(TEXT("/"), TEXT("\\"));
-	const TCHAR* ProjectModuleWhere =
-		TEXT("m.path LIKE ? OR m.path LIKE ? OR m.path LIKE ? OR m.path LIKE ?");
-
-	// Delete dependent rows before files/modules. The symbols delete trigger keeps
-	// symbols_fts consistent, while source_fts is contentless and needs explicit
-	// cleanup. All statements run inside the same replacement transaction.
-	const FString DeleteRefs = FString::Printf(
-		TEXT("DELETE FROM \"references\" WHERE file_id IN (SELECT f.id FROM files f JOIN modules m ON m.id=f.module_id WHERE %s) OR from_symbol_id IN (SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id JOIN modules m ON m.id=f.module_id WHERE %s) OR to_symbol_id IN (SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere, ProjectModuleWhere, ProjectModuleWhere);
-	const FString DeleteInheritance = FString::Printf(
-		TEXT("DELETE FROM inheritance WHERE child_id IN (SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id JOIN modules m ON m.id=f.module_id WHERE %s) OR parent_id IN (SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere, ProjectModuleWhere);
-	const FString DeleteDeprecations = FString::Printf(
-		TEXT("DELETE FROM symbol_deprecations WHERE file_id IN (SELECT f.id FROM files f JOIN modules m ON m.id=f.module_id WHERE %s) OR symbol_id IN (SELECT s.id FROM symbols s JOIN files f ON f.id=s.file_id JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere, ProjectModuleWhere);
-	const FString DeleteFts = FString::Printf(
-		TEXT("DELETE FROM source_fts WHERE file_id IN (SELECT f.id FROM files f JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere);
-	const FString DeleteIncludes = FString::Printf(
-		TEXT("DELETE FROM includes WHERE file_id IN (SELECT f.id FROM files f JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere);
-	const FString DeleteSymbols = FString::Printf(
-		TEXT("DELETE FROM symbols WHERE file_id IN (SELECT f.id FROM files f JOIN modules m ON m.id=f.module_id WHERE %s);"), ProjectModuleWhere);
-	const FString DeleteFiles = FString::Printf(
-		TEXT("DELETE FROM files WHERE module_id IN (SELECT m.id FROM modules m WHERE %s);"), ProjectModuleWhere);
-	const FString DeleteModules = FString::Printf(
-		TEXT("DELETE FROM modules WHERE path LIKE ? OR path LIKE ? OR path LIKE ? OR path LIKE ?;"));
-
-	const TArray<FString> Statements = { DeleteRefs, DeleteInheritance, DeleteDeprecations,
-		DeleteFts, DeleteIncludes, DeleteSymbols, DeleteFiles, DeleteModules };
-	for (const FString& Sql : Statements)
-	{
-		FSQLitePreparedStatement Stmt;
-		if (!Stmt.Create(*Database, *Sql))
-		{
-			TransactionDepth = 0;
-			Database->Execute(TEXT("ROLLBACK;"));
-			MarkOperationErrorLocked(TEXT("BeginProjectReplacement: prepare cleanup statement"));
-			return false;
-		}
-		const int32 PredicateCount = Sql.Contains(TEXT("OR parent_id")) ? 2
-			: (Sql.Contains(TEXT("OR from_symbol_id")) ? 3
-			: (Sql.Contains(TEXT("OR symbol_id")) ? 2 : 1));
-		const TArray<FString> Patterns = { SourcePrefix, PluginsPrefix, SourcePrefixWin, PluginsPrefixWin };
-		int32 Index = 1;
-		const int32 PatternCount = PredicateCount * Patterns.Num();
-		for (; Index <= PatternCount; ++Index)
-		{
-			Stmt.SetBindingValueByIndex(Index, Patterns[(Index - 1) % Patterns.Num()]);
-		}
-		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Error)
-		{
-			TransactionDepth = 0;
-			Database->Execute(TEXT("ROLLBACK;"));
-			MarkOperationErrorLocked(TEXT("BeginProjectReplacement: cleanup statement failed"));
-			return false;
-		}
 	}
 	return true;
 }
@@ -1312,8 +1259,9 @@ bool FMonolithSourceDatabase::RequiresFullReindex() const
 	FScopeLock Lock(&DbLock);
 	if (!Database || !Database->IsValid()) return true;
 	FSQLitePreparedStatement Stmt;
-	if (!Stmt.Create(*Database, TEXT("SELECT key, value FROM meta WHERE key IN ('schema_version','requires_full_reindex');"))) return true;
+	if (!Stmt.Create(*Database, TEXT("SELECT key, value FROM meta WHERE key IN ('schema_version','parser_version','requires_full_reindex');"))) return true;
 	FString SchemaValue;
+	FString ParserValue;
 	FString RequiredValue;
 	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
@@ -1322,10 +1270,13 @@ bool FMonolithSourceDatabase::RequiresFullReindex() const
 		Stmt.GetColumnValueByIndex(0, Key);
 		Stmt.GetColumnValueByIndex(1, Value);
 		if (Key == TEXT("schema_version")) SchemaValue = Value;
+		else if (Key == TEXT("parser_version")) ParserValue = Value;
 		else if (Key == TEXT("requires_full_reindex")) RequiredValue = Value;
 	}
 	return SchemaValue.IsEmpty()
 		|| FCString::Atoi(*SchemaValue) != MonolithSourceSchema::SchemaVersion
+		|| ParserValue.IsEmpty()
+		|| FCString::Atoi(*ParserValue) != MonolithSourceSchema::ParserVersion
 		|| RequiredValue == TEXT("1");
 }
 
@@ -1454,7 +1405,14 @@ int64 FMonolithSourceDatabase::InsertFile(const FString& FilePath, int64 ModuleI
 			MarkOperationErrorLocked(TEXT("InsertFile: prepare metadata update"));
 			return 0;
 		}
-		UpdateStmt.SetBindingValueByIndex(1, ModuleId);
+		if (ModuleId != 0)
+		{
+			UpdateStmt.SetBindingValueByIndex(1, ModuleId);
+		}
+		else
+		{
+			UpdateStmt.SetBindingValueByIndex(1); // NULL for files without a module.
+		}
 		UpdateStmt.SetBindingValueByIndex(2, FileType);
 		UpdateStmt.SetBindingValueByIndex(3, static_cast<int64>(LineCount));
 		UpdateStmt.SetBindingValueByIndex(4, LastModified);
@@ -1474,7 +1432,11 @@ int64 FMonolithSourceDatabase::InsertFile(const FString& FilePath, int64 ModuleI
 		return 0;
 	}
 	InsStmt.SetBindingValueByIndex(1, FilePath);
-	InsStmt.SetBindingValueByIndex(2, ModuleId);
+	if (ModuleId != 0)
+	{
+		InsStmt.SetBindingValueByIndex(2, ModuleId);
+	}
+	// else: leave unbound — SQLite defaults to NULL
 	InsStmt.SetBindingValueByIndex(3, FileType);
 	InsStmt.SetBindingValueByIndex(4, static_cast<int64>(LineCount));
 	InsStmt.SetBindingValueByIndex(5, LastModified);
@@ -1889,6 +1851,38 @@ TMap<FString, FMonolithDeprecationRow> FMonolithSourceDatabase::GetDeprecationsB
 	return Result;
 }
 
+TArray<FMonolithDeprecationRow> FMonolithSourceDatabase::GetDeprecationRows(const FString& SymbolName)
+{
+	FScopeLock Lock(&DbLock);
+	TArray<FMonolithDeprecationRow> Result;
+	if (!Database || !Database->IsValid()) return Result;
+
+	FSQLitePreparedStatement Stmt;
+	Stmt.Create(*Database, TEXT("SELECT d.version, d.message, d.kind, COALESCE(s.qualified_name, '') FROM symbol_deprecations d LEFT JOIN symbols s ON s.id = d.symbol_id WHERE d.symbol_name = ? ORDER BY d.id;"));
+	Stmt.SetBindingValueByIndex(1, SymbolName);
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FMonolithDeprecationRow Row;
+		Stmt.GetColumnValueByIndex(0, Row.Version);
+		Stmt.GetColumnValueByIndex(1, Row.Message);
+		Stmt.GetColumnValueByIndex(2, Row.Kind);
+		Stmt.GetColumnValueByIndex(3, Row.LinkedQualifiedName);
+		Result.Add(MoveTemp(Row));
+	}
+	return Result;
+}
+
+bool FMonolithSourceDatabase::HasSymbolNamed(const FString& Name)
+{
+	FScopeLock Lock(&DbLock);
+	if (!Database || !Database->IsValid()) return false;
+
+	FSQLitePreparedStatement Stmt;
+	Stmt.Create(*Database, TEXT("SELECT 1 FROM symbols WHERE name = ? LIMIT 1;"));
+	Stmt.SetBindingValueByIndex(1, Name);
+	return Stmt.Step() == ESQLitePreparedStatementStepResult::Row;
+}
+
 int32 FMonolithSourceDatabase::GetDeprecationCount()
 {
 	FScopeLock Lock(&DbLock);
@@ -1990,4 +1984,225 @@ int32 FMonolithSourceDatabase::LoadExistingSymbols(
 		Count, OutClassNameToId.Num());
 
 	return Count;
+}
+
+// ============================================================
+// Incremental purge — drop every row derived from files under the given roots
+// ============================================================
+
+int32 FMonolithSourceDatabase::PurgeFilesUnderPaths(const TArray<FString>& RootDirs)
+{
+	FScopeLock Lock(&DbLock);
+	if (!Database || !Database->IsValid())
+	{
+		MarkOperationErrorLocked(TEXT("PurgeFilesUnderPaths: database unavailable"));
+		return -1;
+	}
+
+	// Normalise each root to "<dir>/" so "Source" never prefix-matches "SourceOld".
+	TArray<FString> Prefixes;
+	for (const FString& Root : RootDirs)
+	{
+		FString Prefix = Root;
+		FPaths::NormalizeDirectoryName(Prefix);   // backslashes -> '/', trailing slash stripped
+		if (Prefix.IsEmpty()) continue;
+		Prefix += TEXT("/");
+		Prefixes.Add(Prefix);
+	}
+	if (Prefixes.Num() == 0) return 0;
+
+	// sqlite3_changes() for the most recent statement on this connection.
+	auto LastChanges = [this]() -> int32
+	{
+		FSQLitePreparedStatement ChangesStmt;
+		if (!ChangesStmt.Create(*Database, TEXT("SELECT changes();")))
+		{
+			return -1;
+		}
+		int64 Changes = 0;
+		if (ChangesStmt.Step() != ESQLitePreparedStatementStepResult::Row)
+		{
+			return -1;
+		}
+		ChangesStmt.GetColumnValueByIndex(0, Changes);
+		return static_cast<int32>(Changes);
+	};
+
+	// Executes one statement and returns the rows it changed, or -1 on error.
+	auto ExecCounted = [this, &LastChanges](const TCHAR* SQL) -> int32
+	{
+		if (!Database->Execute(SQL))
+		{
+			UE_LOG(LogMonolithSource, Error, TEXT("PurgeFilesUnderPaths: '%s' failed — %s"), SQL, *Database->GetLastError());
+			return -1;
+		}
+		return LastChanges();
+	};
+
+	// Id sets live in connection-private TEMP tables so every DELETE below is one
+	// set-based statement probing an INTEGER PRIMARY KEY, not a per-row loop.
+	if (!Database->Execute(TEXT("CREATE TEMP TABLE IF NOT EXISTS purge_files (id INTEGER PRIMARY KEY);"))
+		|| !Database->Execute(TEXT("CREATE TEMP TABLE IF NOT EXISTS purge_symbols (id INTEGER PRIMARY KEY);")))
+	{
+		UE_LOG(LogMonolithSource, Error, TEXT("PurgeFilesUnderPaths: temp table creation failed — %s"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("PurgeFilesUnderPaths: create temporary tables"));
+		return -1;
+	}
+
+	// BeginProjectReplacement already owns a transaction. Its caller commits or
+	// rolls back after all replacement rows and metadata have been written.
+	const bool bOwnTransaction = TransactionDepth == 0;
+	if (bOwnTransaction && !Database->Execute(TEXT("BEGIN;")))
+	{
+		UE_LOG(LogMonolithSource, Error, TEXT("PurgeFilesUnderPaths: BEGIN failed — %s"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("PurgeFilesUnderPaths: BEGIN failed"));
+		return -1;
+	}
+	if (bOwnTransaction)
+	{
+		TransactionDepth = 1;
+	}
+
+	bool bOk = Database->Execute(TEXT("DELETE FROM purge_files;"))
+		&& Database->Execute(TEXT("DELETE FROM purge_symbols;"));
+
+	// Collect the file set. Paths are compared with '\' folded to '/' and ASCII
+	// case folded on both sides, so a root spelled differently from the stored
+	// paths (drive-letter case, separators) still matches.
+	for (int32 i = 0; bOk && i < Prefixes.Num(); ++i)
+	{
+		FSQLitePreparedStatement Stmt;
+		bOk = Stmt.Create(*Database,
+			TEXT("INSERT OR IGNORE INTO purge_files (id) SELECT id FROM files ")
+			TEXT("WHERE lower(substr(replace(path, '\\', '/'), 1, ?)) = lower(?);"));
+		if (!bOk)
+		{
+			break;
+		}
+		Stmt.SetBindingValueByIndex(1, static_cast<int64>(Prefixes[i].Len()));
+		Stmt.SetBindingValueByIndex(2, Prefixes[i]);
+		bOk = (Stmt.Step() == ESQLitePreparedStatementStepResult::Done);
+	}
+
+	if (bOk)
+	{
+		bOk = Database->Execute(TEXT("INSERT INTO purge_symbols (id) SELECT id FROM symbols WHERE file_id IN (SELECT id FROM purge_files);"));
+	}
+
+	int32 FileCount = 0;
+	int32 SymbolCount = 0;
+	if (bOk)
+	{
+		FSQLitePreparedStatement CountStmt;
+		bOk = CountStmt.Create(*Database, TEXT("SELECT (SELECT COUNT(*) FROM purge_files), (SELECT COUNT(*) FROM purge_symbols);"));
+		if (bOk && CountStmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			int64 F = 0, S = 0;
+			CountStmt.GetColumnValueByIndex(0, F);
+			CountStmt.GetColumnValueByIndex(1, S);
+			FileCount = static_cast<int32>(F);
+			SymbolCount = static_cast<int32>(S);
+		}
+		else
+		{
+			bOk = false;
+		}
+	}
+
+	int32 RefCount = 0, InhCount = 0, IncCount = 0, FtsCount = 0, DepCount = 0, ModCount = 0, Reparented = 0;
+	auto Accumulate = [&bOk](int32 Changes, int32& Into)
+	{
+		if (Changes < 0) { bOk = false; return; }
+		Into += Changes;
+	};
+
+	if (bOk && FileCount > 0)
+	{
+		// references are split three ways so the from/to halves use idx_refs_from /
+		// idx_refs_to. Type references carry from_symbol_id = 0 and are reachable
+		// only through file_id.
+		Accumulate(ExecCounted(TEXT("DELETE FROM \"references\" WHERE from_symbol_id IN (SELECT id FROM purge_symbols);")), RefCount);
+		if (bOk) Accumulate(ExecCounted(TEXT("DELETE FROM \"references\" WHERE to_symbol_id IN (SELECT id FROM purge_symbols);")), RefCount);
+		if (bOk) Accumulate(ExecCounted(TEXT("DELETE FROM \"references\" WHERE file_id IN (SELECT id FROM purge_files);")), RefCount);
+		if (bOk) Accumulate(ExecCounted(TEXT("DELETE FROM inheritance WHERE child_id IN (SELECT id FROM purge_symbols) OR parent_id IN (SELECT id FROM purge_symbols);")), InhCount);
+		// Rows written before schema v3 have file_id NULL; the symbol_id arm still
+		// reaches the linked ones. Unlinked legacy rows are cleared by a full reindex.
+		if (bOk) Accumulate(ExecCounted(TEXT("DELETE FROM symbol_deprecations WHERE file_id IN (SELECT id FROM purge_files) OR symbol_id IN (SELECT id FROM purge_symbols);")), DepCount);
+		if (bOk) Accumulate(ExecCounted(TEXT("DELETE FROM includes WHERE file_id IN (SELECT id FROM purge_files);")), IncCount);
+		// source_fts.file_id is UNINDEXED, so this scans the FTS content table once.
+		if (bOk) Accumulate(ExecCounted(TEXT("DELETE FROM source_fts WHERE file_id IN (SELECT id FROM purge_files);")), FtsCount);
+		// Survivors must not keep a parent id that is about to disappear.
+		if (bOk) Accumulate(ExecCounted(TEXT("UPDATE symbols SET parent_symbol_id = NULL WHERE parent_symbol_id IN (SELECT id FROM purge_symbols) AND id NOT IN (SELECT id FROM purge_symbols);")), Reparented);
+		// symbols_ad keeps symbols_fts in sync for each deleted row.
+		if (bOk) bOk = ExecCounted(TEXT("DELETE FROM symbols WHERE id IN (SELECT id FROM purge_symbols);")) >= 0;
+		if (bOk) bOk = ExecCounted(TEXT("DELETE FROM files WHERE id IN (SELECT id FROM purge_files);")) >= 0;
+	}
+
+	// Modules at or under the roots that no longer own any file. This also removes
+	// modules and plugins that were deleted from disk entirely.
+	for (int32 i = 0; bOk && i < Prefixes.Num(); ++i)
+	{
+		FSQLitePreparedStatement Stmt;
+		bOk = Stmt.Create(*Database,
+			TEXT("DELETE FROM modules ")
+			TEXT("WHERE (lower(substr(replace(path, '\\', '/'), 1, ?)) = lower(?) OR lower(replace(path, '\\', '/')) = lower(?)) ")
+			TEXT("AND id NOT IN (SELECT module_id FROM files WHERE module_id IS NOT NULL);"));
+		if (!bOk)
+		{
+			break;
+		}
+		Stmt.SetBindingValueByIndex(1, static_cast<int64>(Prefixes[i].Len()));
+		Stmt.SetBindingValueByIndex(2, Prefixes[i]);
+		Stmt.SetBindingValueByIndex(3, Prefixes[i].LeftChop(1));
+		bOk = (Stmt.Step() == ESQLitePreparedStatementStepResult::Done);
+		Stmt.Destroy();
+		if (bOk)
+		{
+			const int32 Changes = LastChanges();
+			bOk = Changes >= 0;
+			if (bOk) ModCount += Changes;
+		}
+	}
+
+	if (bOk)
+	{
+		bOk = Database->Execute(TEXT("DELETE FROM purge_files;"))
+			&& Database->Execute(TEXT("DELETE FROM purge_symbols;"));
+	}
+	if (!bOk)
+	{
+		UE_LOG(LogMonolithSource, Error, TEXT("PurgeFilesUnderPaths: failed — %s; rolling back"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("PurgeFilesUnderPaths: purge failed"));
+		if (bOwnTransaction)
+		{
+			TransactionDepth = 0;
+			if (!Database->Execute(TEXT("ROLLBACK;")))
+			{
+				MarkOperationErrorLocked(TEXT("PurgeFilesUnderPaths: rollback failed"));
+			}
+		}
+		return -1;
+	}
+
+	if (bOwnTransaction && !Database->Execute(TEXT("COMMIT;")))
+	{
+		UE_LOG(LogMonolithSource, Error, TEXT("PurgeFilesUnderPaths: COMMIT failed — %s; rolling back"), *Database->GetLastError());
+		MarkOperationErrorLocked(TEXT("PurgeFilesUnderPaths: COMMIT failed"));
+		TransactionDepth = 0;
+		if (!Database->Execute(TEXT("ROLLBACK;")))
+		{
+			MarkOperationErrorLocked(TEXT("PurgeFilesUnderPaths: rollback failed"));
+		}
+		return -1;
+	}
+	if (bOwnTransaction)
+	{
+		TransactionDepth = 0;
+	}
+
+	UE_LOG(LogMonolithSource, Log,
+		TEXT("PurgeFilesUnderPaths: purged %d files, %d symbols, %d references, %d inheritance, %d includes, %d source chunks, %d deprecations, %d modules (%d symbols re-parented)"),
+		FileCount, SymbolCount, RefCount, InhCount, IncCount, FtsCount, DepCount, ModCount, Reparented);
+
+	return FileCount;
 }

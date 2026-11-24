@@ -74,6 +74,9 @@ description: Use when inspecting or editing Unreal animation assets via Monolith
 | `remove_virtual_bones` | `asset_path`, `bones` | Remove virtual bones |
 | `get_skeleton_info` | `asset_path` | Bone hierarchy, sockets, virtual bones |
 | `get_skeletal_mesh_info` | `asset_path` | Mesh details, LODs, materials |
+| **Physics Assets** | | |
+| `get_physics_asset_info` | `asset_path` | Bodies, constraints, profiles, solver settings |
+| `set_constraint_properties` | `asset_path`, `collision_pair_only`?, `bone_1`, `bone_2`, `disable_collision` | With `collision_pair_only: true`, toggle collision for the exact body pair, including nonadjacent bodies such as `thigh` and `pelvis`; the action does not require a joint between them |
 | **IKRig** | | |
 | `get_ikrig_info` | `asset_path` | Solvers, goals, chains, skeleton |
 | `add_ik_solver` | `asset_path`, `solver_type`, `root_bone`?, `goals`? | Add solver + goals. `solver_type` accepts a friendly alias (`fullbodyik`/`fbik`, `limb`, `pole`, …), exact struct name, or unique substring — Full Body IK now resolves (`root_bone` meaningful for FBIK) |
@@ -100,6 +103,18 @@ animation_query({ action: "add_montage_section", params: { asset_path: "/Game/An
 animation_query({ action: "set_section_next", params: { asset_path: "/Game/Animations/AM_Attack", section: "Intro", next: "Loop" } })
 ```
 
+### Toggle collision for a nonadjacent physics-body pair
+```
+animation_query({ action: "set_constraint_properties", params: {
+  asset_path: "<WolfPA asset path>",
+  collision_pair_only: true,
+  bone_1: "thigh",
+  bone_2: "pelvis",
+  disable_collision: true
+} })
+```
+`<WolfPA asset path>` is a placeholder for the mounted asset path, and bone names must match the asset exactly. `collision_pair_only` defaults to `false`. When true, both bone names must resolve to distinct bodies and `disable_collision` must be supplied explicitly. Do not include `constraint_index` or angular/linear constraint-profile parameters. The action refuses edits while PIE or Simulate in Editor is active or queued, and returns the body indices plus collision-table membership read back through `UPhysicsAsset::IsCollisionEnabled`.
+
 ## Posed Skeletal-Mesh Capture (editor:: action)
 
 `editor_query("capture_scene_preview", { asset_path: "/Game/.../SK_Char", asset_type: "skeletal_mesh", animation_path: "/Game/.../A_Idle", seek_time: 0.5 })` renders the skeletal mesh at the requested pose (omit `animation_path` for rest pose). Useful for visually verifying retarget output, montage section poses, or sequence keyframes. See `monolith_guide(section="recipes")` entry "Visual introspection — going beyond thumbnails".
@@ -113,8 +128,21 @@ animation_query({ action: "set_section_next", params: { asset_path: "/Game/Anima
 - ABP write actions are **EXPERIMENTAL** -- always compile after and check for errors
 - `set_retarget_chain_mapping`: `auto_map: true` for automatic OR explicit `source_chain`+`target_chain`
 - `add_control_rig_element`: `animatable` uses `IsAnimatable()` internally -- not a raw bool field
+- `set_constraint_properties`: omit `collision_pair_only` or set it to `false` for the existing constraint-profile behavior; pair-only mode requires an explicit boolean `disable_collision` and exact distinct body bone names
 - Blend space mutators (`add/edit/delete_blendspace_sample`, `set_blend_space_axis`) now auto-bake the triangulation (`ResampleData`) after each edit, so MCP-authored blend spaces no longer ship empty and A-pose at runtime. For blend spaces authored externally or before this fix, call `bake_blend_space` once to repair. In grid mode (`use_grid: true`) an empty triangulation / `has_blendspace_data: false` is correct, not a failure
 - `add_ik_solver`: `solver_type` resolves against the live solver-struct table (alias -> exact struct name -> unique substring); an ambiguous value returns the candidate list. Full Body IK now adds correctly
 - `auto_layout`: use `formatter: "builtin"` (also the `"auto"` fallback) for a dependency-aware anim-graph layout that works WITHOUT Blueprint Assist, so layout works in release builds where Blueprint Assist is compiled out
 - `set_anim_node_pin_binding` now bootstraps the binding object on previously-unbound nodes, so it works on a node that has no binding yet instead of refusing it
 - `set_transition_rule`: pass a structured `rule` object instead of authoring rule-graph nodes by hand — `kind` is `bool` / `auto` / `compare` / `expression`. The `expression` kind builds compound multi-term conditions (`terms: [{ lhs, op, rhs, abs?, negate? }]` folded through Boolean AND/OR via `combine`); `get_transition_rule` decodes any rule back
+
+## Read-only locomotion/contact analysis (I04)
+
+`animation.analyze_locomotion` is implemented for project UE5.8.1 in pending CL1518; cold build, focused fixtures and representative read-only reports passed. Owner acceptance/submission remain separate. Inspect its live schema before use; registration in source alone does not prove availability in the running editor.
+
+1. Read `get_sequence_info` and `get_skeleton_info`; select one non-additive sequence and explicit left/right foot bones. Do not assume common names or interpret skeleton membership as successful pose evaluation.
+2. Request a summary at a fixed sample rate (default 30Hz). Optionally bound `start_time`/`end_time`; the full request must fit the 2048-sample limit. Leave `include_samples=false` until detailed trajectories are useful.
+3. Inspect root path/net displacement, foot-height/speed summaries, authored contact evidence and geometric candidates separately. The height baseline is the lowest sampled foot position, not a traced gameplay floor.
+4. Inspect sliding availability before interpreting suspect intervals. Root-locked/in-place/disabled-motion cases have no actor-motion basis and cannot establish gameplay sliding.
+5. For useful findings, request detailed samples and inspect height/speed/contact plots. Native animation-editor playback supplies qualitative clip inspection. The CL1518 `editor.capture_anim_frames` repair has pixel-verified readable changing mannequin/wolf poses and reports live single-node asset/time. Material/texture readiness barriers now make first-after-relaunch and repeated mannequin walk/wolf run captures byte-identical at the six verified times. This supports repeatable pose comparisons for that tested scope; other assets/materials/graphs need their own pixel check. Inspect actual output for each new asset/camera. Raw analysis and preview pixels do not replace runtime/IK acceptance.
+
+This action preserves source clips: no marker creation, retargeting, saves or animation graph edits. `derive_foot_sync_markers` remains a separate authoring action with `dry_run=false` by default; never substitute it for this read-only report without checking its mutation contract. Existing animation-preview and NPC acceptance tasks remain separate.

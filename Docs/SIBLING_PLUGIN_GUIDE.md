@@ -335,6 +335,25 @@ If you have many handler classes, follow the in-tree Monolith convention: one cl
 
 ---
 
+## Reliable action contracts (proposed guidance)
+
+Before adding a sibling action, inspect existing `monolith_discover()` namespaces and the exact action schema. Extend or reuse an established action when it already provides the required behavior. The handler above illustrates the minimum registration and result pattern; production actions also need the following contract and acceptance checks. This guidance draws on Epic's pinned [`create-toolset`](https://github.com/EpicGames/unreal-engine-skills-for-claude-code-plugin/blob/a6aa73ada02a9fb1f5415bec491f9942c519b297/skills/create-toolset/SKILL.md) and [`unreal-mcp`](https://github.com/EpicGames/unreal-engine-skills-for-claude-code-plugin/blob/a6aa73ada02a9fb1f5415bec491f9942c519b297/skills/unreal-mcp/SKILL.md) skills, adapted to Monolith's existing registry and domain handlers.
+
+| Concern | Authoring contract |
+| --- | --- |
+| Inputs and schema | Document required/optional fields, nested types, enums, ranges, units (centimeters, seconds, degrees and coordinate space where relevant), defaults, aliases and accepted target selectors. Check required values, wrong types, out-of-range values, conflicting aliases and unexpected fields **before any write**. Monolith already provides common schema/alias checks and optional `STRICT_PARAMS` handling; verify the effective behavior for this action rather than assuming a global warning prevents mutation. |
+| Effects and targets | State whether the action inspects or modifies state, which asset/actor/world it can touch, whether it marks packages dirty, whether save/compile is required, and any editor/PIE precondition. Document read-only/destructive/idempotent hints accurately where the registry exposes them. Hints describe behavior and are never authority to write. Project-specific owner/allowlist checks still apply. |
+| Read, preview and no-op | Provide an inspection action or documented getter to resolve exact targets and current state. For writes where practical, expose a preview/dry-run of the intended delta. An already-satisfied request should return a truthful no-op without rebuilding, saving or dirtying new packages. Omitted authored properties must retain their current values unless removal is explicitly requested. |
+| Results and errors | Preserve established public response shapes and include affected target identity, changed/unchanged status, compilation/rebuild and persistence results when relevant. Report per-target partial failures without concealing the original error. Use `-32602` for invalid parameters and distinguish action failure from a successful no-op (`changed=false`). Return `saved=true` only after the corresponding save is confirmed. |
+| Async and recovery | For any asynchronous handler, document an operation ID/receipt, pending/success/error/unknown completion, ownership of the result lifetime, one terminal reply and behavior on timeout or editor teardown. A timed-out mutation may have already occurred. Never replay a write automatically; first inspect its receipt and read back affected targets. Serialize all stateful editor operations under the same editor owner. |
+| Session identity and source control | Bind editor actions to the expected project/editor instance and, in PIE, the intended world/player/client. Reject ambiguous selectors. Enumerate exact assets before mutation and follow the host project's source-control and exclusive editor ownership contract. A discovery response or reachable MCP endpoint does not establish that the target editor is ready. |
+
+After reconnect or editor restart, invalidate affected cached metadata and require a successful **read-only** call against the expected live editor before performing dependent actions. When readiness or a mutation outcome remains unknown, return that state explicitly and retain the relevant operation/target identity for investigation.
+
+These practices are guidance for new actions and a candidate for richer I01 registry metadata. They do not imply that every currently registered action already publishes effect targets or an async receipt, and do not change existing action signatures.
+
+---
+
 ## Distribution & release discipline
 
 Two distribution scenarios:
@@ -461,7 +480,11 @@ The in-tree optional modules (`MonolithBABridge`, `MonolithComboGraph`, `Monolit
                     "arguments":{"action":"do_something",
                                  "params":{"target":"foo"}}}}'
    ```
-5. **Hot-reload survival.** Edit a handler, recompile via Live Coding, re-run the MCP call. The handler should execute the new code without an editor restart. (Live Coding patches are in-memory only; for header changes, full editor restart + UBT.)
+5. **Rebuild and reload.** For eligible editor-only handler changes, a Live Coding iteration may check that the new handler executes. Live Coding patches are in-memory. Use a full editor restart and UBT for header/module changes and whenever the host project's cold-build policy requires it (including native PCG C++ when required by the host project).
+6. **Validate the schema.** Exercise required, optional, wrong-type, out-of-range, alias-conflict and unknown parameters on direct and batched paths. Ensure invalid mutating input leaves assets untouched.
+7. **Check read/preview/write parity.** Inspect the exact target, preview a bounded change, apply it, verify save/reload where relevant, then repeat to confirm no-op semantics. Check partial failures and affected-target reporting.
+8. **Test lifecycle failures.** For async actions, cover immediate/delayed completion, error, timeout, editor disconnect and late response. Verify unknown-outcome receipts and absence of automatic write replay.
+9. **Verify the actual editor instance and build type.** After reconnect, use a live read-only call. Confirm Editor-only dependencies do not leak into Game/Server or packaged targets.
 
 ---
 

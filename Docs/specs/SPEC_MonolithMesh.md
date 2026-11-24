@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.23.0 (Beta)
+**Version:** 0.24.0 (Beta)
 
 > **Action-count audit (2026-04-26):** source-of-truth count is **195 core + 45 experimental town gen = 240**, not the previously claimed 197 + 45 = 242. The detailed per-action tables below predate the audit and may sum to slightly different numbers per category — they are accurate per-row but the category subtotals have drifted. A full per-action sweep against `Source/MonolithMesh/Private/Monolith*Actions.cpp` is on the audit backlog.
 
@@ -62,6 +62,18 @@
 | `get_vertex_data` | `asset_path`, `lod`, `section` | Raw vertex data for a mesh section |
 | `search_meshes_by_size` | `min_size`, `max_size`, `limit` | Search indexed meshes by bounding box size range |
 | `get_mesh_catalog_stats` | none | Mesh catalog database statistics |
+
+#### Static mesh source-LOD build settings
+
+`mesh.get_lod_build_settings` takes an exact `asset_path` and integer `lod_index`. It reports the resolved mesh/package, source-LOD count, current lightmap-UV generation settings, package dirtiness, minimum lightmap resolution and the separate mesh lightmap-coordinate index. Reading does not rebuild or save.
+
+`mesh.set_lod_build_settings` takes the same target, a non-empty `settings` patch and optional boolean `preview` (default false). Supported keys are `generate_lightmap_uvs` (boolean), `src_lightmap_index` (integer) and `dst_lightmap_index` (integer). Omitted settings are preserved. Unknown keys, wrong types, fractional indices, unsupported UV indices and invalid source LODs are refused before mutation. The complete proposed state includes retained values. When it enables generation, the source UV channel must exist, source/destination must differ, and the destination must be an existing channel or the next source UV channel. Gaps are refused because Unreal remaps them. The read result exposes `source_uv_channel_count`. Minimum lightmap resolution and `UStaticMesh::LightMapCoordinateIndex` are read-only in this slice; generating a destination channel does not select it as the active lightmap channel.
+
+Preview uses the same validation and comparison as apply, returning the current/proposed state and whether a rebuild would be needed. A satisfied patch enters no transaction, rebuilds nothing and preserves existing package dirtiness. A changed patch modifies only the requested fields on one source LOD and performs one synchronous build of the named mesh. Engine derived data may cover multiple LODs. The handler avoids a second generic post-edit rebuild.
+
+The response keeps actual `settings_changed`, `rebuild_status`, actual `package_dirty` and `save_status` separate. A changed request also reports `settings_mutated=true`; observed before/after values determine whether settings remain changed after engine processing. The edit never saves; `save_status` is `not_attempted`. A failed or diagnostically unclean build returns diagnostics and the observed partial state through structured error data. Do not interpret a build completion as UV-quality, lighting or performance acceptance.
+
+Save explicitly with `editor.list_dirty_packages` followed by `editor.save_packages` for the exact target package and `fail_on_unrequested_dirty=true`. Retain each per-package save result, then reload and read both settings and `mesh.get_mesh_uvs`. Preview, a dirty flag or a successful build is insufficient evidence of persistence. Focused contract fixtures use the `Monolith.Mesh.BuildSettings` automation prefix.
 
 **Scene Manipulation (8)**
 | Action | Params | Description |

@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.23.0 (Beta)
+**Version:** 0.24.0 (Beta)
 
 ---
 
@@ -26,7 +26,8 @@
 | `get_expression_details` | Full property reflection, inputs, outputs for a single expression |
 | `get_full_connection_graph` | Complete connection graph (all wires) of a material |
 | `export_material_graph` | Export complete graph to JSON (round-trippable with build_material_graph) |
-| `validate_material` | BFS reachability check — detects islands, broken textures, missing functions, duplicate params, unused params, high expression count (>200). Optional auto-fix |
+| `validate_material` | BFS reachability check — detects islands, broken textures, missing functions, duplicate params, unused params, high expression count (>200). Optional auto-fix. The subsurface-output warning checks the whole resolved shading-model set, not its first entry |
+| `get_material_properties` | Top-level properties of a material or instance. `shading_model` is the AUTHORED model: `MSM_FromMaterialExpression` when the shading model comes from the graph, otherwise the raw `UMaterial::ShadingModel` (read reflectively; instances report their single resolved model). `resolved_shading_models` always lists the set `GetShadingModels()` resolves to; `shading_models` (same content) is kept for compatibility and only emitted when more than one model resolves |
 | `render_preview` | Save preview PNG to Saved/Monolith/previews/ |
 | `get_thumbnail` | Return thumbnail as base64 PNG or save to file |
 | `get_layer_info` | Material Layer / Material Layer Blend info |
@@ -38,13 +39,13 @@
 |--------|-------------|
 | `create_material` | Create new UMaterial at path with configurable defaults (blend mode, shading model, material domain) |
 | `create_material_instance` | Create UMaterialInstanceConstant from parent material with optional parameter overrides |
-| `set_material_property` | Set material properties (blend_mode, shading_model, two_sided, etc.) via UMaterialEditingLibrary |
-| `build_material_graph` | Build entire graph from JSON spec in single undo transaction (4 phases: standard nodes, Custom HLSL, wires, output properties). The spec must be passed as `{ "graph_spec": { "nodes": [...], "connections": [...], ... } }` — not as a bare object |
+| `set_material_property` | Set material properties (blend_mode, shading_model, two_sided, etc.) via UMaterialEditingLibrary. `shading_model: "FromMaterialExpression"` is written to the raw `UMaterial::ShadingModel` and the shading-model field is rebuilt from the graph (`UMaterial::SetShadingModel` would hit the engine's `check(InShadingModel < MSM_NUM)` for that value); the hidden `MSM_NUM` sentinel is rejected. The same handling applies to `create_material`, `batch_set_material_property` and `create_pbr_material_from_disk` |
+| `build_material_graph` | Build entire graph from JSON spec in single undo transaction (4 phases: standard nodes, Custom HLSL, wires, output properties). The spec must be passed as `{ "graph_spec": { "nodes": [...], "connections": [...], ... } }` — not as a bare object. Snapshots and restores the RAW authored `UMaterial::ShadingModel` (read reflectively — not `GetShadingModels().GetFirstShadingModel()`, which returned e.g. DefaultLit for `MSM_FromMaterialExpression` masters and silently converted them). `clear_graph` uses the same snapshot/restore |
 | `disconnect_expression` | Disconnect inputs or outputs on a named expression (supports expr→expr and expr→material property; supports targeted single-connection disconnection via optional `input_name`/`output_name` params) |
 | `delete_expression` | Delete expression node by name from material graph |
 | `create_custom_hlsl_node` | Create Custom HLSL expression with inputs, outputs, and code |
 | `set_expression_property` | Set properties on expression nodes (e.g., DefaultValue on scalar param). Calls `PostEditChangeProperty` with the actual `FProperty*` so `MaterialGraph->RebuildGraph()` fires and the editor display updates correctly |
-| `connect_expressions` | Wire expression outputs to expression inputs or material property inputs. Returns blend mode validation warnings (e.g. Opacity on Opaque/Masked, OpacityMask on non-Masked) |
+| `connect_expressions` | Wire expression outputs to expression inputs or material property inputs. Returns blend mode validation warnings (e.g. Opacity on Opaque/Masked, OpacityMask on non-Masked). Wiring a material property input clears that input's `UseConstant` flag (as the material editor's `UMaterialGraphNode_Root::UpdateInputUseConstant` does), so an output that was never wired in the editor compiles the connected expression instead of its stored constant. Applies to every Monolith path that wires material property inputs (`connect_expressions`, `build_material_graph` output connections, `replace_expression` reconnects, spec-driven graph builds, `create_pbr_material_from_disk` auto-wiring) |
 | `set_instance_parameter` | Set scalar/vector/texture/static switch parameters on material instances |
 | `duplicate_material` | Duplicate material asset to new path |
 | `recompile_material` | Force material recompile |

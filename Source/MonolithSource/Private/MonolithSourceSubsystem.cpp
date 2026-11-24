@@ -1,5 +1,6 @@
 #include "MonolithSourceSubsystem.h"
 #include "MonolithSourceIndexer.h"
+#include "MonolithSourceDatabase.h"
 #include "MonolithSourceSchema.h"
 #include "MonolithSettings.h"
 #include "Misc/Paths.h"
@@ -50,11 +51,22 @@ void UMonolithSourceSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		if (Database->Open(DbPath))
 		{
 			const int32 SchemaVersion = FCString::Atoi(*Database->GetMeta(TEXT("schema_version")));
+			const int32 IndexedParser = FCString::Atoi(*Database->GetMeta(TEXT("parser_version")));
 			const bool bNeedsFullReindex = Database->RequiresFullReindex();
 			FScopeLock StatusGuard(&StatusLock);
 			IndexSchemaVersion = SchemaVersion;
+			IndexParserVersion = IndexedParser;
 			bRequiresFullReindex = bNeedsFullReindex;
 			UE_LOG(LogMonolithSource, Log, TEXT("Engine source DB loaded from %s"), *DbPath);
+
+			// An index built by an older parser misses symbols the current one extracts
+			// (e.g. UCLASS member functions before parser v2) — say so once at startup.
+			if (IndexedParser < MonolithSourceSchema::ParserVersion)
+			{
+				UE_LOG(LogMonolithSource, Warning,
+					TEXT("Engine source DB was built by parser v%d (current v%d); some symbols and call references are missing. Run source.trigger_reindex to rebuild it."),
+					IndexedParser, MonolithSourceSchema::ParserVersion);
+			}
 		}
 	}
 	else
@@ -377,6 +389,7 @@ TSharedPtr<FJsonObject> UMonolithSourceSubsystem::GetIndexStatus() const
 	FString Mode;
 	int64 Generation = 0;
 	int32 SchemaVersion = 0;
+	int32 ParserVersion = 0;
 	bool bNeedsFullReindex = true;
 	FString StartedAt;
 	FString CompletedAt;
@@ -391,6 +404,7 @@ TSharedPtr<FJsonObject> UMonolithSourceSubsystem::GetIndexStatus() const
 		Mode = IndexMode;
 		Generation = IndexGeneration;
 		SchemaVersion = IndexSchemaVersion;
+		ParserVersion = IndexParserVersion;
 		bNeedsFullReindex = bRequiresFullReindex;
 		StartedAt = IndexStartedAt;
 		CompletedAt = IndexCompletedAt;
@@ -406,6 +420,8 @@ TSharedPtr<FJsonObject> UMonolithSourceSubsystem::GetIndexStatus() const
 	Result->SetNumberField(TEXT("generation"), static_cast<double>(Generation));
 	Result->SetNumberField(TEXT("schema_version"), SchemaVersion);
 	Result->SetNumberField(TEXT("expected_schema_version"), MonolithSourceSchema::SchemaVersion);
+	Result->SetNumberField(TEXT("parser_version"), ParserVersion);
+	Result->SetNumberField(TEXT("expected_parser_version"), MonolithSourceSchema::ParserVersion);
 	const bool bAvailable = Database.IsValid() && Database->IsOpen();
 	Result->SetBoolField(TEXT("database_available"), bAvailable);
 	Result->SetBoolField(TEXT("requires_full_reindex"), bNeedsFullReindex);
@@ -471,6 +487,7 @@ bool UMonolithSourceSubsystem::ReopenDatabase(const FString& DbPath)
 	{
 		FScopeLock StatusGuard(&StatusLock);
 		IndexSchemaVersion = 0;
+		IndexParserVersion = 0;
 		bRequiresFullReindex = true;
 		return false;
 	}
@@ -481,6 +498,7 @@ bool UMonolithSourceSubsystem::ReopenDatabase(const FString& DbPath)
 		Database->Close();
 		FScopeLock StatusGuard(&StatusLock);
 		IndexSchemaVersion = 0;
+		IndexParserVersion = 0;
 		bRequiresFullReindex = true;
 		return false;
 	}
@@ -491,15 +509,18 @@ bool UMonolithSourceSubsystem::ReopenDatabase(const FString& DbPath)
 		Database->Close();
 		FScopeLock StatusGuard(&StatusLock);
 		IndexSchemaVersion = 0;
+		IndexParserVersion = 0;
 		bRequiresFullReindex = true;
 		return false;
 	}
 
 	const int32 SchemaVersion = FCString::Atoi(*Database->GetMeta(TEXT("schema_version")));
+	const int32 ParserVersion = FCString::Atoi(*Database->GetMeta(TEXT("parser_version")));
 	const bool bNeedsFullReindex = Database->RequiresFullReindex();
 	{
 		FScopeLock StatusGuard(&StatusLock);
 		IndexSchemaVersion = SchemaVersion;
+		IndexParserVersion = ParserVersion;
 		bRequiresFullReindex = bNeedsFullReindex;
 	}
 	UE_LOG(LogMonolithSource, Log, TEXT("Engine source DB reopened: %s"), *DbPath);

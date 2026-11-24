@@ -22,7 +22,7 @@ Source actions:
     get_class_hierarchy <symbol> [--direction up|down|both] [--depth N]
     get_module_info <module_name>
     get_symbol_context <symbol> [--context-lines N]
-    read_file <file_path> [--start N] [--end N]
+    read_file <file_path> [<start> [<end>]] [--start N] [--end N]
 
 Project actions:
     search <query> [--limit N]
@@ -576,12 +576,51 @@ class SourceActions:
                 result = "\n".join(lines[:max_lines]) + f"\n[...truncated, {remaining} more lines]"
         print(result)
 
+    # --- qualified-name lookup (mirrors MonolithSourceQualifiedLookup in the live module) ---
+
+    @staticmethod
+    def split_tail(symbol):
+        """'A::B::Method' -> 'Method'; None for an unqualified name."""
+        scope = symbol.rfind("::")
+        if scope < 0 or scope + 2 >= len(symbol):
+            return None
+        return symbol[scope + 2:]
+
+    @staticmethod
+    def qualified_name_matches(requested, stored):
+        return requested == stored or requested.endswith("::" + stored)
+
+    def resolve_symbol_rows(self, symbol, kind=None):
+        """Rows for a possibly-qualified name, plus an owner_unmatched flag set when a
+        Class::Method request fell back to every trailing-identifier match."""
+        def by_name(name):
+            if kind:
+                return self.db.execute(
+                    "SELECT id, name, qualified_name FROM symbols WHERE name = ? AND kind = ?",
+                    (name, kind)).fetchall()
+            return self.db.execute(
+                "SELECT id, name, qualified_name FROM symbols WHERE name = ?", (name,)).fetchall()
+
+        rows = by_name(symbol)
+        tail = self.split_tail(symbol)
+        if rows or tail is None:
+            return rows, False
+        tail_rows = by_name(tail)
+        owner_rows = [r for r in tail_rows if self.qualified_name_matches(symbol, r["qualified_name"])]
+        if owner_rows:
+            return owner_rows, False
+        return tail_rows, bool(tail_rows)
+
+    def owner_fallback_note(self, symbol):
+        tail = self.split_tail(symbol)
+        return f"Note: no indexed '{symbol}' with that owner; showing every '{tail}' match.\n"
+
     def find_references(self, args):
         symbol = args.symbol
         ref_kind = getattr(args, 'ref_kind', None) or ""
         limit = args.limit
 
-        sym_rows = self.db.execute("SELECT id, name FROM symbols WHERE name = ?", (symbol,)).fetchall()
+        sym_rows, owner_unmatched = self.resolve_symbol_rows(symbol)
         if not sym_rows:
             fts_q = escape_fts(symbol)
             sym_rows = self.db.execute(
@@ -611,13 +650,14 @@ class SourceActions:
             for ref in refs:
                 lines.append(f"[{ref['ref_kind']}] {self.short_path(ref['path'])}:{ref['line']} (from {ref['from_name']})")
 
-        print("\n".join(lines) if lines else f"No references found for '{symbol}'.")
+        text = "\n".join(lines) if lines else f"No references found for '{symbol}'."
+        print((self.owner_fallback_note(symbol) if owner_unmatched else "") + text)
 
     def find_callers(self, args):
         symbol = args.symbol
         limit = args.limit
 
-        sym_rows = self.db.execute("SELECT id FROM symbols WHERE name = ? AND kind = 'function'", (symbol,)).fetchall()
+        sym_rows, owner_unmatched = self.resolve_symbol_rows(symbol, "function")
         if not sym_rows:
             fts_q = escape_fts(symbol)
             sym_rows = self.db.execute(
@@ -639,13 +679,14 @@ class SourceActions:
             for ref in refs:
                 lines.append(f"{ref['from_name']} -- {self.short_path(ref['path'])}:{ref['line']}")
 
-        print("\n".join(lines) if lines else f"No callers found for '{symbol}'.")
+        text = "\n".join(lines) if lines else f"No callers found for '{symbol}'."
+        print((self.owner_fallback_note(symbol) if owner_unmatched else "") + text)
 
     def find_callees(self, args):
         symbol = args.symbol
         limit = args.limit
 
-        sym_rows = self.db.execute("SELECT id FROM symbols WHERE name = ? AND kind = 'function'", (symbol,)).fetchall()
+        sym_rows, owner_unmatched = self.resolve_symbol_rows(symbol, "function")
         if not sym_rows:
             fts_q = escape_fts(symbol)
             sym_rows = self.db.execute(
@@ -667,7 +708,8 @@ class SourceActions:
             for ref in refs:
                 lines.append(f"{ref['to_name']} -- {self.short_path(ref['path'])}:{ref['line']}")
 
-        print("\n".join(lines) if lines else f"No callees found for '{symbol}'.")
+        text = "\n".join(lines) if lines else f"No callees found for '{symbol}'."
+        print((self.owner_fallback_note(symbol) if owner_unmatched else "") + text)
 
     def get_class_hierarchy(self, args):
         symbol = args.symbol
@@ -807,21 +849,63 @@ class SourceActions:
 
     def read_file(self, args):
         file_path = args.file_path
-        start = args.start
-        end = args.end
 
+        # Line range: --start/--end, or positional <start> [<end>]. Mirrors the
+        # exe: a non-integer or a conflicting duplicate fails loudly.
+        def parse_line(s, what):
+            try:
+                if s.strip() != s or s == "":
+                    raise ValueError
+                return int(s)
+            except ValueError:
+                print(f"read_file: {what} line must be an integer, got '{s}'", file=sys.stderr)
+                sys.exit(1)
+
+        if args.start_pos is not None and args.start is not None:
+            print("read_file: start line given both positionally and via --start", file=sys.stderr)
+            sys.exit(1)
+        if args.end_pos is not None and args.end is not None:
+            print("read_file: end line given both positionally and via --end", file=sys.stderr)
+            sys.exit(1)
+        if args.start_pos is not None:
+            start = parse_line(args.start_pos, "start")
+        else:
+            start = args.start if args.start is not None else 1
+        if args.end_pos is not None:
+            end = parse_line(args.end_pos, "end")
+        else:
+            end = args.end if args.end is not None else 0
+
+        # The index stores forward-slash absolute paths. Look up with forward
+        # slashes first (exact, then suffix anchored at a separator, so an
+        # engine-relative "Engine/Source/..." path resolves), then the legacy
+        # backslash form for older indexes. Same order as the exe.
         resolved = None
-        if os.path.isfile(file_path):
+        if os.path.exists(file_path):
             resolved = file_path
         else:
-            normalized = file_path.replace("/", "\\")
-            row = self.db.execute("SELECT path FROM files WHERE path = ?", (normalized,)).fetchone()
+            fwd = file_path.replace("\\", "/")
+            while fwd.startswith("./"):
+                fwd = fwd[2:]
+            fwd = fwd.lstrip("/")
+            back = fwd.replace("/", "\\")
+            row = self.db.execute("SELECT path FROM files WHERE path = ?", (fwd,)).fetchone()
+            if not row:
+                row = self.db.execute("SELECT path FROM files WHERE path LIKE ? LIMIT 1", (f"%/{fwd}",)).fetchone()
+            if not row:
+                row = self.db.execute("SELECT path FROM files WHERE path = ?", (back,)).fetchone()
+            if not row:
+                row = self.db.execute("SELECT path FROM files WHERE path LIKE ? LIMIT 1", (f"%{back}",)).fetchone()
             if row:
                 resolved = row["path"]
-            else:
-                row = self.db.execute("SELECT path FROM files WHERE path LIKE ? LIMIT 1", (f"%{normalized}",)).fetchone()
-                if row:
-                    resolved = row["path"]
+            elif fwd.startswith("Engine/"):
+                # Not indexed: join onto the engine root derived from any indexed engine file.
+                er = self.db.execute("SELECT path FROM files WHERE path LIKE ? LIMIT 1", ("%/Engine/Source/%",)).fetchone()
+                if er:
+                    p = er["path"]
+                    candidate = p[:p.find("/Engine/Source/") + 1] + fwd
+                    if os.path.exists(candidate):
+                        resolved = candidate
 
         if not resolved:
             print(f"No file found matching '{file_path}'.", file=sys.stderr)
@@ -968,70 +1052,246 @@ class SourceActions:
         limit = args.limit
         method = symbol
         scope = symbol.rfind("::")
-        if scope >= 0:
+        qualified = scope >= 0
+        if qualified:
             method = symbol[scope + 2:]
 
         overloads = []  # (sig, source, file, line)
+        if limit <= 0:
+            print(f"No signature found for '{symbol}'.", file=sys.stderr)
+            sys.exit(1)
 
+        # An indexed function's qualified_name identifies its owning class.
         fnrows = self.db.execute(
-            "SELECT signature, file_id, line_start FROM symbols WHERE name = ? AND kind = 'function'",
+            "SELECT signature, file_id, line_start, qualified_name FROM symbols "
+            "WHERE name = ? AND kind = 'function'",
             (method,)).fetchall()
-        for r in fnrows:
+        for row in fnrows:
             if len(overloads) >= limit:
                 break
-            sig = r["signature"] or ""
-            if not sig:
+            if qualified and ("::" not in row["qualified_name"]
+                              or not self.qualified_name_matches(symbol, row["qualified_name"])):
                 continue
-            if "{" in sig or "\\" in sig:
+            sig = row["signature"] or ""
+            if not sig or "{" in sig or "\\" in sig:
                 continue
-            sig = sig.strip()
-            overloads.append((sig, "column", self.short_path(self.get_file_path(r["file_id"])), r["line_start"]))
+            overloads.append(
+                (sig.strip(), "column", self.short_path(self.get_file_path(row["file_id"])),
+                 row["line_start"]))
 
         if not overloads:
-            fts_q = escape_fts(symbol)
-            chunks = self.db.execute(
-                "SELECT file_id, line_number, text FROM source_fts WHERE source_fts MATCH ? "
-                "ORDER BY bm25(source_fts) LIMIT 50", (fts_q,)).fetchall()
+            # Older indexes may lack member rows. Resolve declarations only inside
+            # the owning class range, or on an explicitly qualified definition.
+            owner = symbol[:scope] if qualified else ""
+            owner_tail = self.split_tail(owner) or owner
+            method_needle = method + "("
+            qualified_needle = symbol + "("
             seen = set()
-            needle = method + "("
-            for ch in chunks:
-                if len(overloads) >= limit:
-                    break
-                fp = self.get_file_path(ch["file_id"])
-                try:
-                    with open(fp, "r", encoding="utf-8", errors="replace") as f:
-                        file_lines = [ln.rstrip("\n") for ln in f.readlines()]
-                except FileNotFoundError:
-                    continue
-                win_start = max(0, ch["line_number"] - 1)
-                win_end = min(len(file_lines), win_start + 10)
-                for i in range(win_start, win_end):
+
+            def mask_cpp_line(line, state):
+                in_block_comment, quote, escaped, raw_end = state
+                masked = []
+                i = 0
+                while i < len(line):
+                    if raw_end:
+                        close = line.find(raw_end, i)
+                        if close < 0:
+                            masked.extend(" " * (len(line) - i))
+                            i = len(line)
+                        else:
+                            end = close + len(raw_end)
+                            masked.extend(" " * (end - i))
+                            i = end
+                            raw_end = None
+                        continue
+                    if in_block_comment:
+                        if line.startswith("*/", i):
+                            masked.extend("  ")
+                            i += 2
+                            in_block_comment = False
+                        else:
+                            masked.append(" ")
+                            i += 1
+                        continue
+
+                    ch = line[i]
+                    if quote:
+                        masked.append(" ")
+                        if escaped:
+                            escaped = False
+                        elif ch == "\\":
+                            escaped = True
+                        elif ch == quote:
+                            quote = None
+                        i += 1
+                    elif line.startswith("//", i):
+                        masked.extend(" " * (len(line) - i))
+                        break
+                    elif line.startswith("/*", i):
+                        masked.extend("  ")
+                        i += 2
+                        in_block_comment = True
+                    elif line.startswith('R"', i):
+                        delimiter_end = line.find("(", i + 2)
+                        delimiter = line[i + 2:delimiter_end] if delimiter_end >= 0 else ""
+                        if (delimiter_end >= 0 and len(delimiter) <= 16
+                                and not any(c.isspace() or c in "()\\" for c in delimiter)):
+                            raw_end = ")" + delimiter + '"'
+                            masked.extend(" " * (delimiter_end + 1 - i))
+                            i = delimiter_end + 1
+                        else:
+                            masked.append(ch)
+                            i += 1
+                    elif ch in ('"', "'"):
+                        masked.append(" ")
+                        quote = ch
+                        i += 1
+                    else:
+                        masked.append(ch)
+                        i += 1
+
+                # A backslash-newline continues a quoted literal, but does not
+                # escape the first character on the next physical line.
+                if escaped:
+                    escaped = False
+                return "".join(masked), (in_block_comment, quote, escaped, raw_end)
+
+            def mask_cpp_lines(lines):
+                state = (False, None, False, None)
+                masked = []
+                for line in lines:
+                    code, state = mask_cpp_line(line, state)
+                    masked.append(code)
+                return masked
+
+            def definition_has_body(code_lines, index, needle_index, needle):
+                paren_depth = 0
+                saw_open = False
+                for line_index in range(index, min(len(code_lines), index + 12)):
+                    line = code_lines[line_index]
+                    start_at = needle_index + len(needle) - 1 if line_index == index else 0
+                    for ch in line[start_at:]:
+                        if ch == "(":
+                            paren_depth += 1
+                            saw_open = True
+                        elif ch == ")":
+                            paren_depth = max(0, paren_depth - 1)
+                        elif paren_depth == 0 and saw_open and ch in ("{", ";"):
+                            return ch == "{"
+                return False
+
+            def add_declaration(lines, index, file_path, needle, inside_owner, occurrence_index=None):
+                line = lines[index]
+                idx = line.find(needle) if occurrence_index is None else occurrence_index
+                if idx < 0:
+                    return
+                if idx > 0 and (line[idx - 1].isalnum() or line[idx - 1] == "_"):
+                    return
+                if qualified:
+                    prefix = line[:idx].strip()
+                    if ((not inside_owner and prefix.endswith("::"))
+                            or "(" in prefix or "=" in prefix or "->" in prefix or "." in prefix
+                            or prefix.startswith("//") or prefix.startswith("*")
+                            or (not prefix and (inside_owner or method != owner_tail))):
+                        return
+                sig = self.compact_declaration(lines, index)
+                if not sig or needle not in sig or sig in seen:
+                    return
+                seen.add(sig)
+                overloads.append((sig, "declaration_read", self.short_path(file_path), index + 1))
+
+            if qualified:
+                owner_rows = self.db.execute(
+                    "SELECT qualified_name, file_id, line_start, line_end FROM symbols "
+                    "WHERE name = ? AND kind IN ('class', 'struct')", (owner_tail,)).fetchall()
+                for row in owner_rows:
                     if len(overloads) >= limit:
                         break
-                    line = file_lines[i]
-                    didx = line.find(needle)
-                    if didx < 0:
+                    if not self.qualified_name_matches(owner, row["qualified_name"]):
                         continue
-                    if didx > 0:
-                        prev = line[didx - 1]
-                        if prev.isalnum() or prev == "_":
-                            continue
-                    sig = self.compact_declaration(file_lines, i)
-                    if not sig or needle not in sig:
+                    file_path = self.get_file_path(row["file_id"])
+                    try:
+                        with open(file_path, "r", encoding="utf-8", errors="replace") as stream:
+                            lines = stream.read().splitlines()
+                    except OSError:
                         continue
-                    if sig in seen:
+                    code_lines = mask_cpp_lines(lines)
+                    start = max(0, row["line_start"] - 1)
+                    end = min(len(lines), row["line_end"])
+                    class_opened = False
+                    saw_class_keyword = False
+                    scope_depth = 0
+                    for index in range(start, end):
+                        if len(overloads) >= limit:
+                            break
+                        code_line = code_lines[index]
+                        scan_start = 0
+                        if not class_opened:
+                            if not saw_class_keyword and re.search(r"\b(class|struct)\b", code_line):
+                                saw_class_keyword = True
+                            if not saw_class_keyword:
+                                continue
+                            opening = code_line.find("{")
+                            semicolon = code_line.find(";")
+                            if opening >= 0 and (semicolon < 0 or opening < semicolon):
+                                class_opened = True
+                                scope_depth = 1
+                                scan_start = opening + 1
+                            elif semicolon >= 0:
+                                break
+                            else:
+                                continue
+
+                        needle_index = code_line.find(method_needle, scan_start)
+                        if needle_index >= 0:
+                            occurrence_depth = (scope_depth
+                                                + code_line[scan_start:needle_index].count("{")
+                                                - code_line[scan_start:needle_index].count("}"))
+                            if occurrence_depth == 1:
+                                add_declaration(lines, index, file_path, method_needle, True,
+                                                needle_index)
+                        scope_depth += (code_line[scan_start:].count("{")
+                                        - code_line[scan_start:].count("}"))
+                        if scope_depth <= 0:
+                            break
+
+            if not overloads:
+                fts_query = escape_fts(symbol)
+                chunks = self.db.execute(
+                    "SELECT file_id, line_number, text FROM source_fts WHERE source_fts MATCH ? "
+                    "ORDER BY bm25(source_fts) LIMIT 50", (fts_query,)).fetchall()
+                needle = qualified_needle if qualified else method_needle
+                for chunk in chunks:
+                    if len(overloads) >= limit:
+                        break
+                    file_path = self.get_file_path(chunk["file_id"])
+                    try:
+                        with open(file_path, "r", encoding="utf-8", errors="replace") as stream:
+                            lines = stream.read().splitlines()
+                    except OSError:
                         continue
-                    seen.add(sig)
-                    overloads.append((sig, "declaration_read", self.short_path(fp), i + 1))
+                    code_lines = mask_cpp_lines(lines) if qualified else None
+                    start = max(0, chunk["line_number"] - 1)
+                    end = min(len(lines), start + 10)
+                    for index in range(start, end):
+                        if len(overloads) >= limit:
+                            break
+                        if qualified:
+                            needle_index = code_lines[index].find(needle)
+                            if needle_index < 0 or not definition_has_body(
+                                    code_lines, index, needle_index, needle):
+                                continue
+                            add_declaration(lines, index, file_path, needle, False, needle_index)
+                        else:
+                            add_declaration(lines, index, file_path, needle, False)
 
         if not overloads:
             print(f"No signature found for '{symbol}'.", file=sys.stderr)
             sys.exit(1)
 
-        out = []
-        for sig, source, fp, line in overloads:
-            out.append(f"{sig}\n  // {source} @ {fp}:{line}")
-        print("\n".join(out))
+        output = [f"{sig}\n  // {source} @ {path}:{line}"
+                  for sig, source, path, line in overloads]
+        print("\n".join(output))
 
     def check_deprecations(self, args):
         symbols = args.symbols
@@ -1040,15 +1300,39 @@ class SourceActions:
             print("Deprecation index is empty (schema v2 landed but not yet populated). "
                   "Run source.trigger_reindex to populate it.")
             return
+        # Mirrors the live handler (#155): a Class::Method with no exact row is retried
+        # with its trailing identifier; an owner-confirmed hit needs the linked symbol's
+        # qualified_name to match; a name with no row and no symbol is "not found".
+        def dep_rows(name):
+            return self.db.execute(
+                "SELECT d.version, d.message, d.kind, COALESCE(s.qualified_name, '') AS linked "
+                "FROM symbol_deprecations d LEFT JOIN symbols s ON s.id = d.symbol_id "
+                "WHERE d.symbol_name = ? ORDER BY d.id", (name,)).fetchall()
+
+        def has_symbol(name):
+            return self.db.execute("SELECT 1 FROM symbols WHERE name = ? LIMIT 1", (name,)).fetchone() is not None
+
         lines = []
         for name in symbols:
-            row = self.db.execute(
-                "SELECT version, message, kind FROM symbol_deprecations WHERE symbol_name = ? LIMIT 1",
-                (name,)).fetchone()
-            if row:
-                lines.append(f"{name}: DEPRECATED ({row['version']}) [{row['kind']}] {row['message']}")
+            tail = self.split_tail(name)
+            rows = dep_rows(name)
+            if not rows and tail is not None:
+                rows = dep_rows(tail)
+            if rows:
+                chosen = rows[0]
+                owner_confirmed = False
+                if tail is not None:
+                    for r in rows:
+                        if r["linked"] and self.qualified_name_matches(name, r["linked"]):
+                            chosen = r
+                            owner_confirmed = True
+                            break
+                suffix = " (matched by bare name; owner not verified)" if (tail is not None and not owner_confirmed) else ""
+                lines.append(f"{name}: DEPRECATED ({chosen['version']}) [{chosen['kind']}] {chosen['message']}{suffix}")
             else:
-                lines.append(f"{name}: not deprecated")
+                found = has_symbol(name) or (tail is not None and has_symbol(tail))
+                lines.append(f"{name}: not deprecated" if found
+                             else f"{name}: not found in the source index (deprecation status unknown)")
         print("\n".join(lines))
 
     # --- shared composition helpers (mirror FMonolithSourceActions) ---
@@ -2799,8 +3083,10 @@ def build_parser():
 
     p = src_sub.add_parser("read_file")
     p.add_argument("file_path")
-    p.add_argument("--start", type=int, default=1)
-    p.add_argument("--end", type=int, default=0)
+    p.add_argument("start_pos", nargs="?", default=None)
+    p.add_argument("end_pos", nargs="?", default=None)
+    p.add_argument("--start", type=int, default=None)
+    p.add_argument("--end", type=int, default=None)
 
     p = src_sub.add_parser("get_include_path")
     p.add_argument("symbol")

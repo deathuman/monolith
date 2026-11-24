@@ -317,15 +317,12 @@ bool FMonolithHttpServer::HandlePostMcp(const FHttpServerRequest& Request, const
 
 bool FMonolithHttpServer::HandleGetMcp(const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete)
 {
-	// SSE endpoint — return a single SSE event with an endpoint message.
-	// UE's HTTP server doesn't natively support long-lived SSE connections,
-	// so we return a single SSE event and close.
-	FString SseBody = TEXT("event: endpoint\ndata: \"/mcp\"\n\n");
-	auto Response = FHttpServerResponse::Create(SseBody, TEXT("text/event-stream"));
-	Response->Code = EHttpServerResponseCodes::Ok;
+	// Standalone GET is only supported when the server provides an SSE stream.
+	// Monolith is request/response only, so return the explicit 405 contract.
+	auto Response = MakeUnique<FHttpServerResponse>();
+	Response->Code = EHttpServerResponseCodes::BadMethod;
+	Response->Headers.Add(TEXT("Allow"), {TEXT("POST, OPTIONS, DELETE")});
 	AddCorsHeaders(*Response, Request);
-	Response->Headers.Add(TEXT("Cache-Control"), {TEXT("no-cache")});
-	Response->Headers.Add(TEXT("Connection"), {TEXT("keep-alive")});
 	OnComplete(MoveTemp(Response));
 	return true;
 }

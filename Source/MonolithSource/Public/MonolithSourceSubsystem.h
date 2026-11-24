@@ -97,6 +97,7 @@ private:
 	FString IndexMode = TEXT("none");
 	int64 IndexGeneration = 0;
 	int32 IndexSchemaVersion = 0;
+	int32 IndexParserVersion = 0;
 	bool bRequiresFullReindex = true;
 	FString IndexStartedAt;
 	FString IndexCompletedAt;

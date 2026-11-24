@@ -184,7 +184,7 @@ monolith_discover({ namespace: "mesh" })
 | `analyze_prop_density` | `volume_name`, `target_density`? | Grid-cell density vs target |
 | `place_storytelling_scene` | `location`, `pattern`, `intensity`? | 5 horror presets (violence/abandoned/dragged/medical/corruption) |
 
-### Level Design (9)
+### Level Design (11)
 
 | Action | Key Params | Purpose |
 |--------|-----------|---------|
@@ -194,9 +194,15 @@ monolith_discover({ namespace: "mesh" })
 | `swap_material_in_level` | `source_material`, `target_material` | Bulk replace material |
 | `find_replace_mesh` | `source_mesh`, `target_mesh` | Swap all instances |
 | `set_lod_screen_sizes` | `asset_path`, `screen_sizes` | LOD transition thresholds |
+| `get_lod_build_settings` | `asset_path`, `lod_index` | Inspect supported source-LOD UV generation settings and package state |
+| `set_lod_build_settings` | `asset_path`, `lod_index`, `settings`, `preview`? | Validate/preview/apply a narrow UV generation patch and rebuild the named mesh |
 | `find_instancing_candidates` | `min_count`? | Find repeated meshes for HISM |
 | `convert_to_hism` | `mesh`, `actors` | Convert to HISM |
 | `get_actor_component_properties` | `actor_name`, `component_class`? | Read UPROPERTYs |
+
+For build-settings edits, use only `generate_lightmap_uvs` (boolean), `src_lightmap_index` (integer) and `dst_lightmap_index` (integer). Read the current state and source UV-channel count, preview the complete patch, then apply it. Unknown fields/types, invalid source LODs and UV indices, missing generation-source channels, identical generation source/destination and generation destinations that skip the next source channel are refused before writes. Omitted fields, minimum lightmap resolution and mesh-level lightmap-coordinate index are preserved. A generated UV channel can remain inactive for lightmapping; report the active index explicitly.
+
+Preview and no-op do not rebuild or newly dirty the package. Changed edits rebuild only the named mesh, with separate settings/rebuild/dirty outcomes; build failure can leave changed settings dirty. Edits do not save. Audit dirty packages, save only the exact requested package using `editor.save_packages` with `fail_on_unrequested_dirty=true`, inspect its per-package result, then reload/read settings and UV data. A failed save does not invalidate the fact that in-memory settings changed, and it cannot establish persistence.
 
 ### Volumes & Properties (7)
 

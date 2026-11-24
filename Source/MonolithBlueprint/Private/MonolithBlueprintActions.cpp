@@ -794,6 +794,30 @@ FMonolithActionResult FMonolithBlueprintActions::HandleSearchNodes(const TShared
 
 namespace
 {
+	// Shared component_count definition for get_components and get_blueprint_info:
+	// SCS-added components only. The auto-created default scene root is excluded,
+	// but only when it is actually part of the SCS node list. UE can leave the
+	// DefaultSceneRootNode pointer set after the first scene component replaces it
+	// (an orphaned root, see BlueprintGeneratedClass.cpp), and subtracting it then
+	// would drop a user-added component from the count.
+	int32 CountScsAddedComponentsForBlueprint(USimpleConstructionScript* SCS)
+	{
+		if (!SCS)
+		{
+			return 0;
+		}
+
+		const TArray<USCS_Node*>& AllNodes = SCS->GetAllNodes();
+		int32 Count = AllNodes.Num();
+
+		USCS_Node* DefaultRoot = SCS->GetDefaultSceneRootNode();
+		if (DefaultRoot && AllNodes.Contains(DefaultRoot))
+		{
+			Count = FMath::Max(0, Count - 1);
+		}
+		return Count;
+	}
+
 	// Forward declaration for recursive serialization
 	TSharedPtr<FJsonObject> SerializeSCSNode(USCS_Node* Node);
 
@@ -872,9 +896,8 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetComponents(const TShar
 			}
 		}
 
-		// Count all nodes (flat) for the component_count field
-		TArray<USCS_Node*> AllNodes = SCS->GetAllNodes();
-		ComponentCount = AllNodes.Num();
+		// Flat count of SCS-added components (shared definition with get_blueprint_info)
+		ComponentCount = CountScsAddedComponentsForBlueprint(SCS);
 	}
 
 	// Inherited NATIVE components come off this Blueprint's OWN class-default object, so their
@@ -1177,6 +1200,7 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetFunctions(const TShare
 				PObj->SetStringField(TEXT("type"),
 					MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
 					MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+				MonolithBlueprintInternal::SetParamRefConstFields(PObj, Pin->PinType);
 				InputsArr.Add(MakeShared<FJsonValueObject>(PObj));
 			}
 			FObj->SetArrayField(TEXT("inputs"), InputsArr);
@@ -1207,6 +1231,7 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetFunctions(const TShare
 				PObj->SetStringField(TEXT("type"),
 					MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
 					MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+				MonolithBlueprintInternal::SetParamRefConstFields(PObj, Pin->PinType);
 				OutputsArr.Add(MakeShared<FJsonValueObject>(PObj));
 			}
 		}
@@ -1266,6 +1291,7 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetEventDispatchers(const
 				PObj->SetStringField(TEXT("type"),
 					MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
 					MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+				MonolithBlueprintInternal::SetParamRefConstFields(PObj, Pin->PinType);
 				PinsArr.Add(MakeShared<FJsonValueObject>(PObj));
 			}
 			break; // only one entry node per graph
@@ -1662,6 +1688,11 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetNodeDetails(const TSha
 		{
 			PinObj->SetStringField(TEXT("default_value"), Pin->DefaultValue);
 		}
+		// Text pins keep their literal in DefaultTextValue, not DefaultValue
+		if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Text && !Pin->DefaultTextValue.IsEmpty())
+		{
+			PinObj->SetStringField(TEXT("default_text"), Pin->DefaultTextValue.ToString());
+		}
 		if (Pin->DefaultObject)
 		{
 			PinObj->SetStringField(TEXT("default_object"), Pin->DefaultObject->GetPathName());
@@ -1875,6 +1906,7 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetFunctionSignature(cons
 				PObj->SetStringField(TEXT("type"),
 					MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
 					MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+				MonolithBlueprintInternal::SetParamRefConstFields(PObj, Pin->PinType);
 				if (!Pin->DefaultValue.IsEmpty())
 				{
 					PObj->SetStringField(TEXT("default"), Pin->DefaultValue);
@@ -1917,6 +1949,7 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetFunctionSignature(cons
 				PObj->SetStringField(TEXT("type"),
 					MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
 					MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+				MonolithBlueprintInternal::SetParamRefConstFields(PObj, Pin->PinType);
 				OutputsArr.Add(MakeShared<FJsonValueObject>(PObj));
 			}
 		}
@@ -1957,6 +1990,7 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetFunctionSignature(cons
 				PObj->SetStringField(TEXT("type"),
 					MonolithBlueprintInternal::ContainerPrefix(Pin->PinType) +
 					MonolithBlueprintInternal::PinTypeToString(Pin->PinType));
+				MonolithBlueprintInternal::SetParamRefConstFields(PObj, Pin->PinType);
 				InputsArr.Add(MakeShared<FJsonValueObject>(PObj));
 			}
 			break;
@@ -2009,6 +2043,8 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetFunctionSignature(cons
 				TSharedPtr<FJsonObject> PObj = MakeShared<FJsonObject>();
 				PObj->SetStringField(TEXT("name"), Prop->GetName());
 				PObj->SetStringField(TEXT("type"), Prop->GetCPPType());
+				PObj->SetBoolField(TEXT("is_reference"), Prop->HasAnyPropertyFlags(CPF_ReferenceParm));
+				PObj->SetBoolField(TEXT("is_const"), Prop->HasAnyPropertyFlags(CPF_ConstParm));
 				if (Prop->PropertyFlags & (CPF_ReturnParm | CPF_OutParm))
 					OutputsArr.Add(MakeShared<FJsonValueObject>(PObj));
 				else
@@ -2267,18 +2303,9 @@ FMonolithActionResult FMonolithBlueprintActions::HandleGetBlueprintInfo(const TS
 	Root->SetNumberField(TEXT("function_count"),  BP->FunctionGraphs.Num());
 	Root->SetNumberField(TEXT("interface_count"), BP->ImplementedInterfaces.Num());
 
-	// Component count — SCS nodes minus the root
-	int32 ComponentCount = 0;
-	if (BP->SimpleConstructionScript)
-	{
-		const TArray<USCS_Node*>& AllNodes = BP->SimpleConstructionScript->GetAllNodes();
-		ComponentCount = AllNodes.Num();
-		// Subtract the default scene root if present
-		if (BP->SimpleConstructionScript->GetDefaultSceneRootNode() != nullptr)
-		{
-			ComponentCount = FMath::Max(0, ComponentCount - 1);
-		}
-	}
+	// Component count — SCS-added components, excluding the default scene root only
+	// when it is a live member of the node list (shared definition with get_components)
+	const int32 ComponentCount = CountScsAddedComponentsForBlueprint(BP->SimpleConstructionScript);
 	Root->SetNumberField(TEXT("component_count"), ComponentCount);
 
 	// native_component_count — inherited native components declared in the C++

@@ -392,6 +392,15 @@ void FMonolithSourceIndexer::IndexModule(const FModuleEntry& Module, FMonolithSo
 	{
 		if (bShouldStop) break;
 
+		// A file reachable from two discovered module roots (a nested `Source` dir
+		// inside a plugin's Source tree is discovered as its own module) used to be
+		// parsed twice: InsertFile reuses the existing row, so its symbols, includes,
+		// chunks and deprecations were appended a second time, and total_files counted
+		// it twice (meta.total_files > COUNT(*) FROM files). Index each path once per run.
+		bool bAlreadyIndexed = false;
+		IndexedFilePaths.Add(FilePath, &bAlreadyIndexed);
+		if (bAlreadyIndexed) continue;
+
 		FString Ext = FPaths::GetExtension(FilePath).ToLower();
 		int32 SymbolCount = 0;
 
@@ -468,6 +477,9 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 
 	// Symbols
 	int32 SymbolCount = 0;
+	// Per-file name -> (line, id) for linking deprecation rows to the exact declaration
+	// they annotate (the global name map collides across same-named members).
+	TMap<FString, TArray<TPair<int32, int64>>> FileSymbolsByName;
 	for (const FParsedSourceSymbol& Sym : ParseResult.Symbols)
 	{
 		if (Sym.Kind == TEXT("include")) continue;
@@ -497,6 +509,11 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 			return SymbolCount;
 		}
 
+		if (SymId != 0)
+		{
+			FileSymbolsByName.FindOrAdd(Sym.Name).Emplace(Sym.LineStart, SymId);
+		}
+
 		// Update symbol maps
 		UpdateSymbolMap(Sym.Name, SymId, Sym.LineStart, Sym.LineEnd);
 		if (QualifiedName != Sym.Name)
@@ -511,7 +528,7 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 
 			if (Sym.BaseClasses.Num() > 0)
 			{
-				PendingBaseClasses.Add(Sym.Name, Sym.BaseClasses);
+				PendingBaseClasses.Add(SymId, Sym.BaseClasses);
 
 				FScopeLock Lock(&DiagLock);
 				Diagnostics.WithBaseClasses++;
@@ -564,6 +581,7 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 			// UE_API/comments/blanks) to the first real declaration, then take the
 			// identifier immediately before '(' (function) or before ';'/'=' (var).
 			FString SymbolName;
+			int32 DeclLine = INDEX_NONE; // 0-based line the name was parsed from
 			for (int32 j = i; j < Lines.Num() && j < i + 8; ++j)
 			{
 				FString Decl = Lines[j].TrimStartAndEnd();
@@ -637,6 +655,7 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 				if (NameEnd > NameStart)
 				{
 					SymbolName = Decl.Mid(NameStart, NameEnd - NameStart);
+					DeclLine = j;
 				}
 				break;
 			}
@@ -646,13 +665,24 @@ int32 FMonolithSourceIndexer::IndexCppFile(const FString& FilePath, int64 Module
 				continue; // could not resolve a name — skip rather than store garbage
 			}
 
-			// Link to a symbols row when one exists; NULL (0) otherwise.
+			// Link to a symbols row when one exists; NULL (0) otherwise. Prefer the row
+			// this file declares between the macro line and the parsed declaration line,
+			// so the link (and its qualified_name) names the annotated owner rather than
+			// whichever same-named symbol the global map saw first.
 			int64 LinkedSymId = 0;
-			if (const int64* Found = SymbolNameToId.Find(SymbolName))
+			if (const TArray<TPair<int32, int64>>* Local = FileSymbolsByName.Find(SymbolName))
 			{
-				LinkedSymId = *Found;
+				for (const TPair<int32, int64>& Entry : *Local)
+				{
+					if (Entry.Key >= i + 1 && Entry.Key <= DeclLine + 1)
+					{
+						LinkedSymId = Entry.Value;
+						break;
+					}
+				}
 			}
-
+			// An unresolved local declaration must remain unlinked. A global bare
+			// name can point to a different owner's same-named function.
 			DB.InsertDeprecation(LinkedSymId, FileId, SymbolName, Version, Message, Kind);
 			if (DB.HasOperationError())
 			{
@@ -806,23 +836,15 @@ bool FMonolithSourceIndexer::Finalize(FMonolithSourceDatabase& DB)
 	}
 	for (const auto& Pair : PendingBaseClasses)
 	{
-		const FString& ChildName = Pair.Key;
+		const int64 ChildId = Pair.Key;
 		const TArray<FString>& BaseClasses = Pair.Value;
-
-		const int64* ChildId = ClassNameToId.Find(ChildName);
-		if (!ChildId)
-		{
-			FScopeLock Lock(&DiagLock);
-			Diagnostics.InheritanceFailed += BaseClasses.Num();
-			continue;
-		}
 
 		for (const FString& BaseName : BaseClasses)
 		{
 			const int64* ParentId = ClassNameToId.Find(BaseName);
 			if (ParentId)
 			{
-				DB.InsertInheritance(*ChildId, *ParentId);
+				DB.InsertInheritance(ChildId, *ParentId);
 				if (DB.HasOperationError())
 				{
 					DB.RollbackTransaction();
@@ -899,5 +921,11 @@ bool FMonolithSourceIndexer::Finalize(FMonolithSourceDatabase& DB)
 	DB.SetMeta(TEXT("index_timestamp"), FString::FromInt(FDateTime::UtcNow().ToUnixTimestamp()));
 	DB.SetMeta(TEXT("total_files"), FString::FromInt(TotalFilesProcessed.Load()));
 	DB.SetMeta(TEXT("total_symbols"), FString::FromInt(TotalSymbolsExtracted.Load()));
+	// Parser generation of the ENGINE rows: only a clean build re-parses them, so a
+	// project-only reindex leaves the previous stamp in place.
+	if (bCleanBuild)
+	{
+		DB.SetMeta(TEXT("parser_version"), FString::FromInt(MonolithSourceSchema::ParserVersion));
+	}
 	return !DB.HasOperationError();
 }

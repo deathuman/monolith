@@ -23,9 +23,13 @@
 #endif
 
 // Capture action includes
+#include "AssetCompilingManager.h"
 #include "ProceduralMeshComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
+#include "Engine/Scene.h"
 #include "Engine/TextureRenderTarget2D.h"
+#include "Engine/Texture.h"
+#include "Engine/TextureCube.h"
 #include "AdvancedPreviewScene.h"
 #include "NiagaraComponent.h"
 #include "NiagaraSystem.h"
@@ -51,6 +55,7 @@
 #include "Animation/DebugSkelMeshComponent.h" // UDebugSkelMeshComponent (UnrealEd)
 #include "Animation/BlendSpace.h"             // UBlendSpace
 #include "Animation/AnimBlueprint.h"          // UAnimBlueprint (GeneratedClass)
+#include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 // asset_type=widget (Phase 1 expansion)
 #include "Blueprint/UserWidget.h"
@@ -61,6 +66,8 @@
 #include "Slate/WidgetRenderer.h"
 #include "RenderDeferredCleanup.h"
 #include "UObject/SavePackage.h"
+#include "HAL/FileManager.h"
+#include "Misc/FeedbackContext.h"            // GWarn as FSavePackageArgs::Error
 #include "LevelEditorViewport.h"
 #include "PixelFormat.h"
 #include "ObjectTools.h"
@@ -69,6 +76,8 @@
 #include "CoreGlobals.h"                     // GIsRunningUnattendedScript
 #include "UObject/Package.h"                 // UPackage::SetDirtyFlag
 #include "Subsystems/AssetEditorSubsystem.h" // CloseAllEditorsForAsset
+#include "AssetRegistry/AssetRegistryModule.h" // delete_assets failure referencers
+#include "AssetRegistry/IAssetRegistry.h"
 
 // Scripting action includes (HOFF 7)
 #include "IPythonScriptPlugin.h"
@@ -95,6 +104,12 @@
 #include "UObject/UObjectIterator.h"
 #include "Engine/Blueprint.h"
 #include "Templates/UnrealTemplate.h"
+// ...and the Dirty half of that function: a non-data-only BS_Dirty Blueprint is recompiled
+// before PIE, so one whose last compile left Error annotations on its nodes is reported too.
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Logging/TokenizedMessage.h"
 
 // start_pie needs the level-editor module + asset viewport to pin PIE to in-viewport mode
 #include "LevelEditor.h"
@@ -551,7 +566,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("save_packages"),
-		TEXT("Save the requested packages to disk (UPackage::SavePackage + FSavePackageArgs). When fail_on_unrequested_dirty=true, errors before saving anything if any dirty package exists outside the requested set (within scope_paths if given). Returns per-package save status."),
+		TEXT("Save the requested packages to disk (UPackage::SavePackage + FSavePackageArgs). When fail_on_unrequested_dirty=true, errors before saving anything if any dirty package exists outside the requested set (within scope_paths if given). Returns per-package save status. Read-only targets require an explicit checkout before saving; the action reports a per-package error and never checks files out implicitly."),
 		FMonolithActionHandler::CreateStatic(&HandleSavePackages),
 		FParamSchemaBuilder()
 			.Required(TEXT("packages"), TEXT("array"), TEXT("Array of long package names (e.g. [\"/Game/Tests/Monolith/DA_Foo\"]) to save."))
@@ -585,7 +600,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("list_errored_blueprints"),
-		TEXT("Read-only scan of all loaded Blueprints for unresolved compile errors (status==BS_Error && bDisplayCompilePIEWarning) — the exact condition the engine tests before raising its blocking PIE compile-error modal. Returns {count, blueprints:[{name, path}]}. Run this before run_pie_smoke to know whether PIE will be refused / blocked."),
+		TEXT("Read-only scan of all loaded Blueprints for unresolved compile errors, mirroring what the engine collects before raising its blocking PIE compile-error modal: status==BS_Error && bDisplayCompilePIEWarning (status \"error\"), and a non-data-only BS_Dirty Blueprint, which the engine recompiles before PIE, whose last compile left Error annotations on its nodes (status \"dirty_with_errors\"). Does not compile anything, so a Dirty Blueprint newly broken since its last compile is not seen. Returns {count, blueprints:[{name, path, status}]}. Run this before run_pie_smoke to know whether PIE will be refused / blocked."),
 		FMonolithActionHandler::CreateStatic(&HandleListErroredBlueprints),
 		FParamSchemaBuilder().Build());
 
@@ -605,7 +620,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("capture_pie_movement_clip"),
-		TEXT("Start an async PIE-smoke session (same model as run_pie_smoke) that ALSO captures a PIE viewport frame every capture_interval seconds into output_path, plus per-frame AnimInstance sampling. Returns {session_id, status:'running', started:true} immediately; poll_pie_smoke returns the sampled values + captured frame paths. If viewport capture is unavailable during PIE the session continues and poll reports capture_deferred."),
+		TEXT("Start an async PIE-smoke session (same model as run_pie_smoke) that ALSO captures a PIE viewport frame every capture_interval seconds into output_path, plus per-frame AnimInstance sampling. Returns {session_id, status:'running', started:true} immediately; poll_pie_smoke returns the sampled values + captured frame paths. If viewport capture is unavailable during PIE the session continues and poll reports capture_deferred. Capture slots where the PIE viewport has not drawn yet (or the window is minimized) are skipped and counted as capture_validity.not_drawn_frames; capture_validity reports expected_frames vs captured_frames and captured_ok is false when fewer than half the expected frames were saved."),
 		FMonolithActionHandler::CreateStatic(&HandleCapturePieMovementClip),
 		FParamSchemaBuilder()
 			.OptionalAssetPath(TEXT("map"), TEXT("Level asset path to load before PIE. Omit to use the current editor level."))
@@ -779,7 +794,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("delete_assets"),
-		TEXT("Delete UE assets by path. Optional safety: restrict to allowed path prefixes"),
+		TEXT("Delete UE assets by path. Optional safety: restrict to allowed path prefixes. When some assets survive, failed_to_delete lists them and failures[] gives per-asset {path, reason, referencers (on-disk packages, capped at 20), referencer_count, in_memory_referencers (capped at 20), in_memory_referencer_count, referenced_by_undo}."),
 		FMonolithActionHandler::CreateStatic(&HandleDeleteAssets),
 		FParamSchemaBuilder()
 			.Required(TEXT("asset_paths"), TEXT("array"), TEXT("Array of UE asset paths to delete"))
@@ -1907,28 +1922,82 @@ namespace
 	{
 		FString Name;
 		FString Path;
+		// "error": BS_Error and still warning on PIE. "dirty_with_errors": BS_Dirty, so the
+		// engine recompiles it before PIE, and its last compile left Error annotations.
+		FString Status;
 	};
 
-	// Scan every loaded UBlueprint for the same condition the engine's
-	// ResolveDirtyBlueprints (PlayLevel.cpp) tests before raising the blocking
-	// "unresolved compiler errors" PIE prompt: status == BS_Error AND the BP still
-	// wants to warn on PIE (bDisplayCompilePIEWarning). Starting PIE on such a world
+	// True when any node of the Blueprint still carries an Error-severity compiler message.
+	// The compiler clears every node's message at the start of a full compile and annotates
+	// the nodes its errors name, and MarkBlueprintAsModified (-> BS_Dirty) leaves them alone,
+	// so on a Dirty Blueprint they are the record of the last compile. Read-only: no compile.
+	bool HasErrorAnnotationsFromLastCompile(UBlueprint* Blueprint)
+	{
+		TArray<UEdGraph*> Graphs;
+		Blueprint->GetAllGraphs(Graphs);
+		for (const UEdGraph* Graph : Graphs)
+		{
+			if (!Graph)
+			{
+				continue;
+			}
+			for (const UEdGraphNode* Node : Graph->Nodes)
+			{
+				if (Node && Node->bHasCompilerMessage && Node->ErrorType <= EMessageSeverity::Error)
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	// Scan every loaded UBlueprint for what the engine's ResolveDirtyBlueprints
+	// (PlayLevel.cpp) will put in its ErroredBlueprints list before raising the
+	// blocking "unresolved compiler errors" PIE prompt. Starting PIE on such a world
 	// pops a Slate modal that runs a nested loop on the game thread, starving the
-	// in-process MCP HTTP server until a human clicks.
+	// in-process MCP HTTP server until a human clicks. The engine's partition, mirrored:
+	//  - skipped: garbage, up-to-date, and PKG_ForDiffing (diff-view copies);
+	//  - recompiled before PIE: non-data-only BS_Dirty Blueprints (IsPossiblyDirty but
+	//    not BS_Unknown). Any that fail join ErroredBlueprints. A scan cannot compile
+	//    without changing state, so it reports those whose LAST compile failed (their
+	//    nodes still carry Error annotations) - a broken Blueprint that was merely
+	//    re-dirtied, which a BS_Error-only test passes;
+	//  - otherwise: BS_Error AND the BP still wants to warn on PIE (bDisplayCompilePIEWarning).
 	void ScanErroredBlueprints(TArray<FErroredBlueprintEntry>& OutErrored)
 	{
 		for (TObjectIterator<UBlueprint> It; It; ++It)
 		{
 			UBlueprint* Blueprint = *It;
-			if (!IsValid(Blueprint))
+			if (!IsValid(Blueprint) || Blueprint->IsUpToDate())
 			{
 				continue;
 			}
-			if (Blueprint->Status == BS_Error && Blueprint->bDisplayCompilePIEWarning)
+			const UPackage* Package = Blueprint->GetPackage();
+			if (Package && Package->HasAnyPackageFlags(PKG_ForDiffing))
+			{
+				continue;
+			}
+
+			const TCHAR* Status = nullptr;
+			if (Blueprint->Status == BS_Dirty && !FBlueprintEditorUtils::IsDataOnlyBlueprint(Blueprint))
+			{
+				if (HasErrorAnnotationsFromLastCompile(Blueprint))
+				{
+					Status = TEXT("dirty_with_errors");
+				}
+			}
+			else if (Blueprint->Status == BS_Error && Blueprint->bDisplayCompilePIEWarning)
+			{
+				Status = TEXT("error");
+			}
+
+			if (Status)
 			{
 				FErroredBlueprintEntry Entry;
 				Entry.Name = Blueprint->GetName();
 				Entry.Path = Blueprint->GetPathName();
+				Entry.Status = Status;
 				OutErrored.Add(MoveTemp(Entry));
 			}
 		}
@@ -1944,6 +2013,7 @@ namespace
 			TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
 			Obj->SetStringField(TEXT("name"), Entry.Name);
 			Obj->SetStringField(TEXT("path"), Entry.Path);
+			Obj->SetStringField(TEXT("status"), Entry.Status);
 			Items.Add(MakeShared<FJsonValueObject>(Obj));
 		}
 		return Items;
@@ -3284,20 +3354,40 @@ FMonolithActionResult FMonolithEditorActions::HandleCaptureAnimFrames(
 
 	// --- Build the preview scene + debug skel mesh component (reuses the proven
 	// skeletal_mesh capture path; UDebugSkelMeshComponent is a USkeletalMeshComponent). ---
-	TSharedPtr<FAdvancedPreviewScene> PreviewScene =
-		MakeShareable(new FAdvancedPreviewScene(FPreviewScene::ConstructionValues()));
-	PreviewScene->SetFloorVisibility(false);
+	// A plain preview scene avoids inheriting mutable Asset Viewer environments.
+	TSharedPtr<FPreviewScene> PreviewScene =
+		MakeShareable(new FPreviewScene(FPreviewScene::ConstructionValues()));
+	PreviewScene->SetLightDirection(FRotator(-35.0f, -135.0f, 0.0f));
+	PreviewScene->SetLightBrightness(3.14f);
+	PreviewScene->SetSkyBrightness(1.0f);
+	UTextureCube* FillCubemap = LoadObject<UTextureCube>(nullptr,
+		TEXT("/Engine/MapTemplates/Sky/SunsetAmbientCubemap.SunsetAmbientCubemap"));
+	if (!FillCubemap)
+	{
+		return FMonolithActionResult::Error(TEXT("Animation capture fill cubemap is unavailable."));
+	}
+	TArray<UObject*> PreviewAssetsToFinishCompilation;
+	PreviewAssetsToFinishCompilation.Add(PreviewMesh);
+	PreviewAssetsToFinishCompilation.Add(FillCubemap);
+	FAssetCompilingManager::Get().FinishCompilationForObjects(PreviewAssetsToFinishCompilation);
+
+	PreviewScene->SetSkyCubemap(FillCubemap);
 
 	UDebugSkelMeshComponent* SkelComp = NewObject<UDebugSkelMeshComponent>(
 		GetTransientPackage(), NAME_None, RF_Transient);
 	SkelComp->SetSkeletalMesh(PreviewMesh);
+	SkelComp->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+	PreviewScene->AddComponent(SkelComp, SkelComp->GetRelativeTransform());
+	SkelComp->SetUpdateAnimationInEditor(true);
 
 	// Configure the animation source per asset kind.
+	UAnimSingleNodeInstance* SingleNode = nullptr;
 	if (AnimBP)
 	{
 		UClass* AnimClass = AnimBP->GeneratedClass;
 		if (!AnimClass)
 		{
+			PreviewScene->RemoveComponent(SkelComp);
 			return FMonolithActionResult::Error(
 				TEXT("AnimBlueprint has no GeneratedClass (compile it first)."));
 		}
@@ -3308,18 +3398,65 @@ FMonolithActionResult FMonolithEditorActions::HandleCaptureAnimFrames(
 	{
 		// Sequence + BlendSpace: single-node mode posed via SetPosition each sample.
 		SkelComp->SetAnimationMode(EAnimationMode::AnimationSingleNode);
-		SkelComp->SetAnimation(AnimAsset);
+		SkelComp->EnablePreview(true, AnimAsset);
+		SingleNode = SkelComp->GetSingleNodeInstance();
+		if (!SingleNode)
+		{
+			PreviewScene->RemoveComponent(SkelComp);
+			return FMonolithActionResult::Error(
+				TEXT("Failed to initialize the transient single-node animation preview."));
+		}
+		SingleNode->SetPlaying(false);
+		SingleNode->SetLooping(false);
 		if (BlendSpc)
 		{
-			if (UAnimSingleNodeInstance* SingleNode = SkelComp->GetSingleNodeInstance())
-			{
-				SingleNode->SetBlendSpacePosition(BlendInput);
-			}
+			SingleNode->SetBlendSpacePosition(BlendInput);
 		}
 	}
 
-	PreviewScene->AddComponent(SkelComp, SkelComp->GetRelativeTransform());
 	UWorld* World = PreviewScene->GetWorld();
+
+	// Finish only the shaders and render assets used by this preview before its first draw.
+	TArray<UTexture*> CaptureTextures;
+	for (UMaterialInterface* Material : SkelComp->GetMaterials())
+	{
+		if (!Material)
+		{
+			continue;
+		}
+
+		Material->EnsureIsComplete();
+		TArray<UTexture*> MaterialTextures;
+		Material->GetUsedTextures(MaterialTextures);
+		for (UTexture* Texture : MaterialTextures)
+		{
+			if (Texture)
+			{
+				CaptureTextures.AddUnique(Texture);
+			}
+		}
+	}
+	CaptureTextures.AddUnique(FillCubemap);
+
+	TArray<UObject*> TextureAssetsToFinishCompilation;
+	for (UTexture* Texture : CaptureTextures)
+	{
+		TextureAssetsToFinishCompilation.Add(Texture);
+	}
+	FAssetCompilingManager::Get().FinishCompilationForObjects(TextureAssetsToFinishCompilation);
+
+	PreviewMesh->WaitForStreaming();
+	for (UTexture* Texture : CaptureTextures)
+	{
+		Texture->WaitForStreaming();
+	}
+
+	SkelComp->MarkRenderStateDirty();
+	if (World) { World->SendAllEndOfFrameUpdates(); }
+	FlushRenderingCommands();
+
+	PreviewScene->UpdateCaptureContents();
+	FlushRenderingCommands();
 
 	const double StartTime = FPlatformTime::Seconds();
 	TArray<TSharedPtr<FJsonValue>> FrameResults;
@@ -3331,7 +3468,7 @@ FMonolithActionResult FMonolithEditorActions::HandleCaptureAnimFrames(
 		if (AnimBP)
 		{
 			// ABP: advance the graph by ticking the component up to the target time. We
-			// re-evaluate from the current pose each sample (monotonic since sorted).
+			// retain the existing paused-world clock and explicit graph tick (monotonic since sorted).
 			const float Step = (i == 0) ? T : (T - TimeSamples[i - 1]);
 			if (World) { World->Tick(ELevelTick::LEVELTICK_PauseTick, FMath::Max(0.0f, Step)); }
 			SkelComp->TickComponent(FMath::Max(0.0f, Step), ELevelTick::LEVELTICK_All, nullptr);
@@ -3341,16 +3478,16 @@ FMonolithActionResult FMonolithEditorActions::HandleCaptureAnimFrames(
 			// Single-node: SetPosition forces evaluation at the absolute target time.
 			if (BlendSpc)
 			{
-				if (UAnimSingleNodeInstance* SingleNode = SkelComp->GetSingleNodeInstance())
-				{
-					SingleNode->SetBlendSpacePosition(BlendInput);
-				}
+				SingleNode->SetBlendSpacePosition(BlendInput);
 			}
-			SkelComp->SetPosition(T, /*bFireNotifies=*/false);
-			if (World) { World->Tick(ELevelTick::LEVELTICK_PauseTick, 0.0f); }
-			SkelComp->TickComponent(0.0f, ELevelTick::LEVELTICK_All, nullptr);
+			SingleNode->SetPosition(T, /*bFireNotifies=*/false);
+			SkelComp->TickAnimation(0.0f, /*bNeedsValidRootMotion=*/false);
 		}
 
+		SkelComp->RefreshBoneTransforms(nullptr);
+		SkelComp->UpdateBounds();
+		SkelComp->MarkRenderTransformDirty();
+		SkelComp->MarkRenderDynamicDataDirty();
 		if (World) { World->SendAllEndOfFrameUpdates(); }
 
 		// --- Shared render path: RT + scene capture + RenderAndSaveCapture ---
@@ -3367,7 +3504,14 @@ FMonolithActionResult FMonolithEditorActions::HandleCaptureAnimFrames(
 		CaptureComp->bCaptureEveryFrame = false;
 		CaptureComp->bCaptureOnMovement = false;
 		CaptureComp->TextureTarget = RT;
-		CaptureComp->CaptureSource = ESceneCaptureSource::SCS_FinalToneCurveHDR;
+		CaptureComp->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+		CaptureComp->PostProcessSettings.bOverride_AutoExposureMethod = true;
+		CaptureComp->PostProcessSettings.AutoExposureMethod = AEM_Manual;
+		CaptureComp->PostProcessSettings.bOverride_AutoExposureApplyPhysicalCameraExposure = true;
+		CaptureComp->PostProcessSettings.AutoExposureApplyPhysicalCameraExposure = false;
+		CaptureComp->PostProcessSettings.bOverride_AutoExposureBias = true;
+		CaptureComp->PostProcessSettings.AutoExposureBias = 0.0f;
+		CaptureComp->PostProcessBlendWeight = 1.0f;
 		CaptureComp->ProjectionType = ECameraProjectionMode::Perspective;
 		CaptureComp->FOVAngle = FOV;
 		CaptureComp->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_RenderScenePrimitives;
@@ -3385,6 +3529,14 @@ FMonolithActionResult FMonolithEditorActions::HandleCaptureAnimFrames(
 		FrameObj->SetNumberField(TEXT("time"), T);
 		FrameObj->SetStringField(TEXT("file"), FramePath);
 		FrameObj->SetBoolField(TEXT("success"), bOk);
+		if (SingleNode)
+		{
+			if (UAnimationAsset* LiveAsset = SingleNode->GetCurrentAsset())
+			{
+				FrameObj->SetStringField(TEXT("single_node_asset"), LiveAsset->GetPathName());
+			}
+			FrameObj->SetNumberField(TEXT("single_node_time"), SingleNode->GetCurrentTime());
+		}
 		FrameResults.Add(MakeShared<FJsonValueObject>(FrameObj));
 	}
 
@@ -3528,6 +3680,7 @@ FMonolithActionResult FMonolithEditorActions::HandleImportTexture(
 	FString PackageFilename = FPackageName::LongPackageNameToFilename(
 		Package->GetName(), FPackageName::GetAssetPackageExtension());
 	FSavePackageArgs SaveArgs;
+	SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
 	UPackage::SavePackage(Package, Texture, *PackageFilename, SaveArgs);
 
 	// Return result
@@ -3771,6 +3924,7 @@ FMonolithActionResult FMonolithEditorActions::HandleStitchFlipbook(
 	FString PackageFilename = FPackageName::LongPackageNameToFilename(
 		Package->GetName(), FPackageName::GetAssetPackageExtension());
 	FSavePackageArgs SaveArgs;
+	SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
 	bool bSaved = UPackage::SavePackage(Package, Texture, *PackageFilename, SaveArgs);
 
 	if (!bSaved)
@@ -4009,18 +4163,135 @@ FMonolithActionResult FMonolithEditorActions::HandleDeleteAssets(
 	Result->SetNumberField(TEXT("requested"), AssetPaths.Num());
 	Result->SetNumberField(TEXT("found"), ObjectsToDelete.Num());
 
-	// Surface partial failures. The ObjectTools API returns only a count, not
-	// which objects survived, so this is count-derived: when fewer objects were
-	// deleted than were found, report the requested-and-found paths (pass
-	// force=true to delete referenced assets the soft path refuses).
+	// Surface partial failures. The ObjectTools API returns only a count, so the
+	// survivors are found by re-resolving each attempted path after the delete.
+	// For each survivor, explain why: on-disk package referencers from the asset
+	// registry (excluding the rest of this delete set), then in-memory referencers
+	// from the same reference search ObjectTools runs. The in-memory list cannot
+	// name every holder (e.g. native code holding a raw pointer shows no referencer).
 	if (NumDeleted < ObjectsToDelete.Num())
 	{
-		TArray<TSharedPtr<FJsonValue>> FailedArr;
+		constexpr int32 MaxReferencersListed = 20;
+		IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+
+		TSet<FName> DeleteSetPackages;
 		for (const FString& P : AttemptedPaths)
 		{
+			DeleteSetPackages.Add(FName(*FPackageName::ObjectPathToPackageName(P)));
+		}
+
+		TArray<TSharedPtr<FJsonValue>> FailedArr;
+		TArray<TSharedPtr<FJsonValue>> FailuresArr;
+		for (const FString& P : AttemptedPaths)
+		{
+			UObject* Survivor = FindObject<UObject>(nullptr, *P);
+			const bool bInMemory = IsValid(Survivor);
+			const bool bInRegistry = AR.GetAssetByObjectPath(FSoftObjectPath(P)).IsValid();
+			if (!bInMemory && !bInRegistry)
+			{
+				continue; // deleted
+			}
 			FailedArr.Add(MakeShared<FJsonValueString>(P));
+
+			TSharedPtr<FJsonObject> Failure = MakeShared<FJsonObject>();
+			Failure->SetStringField(TEXT("path"), P);
+
+			// On-disk referencers (package-level, as recorded by the asset registry).
+			const FName PackageName(*FPackageName::ObjectPathToPackageName(P));
+			TArray<FName> PackageReferencers;
+			AR.GetReferencers(PackageName, PackageReferencers);
+			TArray<FString> ExternalPackageRefs;
+			for (const FName& Ref : PackageReferencers)
+			{
+				if (Ref != PackageName && !DeleteSetPackages.Contains(Ref))
+				{
+					ExternalPackageRefs.Add(Ref.ToString());
+				}
+			}
+			ExternalPackageRefs.Sort();
+
+			// In-memory referencers (same search ObjectTools uses to refuse the delete).
+			bool bReferenced = false;
+			bool bReferencedByUndo = false;
+			TArray<FString> MemoryRefs;
+			int32 MemoryRefCount = 0;
+			if (bInMemory)
+			{
+				FReferencerInformationList MemoryReferences;
+				ObjectTools::GatherObjectReferencersForDeletion(Survivor, bReferenced, bReferencedByUndo, &MemoryReferences);
+				TSet<FString> Seen;
+				for (const FReferencerInformation& Info : MemoryReferences.ExternalReferences)
+				{
+					if (Info.Referencer)
+					{
+						const FString RefPath = Info.Referencer->GetPathName();
+						if (!Seen.Contains(RefPath))
+						{
+							Seen.Add(RefPath);
+							++MemoryRefCount;
+							if (MemoryRefs.Num() < MaxReferencersListed)
+							{
+								MemoryRefs.Add(RefPath);
+							}
+						}
+					}
+				}
+			}
+
+			FString Reason;
+			if (ExternalPackageRefs.Num() > 0)
+			{
+				Reason = FString::Printf(TEXT("referenced by %d other package(s) on disk"), ExternalPackageRefs.Num());
+			}
+			else if (MemoryRefCount > 0 || bReferenced)
+			{
+				Reason = TEXT("referenced in memory (open editor, loaded level, or another loaded object)");
+			}
+			else if (bReferencedByUndo)
+			{
+				Reason = TEXT("referenced by the undo buffer (transaction history)");
+			}
+			else
+			{
+				Reason = TEXT("delete refused for an unreported cause (see LogObjectTools in the editor log)");
+			}
+			if (!bForce)
+			{
+				Reason += TEXT("; force=true deletes it anyway and nulls the referencers");
+			}
+			Failure->SetStringField(TEXT("reason"), Reason);
+			Failure->SetBoolField(TEXT("referenced_by_undo"), bReferencedByUndo);
+
+			TArray<TSharedPtr<FJsonValue>> PkgRefArr;
+			for (int32 i = 0; i < ExternalPackageRefs.Num() && i < MaxReferencersListed; ++i)
+			{
+				PkgRefArr.Add(MakeShared<FJsonValueString>(ExternalPackageRefs[i]));
+			}
+			Failure->SetArrayField(TEXT("referencers"), PkgRefArr);
+			Failure->SetNumberField(TEXT("referencer_count"), ExternalPackageRefs.Num());
+
+			TArray<TSharedPtr<FJsonValue>> MemRefArr;
+			for (const FString& R : MemoryRefs)
+			{
+				MemRefArr.Add(MakeShared<FJsonValueString>(R));
+			}
+			Failure->SetArrayField(TEXT("in_memory_referencers"), MemRefArr);
+			Failure->SetNumberField(TEXT("in_memory_referencer_count"), MemoryRefCount);
+
+			FailuresArr.Add(MakeShared<FJsonValueObject>(Failure));
+		}
+
+		// Survivor detection found nothing although the count is short: fall back to
+		// the old count-derived report so a failure is never silently dropped.
+		if (FailedArr.Num() == 0)
+		{
+			for (const FString& P : AttemptedPaths)
+			{
+				FailedArr.Add(MakeShared<FJsonValueString>(P));
+			}
 		}
 		Result->SetArrayField(TEXT("failed_to_delete"), FailedArr);
+		Result->SetArrayField(TEXT("failures"), FailuresArr);
 	}
 
 	if (NotFound.Num() > 0)
@@ -4856,10 +5127,15 @@ FMonolithActionResult FMonolithEditorActions::HandleSavePackages(const TSharedPt
 		Row->SetBoolField(TEXT("is_map"), bIsMap);
 		Row->SetStringField(TEXT("disk_path"), Filename);
 
+		IFileManager& FileManager = IFileManager::Get();
+		const bool bOnDiskReadOnly = FileManager.FileExists(*Filename) && FileManager.IsReadOnly(*Filename);
+		Row->SetBoolField(TEXT("read_only"), bOnDiskReadOnly);
+
 		if (bDryRun)
 		{
 			// Report intent only — nothing is written. A package "would save" if it is
-			// currently dirty; clean packages are reported as no-op.
+			// currently dirty; clean packages are reported as no-op. A read-only target
+			// is reported as dirty/would_save, but requires explicit checkout first.
 			const bool bWouldSave = Package->IsDirty();
 			Row->SetBoolField(TEXT("would_save"), bWouldSave);
 			Row->SetBoolField(TEXT("dirty"), bWouldSave);
@@ -4868,13 +5144,31 @@ FMonolithActionResult FMonolithEditorActions::HandleSavePackages(const TSharedPt
 			continue;
 		}
 
+		// Issue #147: a read-only target can make FinalizeTempOutputFiles fatal.
+		// Callers manage source-control checkout explicitly, so
+		// report an explicit error without implicitly checking out any file.
+		if (bOnDiskReadOnly)
+		{
+			Row->SetBoolField(TEXT("checked_out"), false);
+			Row->SetBoolField(TEXT("saved"), false);
+			Row->SetStringField(TEXT("error"),
+				TEXT("read-only on disk, not checked out (check out the exact file before saving)"));
+			Rows.Add(MakeShared<FJsonValueObject>(Row));
+			continue;
+		}
+
 		FSavePackageArgs SaveArgs;
 		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		// FSavePackageArgs::Error defaults to GError. On a save failure the engine
+		// logs "Error saving ..." through that device, and the Windows GError device
+		// (FWindowsErrorOutputDevice) is fatal regardless of verbosity. Route it to
+		// GWarn so a failed save returns false instead of taking the editor down.
+		SaveArgs.Error = GWarn;
 		const bool bSaved = UPackage::SavePackage(Package, nullptr, *Filename, SaveArgs);
 
 		Row->SetBoolField(TEXT("saved"), bSaved);
 		if (bSaved) { ++SavedCount; }
-		else { Row->SetStringField(TEXT("error"), TEXT("UPackage::SavePackage returned false")); }
+		else { Row->SetStringField(TEXT("error"), TEXT("UPackage::SavePackage returned false (see LogSavePackage in the editor log)")); }
 		Rows.Add(MakeShared<FJsonValueObject>(Row));
 	}
 
@@ -5593,12 +5887,43 @@ namespace MonolithEditorPieSmoke
 
 			// #7 capture-validity report. Uniform / all-black frames (the hidden-editor /
 			// no-active-level-viewport failure mode) are flagged invalid; captured_ok is
-			// true only when at least one valid frame landed and none were invalid.
+			// true only when at least one valid frame landed, none were invalid, and the
+			// clip is not short of frames (issue #149).
 			TSharedPtr<FJsonObject> Validity = MakeShared<FJsonObject>();
 			Validity->SetNumberField(TEXT("valid_frames"), S.ValidFrames);
 			Validity->SetNumberField(TEXT("invalid_frames"), S.InvalidFrames);
-			const bool bCapturedOk = (S.ValidFrames > 0) && (S.InvalidFrames == 0);
+			Validity->SetNumberField(TEXT("not_drawn_frames"), S.NotDrawnFrames);
+
+			// Issue #149: expected frames over the observed capture window (wall-clock, so a
+			// hitch or debugger pause still counts against the clip). A clip that saved fewer
+			// than half the expected frames is a shortfall and fails captured_ok. The 50%
+			// threshold leaves room for tick quantisation (each capture lands on the first
+			// tick past the interval, so low editor frame rates stretch the effective interval).
+			const double ObservedWindow = (S.LastObservedSeconds > S.StartTimeSeconds)
+				? FMath::Min(S.LastObservedSeconds - S.StartTimeSeconds, S.DurationSeconds)
+				: 0.0;
+			const int32 ExpectedFrames = (S.CaptureInterval > 0.0)
+				? FMath::Max(1, FMath::FloorToInt32(ObservedWindow / S.CaptureInterval))
+				: 1;
+			const int32 CapturedFrames = S.CaptureFrameIndex;
+			const int32 MinFrames = FMath::CeilToInt32(ExpectedFrames * 0.5);
+			const bool bShortfall = CapturedFrames < MinFrames;
+			Validity->SetNumberField(TEXT("expected_frames"), ExpectedFrames);
+			Validity->SetNumberField(TEXT("captured_frames"), CapturedFrames);
+			Validity->SetNumberField(TEXT("min_frames_required"), MinFrames);
+			Validity->SetBoolField(TEXT("frame_shortfall"), bShortfall);
+			Validity->SetNumberField(TEXT("max_capture_gap_seconds"), S.MaxCaptureGapSeconds);
+
+			const bool bCapturedOk = (S.ValidFrames > 0) && (S.InvalidFrames == 0) && !bShortfall;
 			Validity->SetBoolField(TEXT("captured_ok"), bCapturedOk);
+			if (bShortfall)
+			{
+				Validity->SetStringField(TEXT("shortfall_hint"), FString::Printf(
+					TEXT("Captured %d of ~%d expected frames (%d skipped as not drawn, largest gap %.2fs). ")
+					TEXT("Frame scheduling uses wall-clock time, so a hitch, debugger pause, minimized ")
+					TEXT("window, or realtime-off viewport consumes the clip duration."),
+					CapturedFrames, ExpectedFrames, S.NotDrawnFrames, S.MaxCaptureGapSeconds));
+			}
 			// include_ui frames are written asynchronously at end-of-frame by the engine
 			// screenshot path, so no pixel buffer reaches this accounting — the counts are
 			// frames REQUESTED, not frames verified. Say so rather than implying a check ran.

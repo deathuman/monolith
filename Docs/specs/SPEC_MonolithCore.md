@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.23.0 (Beta)
+**Version:** 0.24.0 (Beta)
 
 ---
 
@@ -19,8 +19,8 @@
 | `FMonolithToolRegistry` | Central singleton action registry. `TMap<FString, FRegisteredAction>` keyed by "namespace.action". Thread-safe — releases lock before executing handlers. Validates required params from schema before dispatch (skips `asset_path` — `GetAssetPath()` handles aliases itself). Returns descriptive error listing missing + provided keys |
 | `FMonolithJsonUtils` | Static JSON-RPC 2.0 helpers. Standard error codes (-32700 through -32603). Declares `LogMonolith` category |
 | `FMonolithAssetUtils` | Asset loading with 4-tier fallback: StaticLoadObject(resolved) -> PackageName.ObjectName -> FindObject+_C suffix -> ForEachObjectWithPackage |
-| `UMonolithSettings` | UDeveloperSettings (config=Monolith). ServerPort, bAutoUpdateEnabled, DatabasePathOverride, EngineSourceDBPathOverride, EngineSourcePath, module enable toggles, `bEnableEditorAccessibilityBridge` (default false), `bEnableProceduralTownGen` (experimental, default false), LogVerbosity. Settings UI customized via `FMonolithSettingsCustomization` (IDetailCustomization) with re-index buttons for project and source databases |
-| `UMonolithUpdateSubsystem` | UEditorSubsystem. GitHub Releases auto-updater. Shows dialog window with full release notes on update detection. Downloads zip, cross-platform extraction (PowerShell on Windows, unzip on Mac/Linux). Stages to Saved/Monolith/Staging/, hot-swaps on editor exit via FCoreDelegates::OnPreExit. Current version always from compiled MONOLITH_VERSION (version.json only stores pending/staging state). Release zips include pre-compiled DLLs. |
+| `UMonolithSettings` | UDeveloperSettings (config=Monolith). ServerPort, bAutoUpdateEnabled, DatabasePathOverride, EngineSourceDBPathOverride, EngineSourcePath, 10 module enable toggles (functional — checked at registration time), `bEnableEditorAccessibilityBridge` (default false; startup and restart behavior below), `bEnableProceduralTownGen` (experimental, default false), LogVerbosity. Settings UI customized via `FMonolithSettingsCustomization` (IDetailCustomization) with re-index buttons for project and source databases |
+| `UMonolithUpdateSubsystem` | UEditorSubsystem. GitHub Releases auto-updater. Shows the full release notes after selecting an explicit `Monolith-*.zip` release asset; repository `zipball_url` source archives and unrelated ZIPs are rejected because they do not satisfy the plugin binary contract. Per-engine selection uses the stable `Monolith-` prefix plus `-UE5.<minor>.zip` suffix. Downloads zip, cross-platform extraction (PowerShell on Windows, unzip on Mac/Linux). Stages to Saved/Monolith/Staging/, hot-swaps on editor exit via FCoreDelegates::OnPreExit. Current version always from compiled MONOLITH_VERSION (version.json only stores pending/staging state). Release zips include pre-compiled DLLs. |
 | `FMonolithCoreTools` | Registers 4 core actions |
 | `FBulkFillSpec` | USTRUCT (`BlueprintType`). Input shape for `bulk_fill_query("apply")`: `target_namespace`, `target` (asset path or class), nested JSON `tree`, plus `dry_run` / `strict` toggles. Same shape consumed by every per-namespace adapter registered via `FMonolithBulkFillRegistry`. |
 | `FDryRunReport` | USTRUCT (`BlueprintType`). Output shape returned when `dry_run=true`. Carries per-field `FieldWrites`, `SilentDrops` (with reason — covers `FGameplayAttribute`-rename hazard class and other type-mismatch / unknown-field cases), `Clamps` (engine clamp annotations such as the AI `lose_sight_radius >= 1.1 × sight_radius` rule), `Errors`. Promoted to hard error and transaction-rollback when `strict=true`. |
