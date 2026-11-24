@@ -1,9 +1,15 @@
 #include "MonolithAssetUtils.h"
+#include "MonolithSettings.h"
+#include "HAL/FileManager.h"
+#include "Misc/FeedbackContext.h"
+#include "Misc/PackageName.h"
+#include "UObject/SavePackage.h"
 #include "Misc/Paths.h"
 #include "MonolithJsonUtils.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "AssetRegistry/AssetData.h"
+#include "FileHelpers.h"
 #include "UObject/SoftObjectPath.h"
 #include "UObject/UObjectHash.h"
 #include "UObject/Package.h"
@@ -194,4 +200,68 @@ TArray<FAssetData> FMonolithAssetUtils::GetAssetsByClass(const FTopLevelAssetPat
 FString FMonolithAssetUtils::GetAssetName(const FString& AssetPath)
 {
 	return FPackageName::GetShortName(AssetPath);
+}
+
+bool FMonolithAssetUtils::SaveAssetPackage(UPackage* Package, FString* OutError)
+{
+	auto Fail = [OutError](FString&& Reason) -> bool
+	{
+		UE_LOG(LogMonolith, Warning, TEXT("%s"), *Reason);
+		if (nullptr != OutError)
+		{
+			*OutError = MoveTemp(Reason);
+		}
+		return false;
+	};
+
+	if (nullptr == Package)
+	{
+		return Fail(TEXT("No package to save."));
+	}
+
+	// SavePackages silently drops these and still reports success.
+	if (Package == GetTransientPackage() || Package->HasAnyPackageFlags(PKG_CompiledIn))
+	{
+		return Fail(FString::Printf(TEXT("'%s' is not a savable asset package."), *Package->GetName()));
+	}
+
+	// Same guard UEditorAssetSubsystem::SaveLoadedAsset sets, so the save path takes its
+	// no-prompt branches instead of raising a modal the MCP caller cannot answer.
+	TGuardValue<bool> UnattendedScriptGuard(GIsRunningUnattendedScript, true);
+
+	// Some projects own checkout and add operations through an external workflow.
+	// In that mode, save only the explicitly requested package without invoking
+	// the editor's implicit source-control or external-package operations.
+	if (!GetDefault<UMonolithSettings>()->bAutoCheckoutOnSave)
+	{
+		FString Filename;
+		const FString Extension = Package->ContainsMap() ? FPackageName::GetMapPackageExtension()
+			: FPackageName::GetAssetPackageExtension();
+		if (!FPackageName::TryConvertLongPackageNameToFilename(Package->GetName(), Filename, Extension))
+		{
+			return Fail(FString::Printf(TEXT("Cannot resolve package filename for '%s'."), *Package->GetName()));
+		}
+		if (IFileManager::Get().IsReadOnly(*Filename))
+		{
+			return Fail(FString::Printf(TEXT("'%s' is read-only; check out the exact file before saving."), *Filename));
+		}
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		SaveArgs.Error = GWarn;
+		if (!UPackage::SavePackage(Package, nullptr, *Filename, SaveArgs))
+		{
+			return Fail(FString::Printf(TEXT("Saving '%s' failed; see LogSavePackage."), *Package->GetName()));
+		}
+		return true;
+	}
+
+	const TArray<UPackage*> Packages = { Package };
+	if (!UEditorLoadingAndSavingUtils::SavePackages(Packages, /*bOnlyDirty*/ false))
+	{
+		return Fail(FString::Printf(
+			TEXT("Saving '%s' failed. If it is under revision control, check that it is not ")
+			TEXT("checked out or locked by someone else."), *Package->GetName()));
+	}
+
+	return true;
 }

@@ -9637,7 +9637,7 @@ FMonolithActionResult FMonolithAnimationActions::HandleAddMontageAnimSegment(con
 	Montage->Modify();
 
 	FAnimSegment NewSeg;
-	NewSeg.SetAnimReference(Anim);
+	NewSeg.SetAnimReference(Anim, true);
 	NewSeg.StartPos = StartPos;
 	NewSeg.AnimStartTime = AnimStartTime;
 	NewSeg.AnimEndTime = AnimEndTime;

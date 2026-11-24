@@ -12,7 +12,7 @@
 
 Most MCP integrations for Unreal register every action as a separate tool. That floods the AI's context window with hundreds of tool names before you've asked a single question — and the actually useful stuff gets buried. I built Monolith because I wanted my AI to spend its context on my problem, not on memorising a tool catalogue.
 
-One plugin. One MCP endpoint. A handful of namespace-dispatch tools instead of ~1,400+. The AI calls `monolith_discover()` and `monolith_guide()` when it needs to know what's available, and otherwise just hits `blueprint_query("create_blueprint", ...)`, `material_query("compile", ...)`, and so on. `monolith_discover()` is terse by default — each action returns just a name and a one-line description, so listing a namespace costs almost nothing; the full param schema is one `describe_query("action_schema", ...)` call (or `detail=true`) away when the AI actually needs it.
+One plugin. One MCP endpoint. A handful of namespace-dispatch tools instead of ~1,500+. The AI calls `monolith_discover()` and `monolith_guide()` when it needs to know what's available, and otherwise just hits `blueprint_query("create_blueprint", ...)`, `material_query("compile", ...)`, and so on. `monolith_discover()` is terse by default — each action returns just a name and a one-line description, so listing a namespace costs almost nothing; the full param schema is one `describe_query("action_schema", ...)` call (or `detail=true`) away when the AI actually needs it.
 
 I use it every day. It does what I need.
 
@@ -20,9 +20,9 @@ I use it every day. It does what I need.
 
 ## What it does
 
-Monolith exposes **~1,400+ actions across 26 in-tree namespaces** through a namespace-dispatch pattern: each domain registers a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` lists everything available. (Exact counts are intentionally approximate — query `monolith_discover()` for the live figure.)
+Monolith exposes **~1,500+ actions across 27 in-tree namespaces** through a namespace-dispatch pattern: each domain registers a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` lists everything available. (Exact counts are intentionally approximate — query `monolith_discover()` for the live figure.)
 
-Covered domains: Blueprints, Materials, Animation, Niagara, Mesh, UI (incl. CommonUI), AI (Behavior Trees, State Trees, EQS, Smart Objects, Perception, Navigation), Gameplay Ability System, Logic Driver state machines, ComboGraph combo trees, Audio (Sound Cues + MetaSounds), Editor control (UBT builds, log capture, scene capture, asset preview & inspection), Engine source search (1M+ symbols, fully offline), Project asset search (SQLite FTS5), INI config, Level Sequences, a `bulk_fill` / `describe` reflection framework for deep property writes, a `monolith_guide` self-onboarding tool for your AI, plus the new v0.17.0 **Reflection Intelligence** layer: `decision` (architectural decision-record harvest), `risk` (repo-level hotspot + co-change + conditional-gate signals), `cppreflect` (UE 5.7 UHT reflection-edge queries cross-joined with the asset registry), `network` (replication inspection — replicated classes, RPCs, OnRep handlers, unbalanced-handler audits), `pipeline` (read-only composer actions for PR review + release pre-flight), and `reflect` (index maintenance — a project-only force-rebuild of the reflection tables). The `cppreflect` and `network` indexers scan your project plugins by default, so replicated classes and RPCs declared in plugins are in scope without extra setup; enabled marketplace plugins are gated behind a setting, and Epic engine built-ins stay excluded.
+Covered domains: Blueprints, Materials, Animation, Niagara, Mesh, UI (incl. CommonUI), AI (Behavior Trees, State Trees, EQS, Smart Objects, Perception, Navigation), Gameplay Ability System, Logic Driver state machines, ComboGraph combo trees, Audio (Sound Cues + MetaSounds), Editor control (UBT builds, log capture, scene capture, asset preview & inspection), Engine source search (1M+ symbols, fully offline), Project asset search (SQLite FTS5), INI config, Level Sequences, Gameplay Tags (reference lookups, unused/broken audits, ini tag editing), a `bulk_fill` / `describe` reflection framework for deep property writes, a `monolith_guide` self-onboarding tool for your AI, plus the new v0.17.0 **Reflection Intelligence** layer: `decision` (architectural decision-record harvest), `risk` (repo-level hotspot + co-change + conditional-gate signals), `cppreflect` (UE 5.7 UHT reflection-edge queries cross-joined with the asset registry), `network` (replication inspection — replicated classes, RPCs, OnRep handlers, unbalanced-handler audits), `pipeline` (read-only composer actions for PR review + release pre-flight), and `reflect` (index maintenance — a project-only force-rebuild of the reflection tables). The `cppreflect` and `network` indexers scan your project plugins by default, so replicated classes and RPCs declared in plugins are in scope without extra setup; enabled marketplace plugins are gated behind a setting, and Epic engine built-ins stay excluded.
 
 **MCP LLM Ergonomics** (also new in v0.17.0): universal response shaping (`_fields` / `_omit` / `_compact_json`) on every action, schema-tagged param kinds with automatic `\` → `/` rewrite on asset paths, `did_you_mean` fuzzy match on dispatch errors, MCP `tools/list` annotations (read-only / destructive / idempotent hints), `source_query` cursor pagination, and a proxy-side JSONL call log. The whole point is to let your AI spend less context recovering from typos and trial-and-error.
 
@@ -85,7 +85,7 @@ Details: [wiki Tool Reference](https://github.com/tumourlove/monolith/wiki/Tool-
 
 ## Auto-updater
 
-Off by default as of v0.14.6. Opt in via **Auto Update Enabled** in Editor Preferences > Plugins > Monolith — checks GitHub Releases on editor startup, verifies the downloaded zip's SHA256 against the release-notes marker, swaps the plugin on editor exit (after a Y/N prompt). See [Auto-Updater wiki](https://github.com/tumourlove/monolith/wiki/Auto-Updater).
+Off by default as of v0.14.6. Opt in via **Auto Update Enabled** in Project Settings > Plugins > Monolith — checks GitHub Releases on editor startup, verifies the downloaded zip's SHA256 against the release-notes marker, swaps the plugin on editor exit (after a Y/N prompt). See [Auto-Updater wiki](https://github.com/tumourlove/monolith/wiki/Auto-Updater).
 
 ---
 
@@ -93,7 +93,7 @@ Off by default as of v0.14.6. Opt in via **Auto Update Enabled** in Editor Prefe
 
 Monolith starts a local HTTP server on port 9316 to receive MCP traffic. UE's `FHttpServerModule` does **not** expose a bind-address parameter, so the listener is reachable on all network interfaces, not just `127.0.0.1`. CORS is restricted to localhost origins (which blocks browser-based cross-origin reads) but does **not** block direct HTTP requests from other devices on the same LAN.
 
-If you work on an untrusted network: either add a Windows Firewall rule blocking inbound TCP on port 9316 from non-loopback addresses, or untick **MCP Server Enabled** in Editor Preferences > Plugins > Monolith and restart the editor.
+If you work on an untrusted network: either add a Windows Firewall rule blocking inbound TCP on port 9316 from non-loopback addresses, or untick **MCP Server Enabled** in Project Settings > Plugins > Monolith and restart the editor.
 
 See [SECURITY.md](SECURITY.md) for the full threat model and disclosure policy.
 

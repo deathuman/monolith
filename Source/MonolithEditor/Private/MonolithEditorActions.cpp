@@ -82,6 +82,7 @@
 // Scripting action includes (HOFF 7)
 #include "IPythonScriptPlugin.h"
 #include "PythonScriptTypes.h"
+#include "MonolithPythonGlobalsScope.h"
 #include "LevelEditorSubsystem.h"
 #include "Editor.h"
 
@@ -137,6 +138,7 @@
 #include "GameFramework/WorldSettings.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/PlayerStart.h"
+#include "MonolithAssetUtils.h"
 
 // --- Compile state ---
 
@@ -627,7 +629,7 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Optional(TEXT("marker"), TEXT("string"), TEXT("Log marker token. Default MONOLITH_CLIP."), TEXT("MONOLITH_CLIP"))
 			.Optional(TEXT("duration"), TEXT("number"), TEXT("Seconds the editor loop advances PIE before the session auto-completes (clamped 0-120). Default 5."), TEXT("5"))
 			.Optional(TEXT("capture_interval"), TEXT("number"), TEXT("Seconds between captured frames (clamped 0.05-5). Default 0.25."), TEXT("0.25"))
-			.Optional(TEXT("include_ui"), TEXT("bool"), TEXT("Capture the composited backbuffer (game + UMG/Slate UI) via the engine screenshot path — the `shot showui` mechanism — instead of the scene-only viewport read. Required for any UI iteration: the default ReadPixels path never sees UMG, so a UI capture comes back as an empty scene. CAVEATS: (1) the file is written at END OF FRAME (async), so the per-frame uniformity/validity check does NOT apply — these frames are reported as requested-valid and the clip directory is the ground truth; (2) with PIE docked in the editor the backbuffer is the WHOLE EDITOR WINDOW — use new-window PIE for a clean game+UI clip. Default false (no behaviour change)."), TEXT("false"))
+			.Optional(TEXT("include_ui"), TEXT("bool"), TEXT("Capture the PIE game viewport's own widget with the Slate UI composited into it (game + UMG/HUD), instead of the scene-only viewport read. Required for any UI iteration: the default ReadPixels path never sees UMG, so a UI capture comes back as an empty scene. The widget is taken and the PNG written in-process, so the per-frame uniformity/validity check applies like any other frame; the picture is the game viewport only, docked PIE or window PIE (never a global screenshot request, which a drawing editor viewport would take). Default false (no behaviour change)."), TEXT("false"))
 			.Optional(TEXT("sample_vars"), TEXT("array"), TEXT("AnimInstance variable names sampled each frame. Default [GroundSpeed, bShouldMove, DesiredYawDelta]."))
 			.Optional(TEXT("pawn_class"), TEXT("string"), TEXT("Substring of the target pawn's class name to sample. Omit to use the first player controller's pawn."))
 			.Optional(TEXT("console_script"), TEXT("array"), TEXT("Console commands run on the PIE world at start (drive the movement)."))
@@ -843,7 +845,9 @@ void FMonolithEditorActions::RegisterActions(FMonolithLogCapture* LogCapture)
 			.Required(TEXT("command"), TEXT("string"), TEXT("Python source. May be inline code, a single statement, or a file path with optional space-separated args (when mode=execute_file)."))
 			.Optional(TEXT("mode"), TEXT("string"), TEXT("Execution mode: execute_file (default — multi-statement script or file with args), execute_statement (single stmt, prints result), evaluate_statement (single expr, returns result in 'result')."), TEXT("execute_file"))
 			.Optional(TEXT("unattended"), TEXT("bool"), TEXT("Set GIsRunningUnattendedScript=true to suppress UI dialogs."), TEXT("false"))
-			.Optional(TEXT("file_scope"), TEXT("string"), TEXT("Scope for execute_file: private (isolated locals/globals — default), public (shared with REPL console)."), TEXT("private"))
+			.Optional(TEXT("file_scope"), TEXT("string"), TEXT("Scope for execute_file when command is a .py path: private (isolated locals/globals — default), public (shared with REPL console). Inline code always runs in the shared console globals."), TEXT("private"))
+			.Optional(TEXT("clean_globals"), TEXT("bool"), TEXT("Remove the top-level names this call creates from the shared console globals afterwards, clear builtins._ and run gc.collect(), so UObjects (and their worlds) referenced only from those names can be garbage collected. Off by default: globals persist across run_python calls, which multi-call workflows and self-unregistering slate tick callbacks rely on. Names stored elsewhere, such as module attributes, are never removed. pie_smoke python stages always clean up."), TEXT("false"))
+			.Optional(TEXT("keep_globals"), TEXT("bool"), TEXT("Legacy inverse of clean_globals (keep_globals=false == clean_globals=true). Ignored when clean_globals is passed."))
 			.Build());
 
 	Registry.RegisterAction(TEXT("editor"), TEXT("load_level"),
@@ -3677,11 +3681,7 @@ FMonolithActionResult FMonolithEditorActions::HandleImportTexture(
 
 	// Save the package
 	UPackage* Package = Texture->GetOutermost();
-	FString PackageFilename = FPackageName::LongPackageNameToFilename(
-		Package->GetName(), FPackageName::GetAssetPackageExtension());
-	FSavePackageArgs SaveArgs;
-	SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
-	UPackage::SavePackage(Package, Texture, *PackageFilename, SaveArgs);
+	FMonolithAssetUtils::SaveAssetPackage(Package);
 
 	// Return result
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -3921,11 +3921,7 @@ FMonolithActionResult FMonolithEditorActions::HandleStitchFlipbook(
 	Texture->MarkPackageDirty();
 
 	// Save
-	FString PackageFilename = FPackageName::LongPackageNameToFilename(
-		Package->GetName(), FPackageName::GetAssetPackageExtension());
-	FSavePackageArgs SaveArgs;
-	SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
-	bool bSaved = UPackage::SavePackage(Package, Texture, *PackageFilename, SaveArgs);
+	bool bSaved = FMonolithAssetUtils::SaveAssetPackage(Package);
 
 	if (!bSaved)
 	{
@@ -4744,6 +4740,18 @@ FMonolithActionResult FMonolithEditorActions::HandleRunPython(const TSharedPtr<F
 	bool bUnattended = false;
 	Params->TryGetBoolField(TEXT("unattended"), bUnattended);
 
+	// Globals persist by default; clean_globals opts in to the cleanup. keep_globals is the
+	// earlier inverse spelling and is honoured when clean_globals is absent.
+	bool bCleanGlobals = false;
+	if (!Params->TryGetBoolField(TEXT("clean_globals"), bCleanGlobals))
+	{
+		bool bKeepGlobals = true;
+		if (Params->TryGetBoolField(TEXT("keep_globals"), bKeepGlobals))
+		{
+			bCleanGlobals = !bKeepGlobals;
+		}
+	}
+
 	FString ScopeStr = TEXT("private");
 	Params->TryGetStringField(TEXT("file_scope"), ScopeStr);
 	EPythonFileExecutionScope FileScope = EPythonFileExecutionScope::Private;
@@ -4785,7 +4793,11 @@ FMonolithActionResult FMonolithEditorActions::HandleRunPython(const TSharedPtr<F
 	Cmd.FileExecutionScope = FileScope;
 	Cmd.Flags = bUnattended ? EPythonCommandFlags::Unattended : EPythonCommandFlags::None;
 
-	const bool bOk = Python->ExecPythonCommandEx(Cmd);
+	bool bOk = false;
+	{
+		FMonolithPythonGlobalsScope GlobalsScope(*Python, bCleanGlobals);
+		bOk = Python->ExecPythonCommandEx(Cmd);
+	}
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("ok"), bOk);
@@ -5430,6 +5442,7 @@ namespace MonolithEditorPieSmoke
 					FPythonCommandEx Cmd;
 					Cmd.Command = PythonScript;
 					Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
+					FMonolithPythonGlobalsScope GlobalsScope(*Python);
 					Python->ExecPythonCommandEx(Cmd);
 				}
 			}
@@ -5740,7 +5753,10 @@ namespace MonolithEditorPieSmoke
 					FPythonCommandEx Cmd;
 					Cmd.Command = Stages.PrePie.Python;
 					Cmd.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
-					Stages.PrePie.bPythonOk = Python->ExecPythonCommandEx(Cmd);
+					{
+						FMonolithPythonGlobalsScope GlobalsScope(*Python);
+						Stages.PrePie.bPythonOk = Python->ExecPythonCommandEx(Cmd);
+					}
 					Stages.PrePie.PythonOutput = Cmd.CommandResult;
 				}
 				else { Stages.PrePie.PythonOutput = TEXT("Python not available in this build."); }
@@ -5924,17 +5940,9 @@ namespace MonolithEditorPieSmoke
 					TEXT("window, or realtime-off viewport consumes the clip duration."),
 					CapturedFrames, ExpectedFrames, S.NotDrawnFrames, S.MaxCaptureGapSeconds));
 			}
-			// include_ui frames are written asynchronously at end-of-frame by the engine
-			// screenshot path, so no pixel buffer reaches this accounting — the counts are
-			// frames REQUESTED, not frames verified. Say so rather than implying a check ran.
-			Validity->SetBoolField(TEXT("uniformity_checked"), !S.bIncludeUi);
-			if (S.bIncludeUi)
-			{
-				Validity->SetStringField(TEXT("note"),
-					TEXT("include_ui=true: frames are written end-of-frame by the engine screenshot ")
-					TEXT("path, so per-frame uniformity/validity was NOT verified — these counts are ")
-					TEXT("frames requested. Inspect the files in output_dir to confirm."));
-			}
+			// include_ui frames are the game viewport's own widget, taken and written in-process
+			// (CapturePieFrameWithUi), so every frame's pixels are checked like a scene-only frame.
+			Validity->SetBoolField(TEXT("uniformity_checked"), true);
 			if (S.InvalidFrames > 0 && S.ValidFrames == 0)
 			{
 				Validity->SetStringField(TEXT("hint"),

@@ -34,6 +34,7 @@
 
 // MonolithUI shared color parser (no-degamma path; matches MD_UI material expectations).
 #include "MonolithUICommon.h"
+#include "MonolithAssetUtils.h"
 
 namespace MonolithUI::GradientInternal
 {
@@ -336,18 +337,12 @@ FMonolithActionResult MonolithUI::FGradientActions::HandleCreateGradientMidFromS
 
     if (bSave)
     {
-        const FString PackageFilename = FPackageName::LongPackageNameToFilename(
-            Package->GetName(), FPackageName::GetAssetPackageExtension());
-
-        FSavePackageArgs SaveArgs;
-        SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
-        SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-        SaveArgs.SaveFlags = SAVE_NoError;
-        const bool bSaved = UPackage::SavePackage(Package, MIC, *PackageFilename, SaveArgs);
+        FString SaveError;
+        const bool bSaved = FMonolithAssetUtils::SaveAssetPackage(Package, &SaveError);
         if (!bSaved)
         {
             return FMonolithActionResult::Error(
-                FString::Printf(TEXT("UPackage::SavePackage failed for '%s'"), *PackageFilename),
+                FString::Printf(TEXT("Gradient material instance created in memory but not saved to disk: %s"), *SaveError),
                 -32603);
         }
     }

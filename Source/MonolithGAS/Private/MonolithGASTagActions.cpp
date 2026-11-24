@@ -15,6 +15,7 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Misc/FileHelper.h"
 #include "UObject/SavePackage.h"
+#include "MonolithAssetUtils.h"
 
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -24,7 +25,7 @@
 void FMonolithGASTagActions::RegisterActions(FMonolithToolRegistry& Registry)
 {
 	Registry.RegisterAction(TEXT("gas"), TEXT("add_gameplay_tags"),
-		TEXT("Batch-add gameplay tags. Adds to DefaultGameplayTags.ini by default, or to a DataTable if table_path is provided. Auto-creates parent hierarchy."),
+		TEXT("Batch-add gameplay tags. Adds to DefaultGameplayTags.ini by default, or to a DataTable if table_path is provided. Auto-creates parent hierarchy. See also gameplay_tags add (any ini source, validation, restricted tags; works with GAS disabled)."),
 		FMonolithActionHandler::CreateStatic(&HandleAddGameplayTags),
 		FParamSchemaBuilder()
 			.Required(TEXT("tags"), TEXT("array"), TEXT("Array of tag strings (e.g. [\"Ability.Combat.Melee\", \"State.Dead\"])"))
@@ -32,7 +33,7 @@ void FMonolithGASTagActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	Registry.RegisterAction(TEXT("gas"), TEXT("get_tag_hierarchy"),
-		TEXT("Return the full gameplay tag tree, optionally filtered to a subtree"),
+		TEXT("Return the full gameplay tag tree, optionally filtered to a subtree. See also gameplay_tags list / get_tag_info (works with GAS disabled)."),
 		FMonolithActionHandler::CreateStatic(&HandleGetTagHierarchy),
 		FParamSchemaBuilder()
 			.Optional(TEXT("root"), TEXT("string"), TEXT("Root tag to filter subtree (e.g. \"Ability.Combat\")"))
@@ -58,7 +59,7 @@ void FMonolithGASTagActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	Registry.RegisterAction(TEXT("gas"), TEXT("rename_tag"),
-		TEXT("Rename a gameplay tag across all GAS assets (GameplayEffects, Abilities, etc.). Supports dry_run mode."),
+		TEXT("Rename a gameplay tag across all GAS assets (GameplayEffects, Abilities, etc.). Supports dry_run mode. See also gameplay_tags rename (renames the declaration and writes a GameplayTagRedirect)."),
 		FMonolithActionHandler::CreateStatic(&HandleRenameTag),
 		FParamSchemaBuilder()
 			.Required(TEXT("old_tag"), TEXT("string"), TEXT("The tag to rename (e.g. 'Damage.Type.Fire')"))
@@ -67,7 +68,7 @@ void FMonolithGASTagActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Build());
 
 	Registry.RegisterAction(TEXT("gas"), TEXT("remove_gameplay_tags"),
-		TEXT("Remove gameplay tags from DefaultGameplayTags.ini with optional reference check"),
+		TEXT("Remove gameplay tags from DefaultGameplayTags.ini with optional reference check. See also gameplay_tags remove (any ini source; also checks C++ literals and config uses)."),
 		FMonolithActionHandler::CreateStatic(&HandleRemoveGameplayTags),
 		FParamSchemaBuilder()
 			.Required(TEXT("tags"), TEXT("array"), TEXT("Array of tag strings to remove"))
@@ -332,11 +333,7 @@ FMonolithActionResult FMonolithGASTagActions::HandleAddGameplayTags(const TShare
 				DataTable->GetPackage()->GetName(), PackageFileName,
 				FPackageName::GetAssetPackageExtension()))
 			{
-				FSavePackageArgs SaveArgs;
-				SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
-				SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-				UPackage::SavePackage(DataTable->GetPackage(), DataTable,
-					*PackageFileName, SaveArgs);
+				FMonolithAssetUtils::SaveAssetPackage(DataTable->GetPackage());
 			}
 
 			// Refresh tags

@@ -36,6 +36,12 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="MCP Server", meta=(ClampMin="1024", ClampMax="65535"))
 	int32 ServerPort = 9316;
 
+	// --- Asset Saving ---
+
+	UPROPERTY(config, EditAnywhere, Category="Asset Saving",
+		meta=(ToolTip="Automatically check out existing packages and mark new packages for add when saving. Disable when the host project manages source-control ownership explicitly; read-only packages will fail until checked out."))
+	bool bAutoCheckoutOnSave = true;
+
 	// --- Auto-Update ---
 
 	/** Check GitHub Releases for updates on editor startup. Off by default
@@ -228,6 +234,11 @@ public:
 
 	UPROPERTY(config, EditAnywhere, Category="Modules", DisplayName="Enable Mesh Module")
 	bool bEnableMesh = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules",
+		meta=(DisplayName="Enable Gameplay Tags Module",
+			  ToolTip="Registers gameplay_tags_query actions: tag reference lookups from the Asset Registry, unused and broken tag audits, and declaring, editing, renaming, moving and removing ini tags. Independent of the GAS toggle."))
+	bool bEnableGameplayTags = true;
 
 	// --- Optional Module Toggles ---
 

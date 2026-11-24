@@ -25,6 +25,7 @@
 #include "AssetToolsModule.h"                   // FAssetToolsModule
 #include "IAssetTools.h"                        // IAssetTools::CreateUniqueAssetName
 #include "Modules/ModuleManager.h"              // FModuleManager::LoadModuleChecked
+#include "MonolithAssetUtils.h"
 
 namespace MonolithUI::FontIngestInternal
 {
@@ -269,20 +270,13 @@ FMonolithActionResult MonolithUI::FFontIngestActions::HandleImportFontFamily(con
 
         if (bSave)
         {
-            const FString FacePackageFilename = FPackageName::LongPackageNameToFilename(
-                FacePackage->GetName(), FPackageName::GetAssetPackageExtension());
-
-            FSavePackageArgs SaveArgs;
-            SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
-            SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-            SaveArgs.SaveFlags = SAVE_NoError;
-            const bool bSaved = UPackage::SavePackage(
-                FacePackage, FaceAsset, *FacePackageFilename, SaveArgs);
+            FString SaveError;
+            const bool bSaved = FMonolithAssetUtils::SaveAssetPackage(FacePackage, &SaveError);
             if (!bSaved)
             {
                 Warnings.Add(FString::Printf(
-                    TEXT("faces[%d] ('%s'): SavePackage failed for '%s' -- face in-memory but not on disk"),
-                    i, *Spec.Typeface, *FacePackageFilename));
+                    TEXT("faces[%d] ('%s'): face created in memory but not saved to disk: %s"),
+                    i, *Spec.Typeface, *SaveError));
             }
         }
 
@@ -350,19 +344,12 @@ FMonolithActionResult MonolithUI::FFontIngestActions::HandleImportFontFamily(con
 
     if (bSave)
     {
-        const FString FamilyPackageFilename = FPackageName::LongPackageNameToFilename(
-            FamilyPackage->GetName(), FPackageName::GetAssetPackageExtension());
-
-        FSavePackageArgs SaveArgs;
-        SaveArgs.Error = GWarn; // GError (the default) is fatal on a failed save
-        SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
-        SaveArgs.SaveFlags = SAVE_NoError;
-        const bool bSaved = UPackage::SavePackage(
-            FamilyPackage, FamilyFont, *FamilyPackageFilename, SaveArgs);
+        FString SaveError;
+        const bool bSaved = FMonolithAssetUtils::SaveAssetPackage(FamilyPackage, &SaveError);
         if (!bSaved)
         {
             return FMonolithActionResult::Error(
-                FString::Printf(TEXT("UPackage::SavePackage failed for family '%s'"), *FamilyPackageFilename),
+                FString::Printf(TEXT("Font family created in memory but not saved to disk: %s"), *SaveError),
                 -32603);
         }
     }

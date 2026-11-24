@@ -2,7 +2,7 @@
 
 **Parent:** [SPEC_CORE.md](../SPEC_CORE.md)
 **Engine:** Unreal Engine 5.7+
-**Version:** 0.24.0 (Beta) — actions shipped across Phases 1–4a (decision + risk + a source-namespace module-dep audit + cppreflect + network + pipeline + audit actions on existing namespaces: material/niagara/blueprint/project), plus the `cppreflect_query("list_class_specifiers")` and `reflect_query("rebuild_reflection_index")` (new `reflect` namespace, WRITE/maintenance) follow-ups. Counts are approximate — query `monolith_discover()` for the live figure. The network-completeness workstream also makes `list_replicated_classes` capture bare `UPROPERTY(Replicated)` (now WORKS, verified E2E), switches `list_rpc_functions` to specifier-based detection, and widens the indexer scan scope from the game module alone to an `IPluginManager`-driven ladder — game module + project plugins by default, marketplace plugins gated, Epic engine built-ins excluded (§5.2). With project plugins in scope, `list_rpc_functions` now returns the project's actual RPCs (the project's project-plugin Server RPCs, verified E2E) — the prior "empty due to game-module-only scan scope" limitation is resolved.
+**Version:** 0.25.0 (Beta) — actions shipped across Phases 1–4a (decision + risk + a source-namespace module-dep audit + cppreflect + network + pipeline + audit actions on existing namespaces: material/niagara/blueprint/project), plus the `cppreflect_query("list_class_specifiers")` and `reflect_query("rebuild_reflection_index")` (new `reflect` namespace, WRITE/maintenance) follow-ups. Counts are approximate — query `monolith_discover()` for the live figure. The network-completeness workstream also makes `list_replicated_classes` capture bare `UPROPERTY(Replicated)` (now WORKS, verified E2E), switches `list_rpc_functions` to specifier-based detection, and widens the indexer scan scope from the game module alone to an `IPluginManager`-driven ladder — game module + project plugins by default, marketplace plugins gated, Epic engine built-ins excluded (§5.2). With project plugins in scope, `list_rpc_functions` now returns the project's actual RPCs (the project's project-plugin Server RPCs, verified E2E) — the prior "empty due to game-module-only scan scope" limitation is resolved.
 
 ---
 
@@ -1249,8 +1249,8 @@ No conditional-gate `WITH_*` macros — the module loads unconditionally and con
 
 ## 12. Configuration
 
-**Editor location:** Editor Preferences → Plugins → "Monolith Reflection Intel"
-**INI file:** `Config/MonolithSettings.ini`
+**Editor location:** Project Settings → Engine → "Monolith Reflection Intel"
+**INI file:** `<Project>/Config/DefaultMonolithSettings.ini` (`config=MonolithSettings, defaultconfig`). This is a separate branch from core `UMonolithSettings` (`config=Monolith`, plugin defaults in `Config/DefaultMonolith.ini`); the plugin's `Config/` folder ships no `DefaultMonolithSettings.ini`, so these settings take their C++ defaults until changed in Project Settings or written to the project file.
 **Section:** `[/Script/MonolithReflectionIntel.MonolithReflectionIntelSettings]`
 
 | Setting | Default | Category | Description |

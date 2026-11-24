@@ -1,6 +1,6 @@
 # Monolith — Technical Specification
 
-**Version:** 0.24.0 (Beta)
+**Version:** 0.25.0 (Beta)
 **Wiki:** https://github.com/tumourlove/monolith/wiki
 **Engine:** Unreal Engine 5.7+
 **Platform:** Windows, macOS, Linux
@@ -12,7 +12,7 @@
 
 ## 1. Overview
 
-Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to a small set of MCP dispatcher tools (~1,400+ actions across 26 in-tree namespaces — 45 experimental town gen actions disabled by default; query `monolith_discover()` for the live figure), cutting AI assistant context consumption by ~95%. The CommonUI action pack (51 actions, conditional on `WITH_COMMONUI`) shipped M0.5, v0.14.0 (2026-04-19), tested M0.5.1 (2026-04-25). Editor +2 (`run_automation_tests`, `list_automation_tests`) landed v0.14.8 — PR #48 by @MaxenceEpitech. v0.14.9 added Editor +2 (`run_python`, `load_level` — Issue #50, ported from @JCSopko's fork) and Animation +1 (`copy_bone_pose_between_sequences` — PR #51 by @MaxenceEpitech). v0.14.10 added Audio +12 MetaSound document introspection actions plus a new `FMetaSoundIndexer` deep indexer in MonolithIndex (PR #18 by @alakangas, refactored into existing `audio_query` namespace), AND Animation +1 (`list_bone_tracks`) + Editor +3 (`start_pie`, `stop_pie`, `run_console_command` with maintainer-pinned in-viewport mode + GEngine null-guard) — PR #54 by @MaxenceEpitech.
+Monolith is a unified Unreal Engine editor plugin that consolidates 9 separate MCP (Model Context Protocol) servers and 4 C++ plugins into a single plugin with an embedded HTTP MCP server. It reduces ~220 individual tools down to a small set of MCP dispatcher tools (~1,500+ actions across 27 in-tree namespaces — 45 experimental town gen actions disabled by default; query `monolith_discover()` for the live figure), cutting AI assistant context consumption by ~95%. The CommonUI action pack (51 actions, conditional on `WITH_COMMONUI`) shipped M0.5, v0.14.0 (2026-04-19), tested M0.5.1 (2026-04-25). Editor +2 (`run_automation_tests`, `list_automation_tests`) landed v0.14.8 — PR #48 by @MaxenceEpitech. v0.14.9 added Editor +2 (`run_python`, `load_level` — Issue #50, ported from @JCSopko's fork) and Animation +1 (`copy_bone_pose_between_sequences` — PR #51 by @MaxenceEpitech). v0.14.10 added Audio +12 MetaSound document introspection actions plus a new `FMetaSoundIndexer` deep indexer in MonolithIndex (PR #18 by @alakangas, refactored into existing `audio_query` namespace), AND Animation +1 (`list_bone_tracks`) + Editor +3 (`start_pie`, `stop_pie`, `run_console_command` with maintainer-pinned in-viewport mode + GEngine null-guard) — PR #54 by @MaxenceEpitech.
 
 ### What It Replaces
 
@@ -74,7 +74,7 @@ All domain modules register actions with `FMonolithToolRegistry` (central single
 
 - **Protocol version:** Echoes client's requested version; supports both `2024-11-05` and `2025-03-26` (defaults to `2025-03-26`)
 - **Transport:** HTTP with JSON-RPC 2.0 request/response over POST; standalone `GET /mcp` returns HTTP 405 with `Allow: POST, OPTIONS, DELETE` because SSE streaming is not implemented. This follows the [Streamable HTTP specification (2025-03-26)](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports), which permits 405 when standalone GET streaming is unsupported. OPTIONS handles CORS. Transport type in `.mcp.json` varies by client: `"http"` for Claude Code, `"streamableHttp"` for Cursor/Cline
-- **Endpoint:** `http://localhost:{port}/mcp` (default port 9316)
+- **Endpoint:** `http://127.0.0.1:{port}/mcp` (default port 9316)
 - **Bind retry:** `FMonolithHttpServer::Start()` attempts up to 5 binds with exponential backoff and TCP port probe before failing. `Restart()` method available for runtime recovery. Console command: `Monolith.Restart`
 - **Batch support:** Yes (JSON-RPC arrays)
 - **Session management:** None — server is fully stateless (session tracking removed; no per-session state was ever stored)
@@ -126,6 +126,7 @@ All three sources emit free-text strings into the same array. No schema or envel
 - Networking
 - GeometryScripting (optional — enables Tier 5 mesh operations)
 - GameplayAbilities (optional — enables MonolithGAS module; `#if WITH_GBA` compile guard)
+- ModelViewViewModel (optional — enables the `ui` MVVM actions in source builds of projects that enable it; `#if WITH_MVVM` compile guard, forced off in release builds)
 
 ### Optional-Dependency Detection Matrix
 
@@ -141,6 +142,33 @@ Modules that probe for optional plugins follow a unified Build.cs convention: 3-
 | MonolithAudio | MetaSound | `WITH_METASOUND` | `MonolithAudio.Build.cs` | (existing) |
 | MonolithUI | CommonUI | `WITH_COMMONUI` | `MonolithUI.Build.cs` | **v0.14.0** (M0.5) |
 | MonolithAI | StateTree, SmartObjects | `WITH_STATETREE`, `WITH_SMARTOBJECTS` (required); `WITH_MASSENTITY`, `WITH_ZONEGRAPH` (optional) | `MonolithAI.Build.cs` | (existing) |
+| MonolithUI | ModelViewViewModel (UMG Viewmodel) | `WITH_MVVM` | `MonolithUI.Build.cs` | Unreleased (#173). Detected by `.uproject` enablement (`IsPluginEnabled`, the same helper as MonolithAI), not disk presence, because the engine plugin is on disk in every install. `Optional` plugin reference in `Monolith.uplugin`; the three MVVM modules are `$LeakSentinels` entries |
+
+### Reflection path walker
+
+`FMonolithReflectionWalker` (MonolithCore) resolves the dotted/bracket property paths used by `blueprint set_property_at_path` and the bulk-fill dry runs. The grammar is shared by every caller:
+
+- `Name` resolves a member of the current struct or class: exact match first, then case-insensitive. Deprecated members (`CPF_Deprecated` or `meta=(DeprecatedProperty)`) are refused (#148).
+- `.` descends into a struct member. After an object reference (`TObjectPtr`, raw `UObject*`, `TWeakObjectPtr` and similar), `.` descends into the object the reference points at; the reference must be non-null and already loaded.
+- `[N]` indexes an array.
+- `[Key]` keys a map. `Key` goes through the key property's ImportText, so an enum name, an int, an FName or FString, or a 32-hex-digit GUID all work.
+- `[@ObjectName]` works on arrays of object references only. It picks the element whose object name matches, case-insensitively; when several match without regard to case, the exact-case match wins.
+- `[@class=ClassName]` works on arrays of object references only. It picks the single element whose class name is exactly `ClassName`, with or without the `U` prefix. Subclasses do not match. Zero or several matches is an error listing the first 10 elements as `[i] Name (Class)`.
+- Chained brackets (`Grid[2][3]`) are not supported; a bracket must follow a member name.
+
+**Resolver API.** `ResolvePathWithOptions(TopStruct, Container, Path, FPathResolveOptions)` is the full resolver; `ResolvePath(..., bCreateMissingKeys)` is a thin wrapper. Options:
+
+- `bCreateMissingKeys`: add missing map keys.
+- `bNoMutation`: resolve without changing the container. A created entry is resolved inside a scratch value owned by the result (`bLeafInScratch`).
+- `NewElementValue`: initial value for the first entry the path creates (surfaced as `new_element_value`).
+- `RootObject`: the object the container belongs to.
+- `HomePackage` with `bRefuseExternalObjects`: list, or refuse, dereferences into objects outside the home package (surfaced as `allow_external`).
+
+The result carries `LeafOwnerObject` / `LeafOwnerHeadProp` (the deepest object the path reached, reported as `leaf_owner`), `ExternalObjects`, the created-entry fields (`bCreatedMissingKey`, `CreatedKeyPath`, `CreatedElementProp`, `CreatedElementPtr`, `bLeafIsCreatedElement`, `bAppliedNewElementValue`) and `Warnings`.
+
+**Helpers.** `InspectLeaf(Resolved, Value, Owner, Spec, Report, Label)` is the dry-run leaf write: it works on a copy of the live leaf, or writes the scratch leaf in place. `ListDefaultedStructFields(ElementProp, ElementPtr)` lists a struct value's fields that equal the struct default, recursing into struct fields that differ (surfaced as `defaulted_fields`). `InspectTree` seeds each scratch value from the live container, so dry-run `current` values are the live values. Under `Spec.bStrict`, the scalar write rejects numeric text the engine import would only partly parse (floats `[+-] digits [. digits] [e[+-]digits] [f]`; integers `[+-]digits` or `0x` hex).
+
+Action-level behaviour (sub-object edit cradle, package scope, map entry creation, dry run) is in [specs/SPEC_MonolithBlueprint.md § `set_property_at_path`](specs/SPEC_MonolithBlueprint.md). Automation tests: 5 in `MonolithCore/Private/Reflection/Tests/MonolithReflectionPathTest.cpp`.
 
 ---
 
@@ -245,7 +273,7 @@ Two options for offline access (no full editor session required):
 'Plugins/Monolith/Binaries/monolith_query.exe' <namespace> <action> [args...]
 ```
 
-Standalone C++ executable. No UE runtime, no Python, instant startup. Queries `EngineSource.db` and `ProjectIndex.db` directly. Replaces the previous `MonolithQueryCommandlet` (removed) and supersedes `monolith_offline.py` as the primary offline access path.
+Standalone C++ executable. No UE runtime, no Python, instant startup. Queries `EngineSource.db` and `ProjectIndex.db` directly. It looks for `ProjectIndex.db` in the plugin's own `Saved/` folder only; when the editor writes the index elsewhere (plugin mounted outside the project, or `DatabasePathOverride` set), pass `--project-db <path>`. `monolith_offline.py` has no such override yet. See [specs/SPEC_MonolithIndex.md](specs/SPEC_MonolithIndex.md). Replaces the previous `MonolithQueryCommandlet` (removed) and supersedes `monolith_offline.py` as the primary offline access path.
 
 ### 5.2 monolith_offline.py (legacy)
 
@@ -344,16 +372,17 @@ All skills follow a common structure: YAML frontmatter, Discovery section, Asset
 
 ## 7. Configuration
 
-**Settings location:** Editor Preferences > Plugins > Monolith
-**Config file:** `Config/MonolithSettings.ini` section `[/Script/MonolithCore.MonolithSettings]`
+**Settings location:** Project Settings > Plugins > Monolith
+**Config file:** `Config/DefaultMonolith.ini` section `[/Script/MonolithCore.MonolithSettings]`. `UMonolithSettings` is `config=Monolith`, so the engine reads the plugin's `Config/DefaultMonolith.ini` and then the project's `Config/DefaultMonolith.ini`, which is also where Project Settings writes (`defaultconfig`).
 
 Setting names below match the actual `UMonolithSettings` UPROPERTY identifiers in `Source/MonolithCore/Public/MonolithSettings.h` (verified 2026-04-26 audit). The convention is `bEnable<Module>` for module toggles, `bEnableProceduralTownGen` for experimental sub-features.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | ServerPort | 9316 | MCP HTTP server port |
-| bAutoUpdateEnabled | True | GitHub Releases auto-check on startup |
-| DatabasePathOverride | (empty) | Override default DB path (Plugins/Monolith/Saved/) |
+| bAutoUpdateEnabled | False | GitHub Releases auto-check on startup |
+| bAutoCheckoutOnSave | True | Use editor checkout/add on save; disable for explicit source-control ownership. In that mode only the requested package is saved. |
+| DatabasePathOverride | (empty) | Override the ProjectIndex.db directory (relative = from the project directory). Default: Plugins/Monolith/Saved/, or <Project>/Saved/Monolith/ when the plugin lives outside the project |
 | EngineSourceDBPathOverride | (empty) | Override engine source DB path |
 | EngineSourcePath | (empty) | Override engine source directory |
 | bEnableBlueprint | True | Enable Blueprint module |
@@ -371,6 +400,7 @@ Setting names below match the actual `UMonolithSettings` UPROPERTY identifiers i
 | bEnableLogicDriver | True | Enable Logic Driver Pro module (no-op if `WITH_LOGICDRIVER=0`) |
 | bEnableAI | True | Enable AI module (Behavior Trees, Blackboards, State Trees, EQS, Smart Objects, Perception, Navigation) |
 | bEnableAudio | True | Enable Audio module (Sound Cues, MetaSounds, batch ops, AI Perception bind) |
+| bEnableGameplayTags | True | Enable the `gameplay_tags` namespace (MonolithGameplayTags). Independent of `bEnableGAS` |
 | bEnableExternalInventoryModule | True | Allow an external sibling plugin to register `inventory_query` actions |
 | bEnableProceduralTownGen | **False** | Enable Procedural Town Generator actions (45 actions). Requires `bEnableMesh`. **Work-in-progress** — known geometry issues, disabled by default. Unless you're willing to dig in and help improve it, best left alone |
 | bEnableBlueprintAssist | True | Allow MonolithBABridge to register IMonolithGraphFormatter when Blueprint Assist is present. Set false to force built-in layout for all auto_layout calls |
@@ -386,7 +416,7 @@ Setting names below match the actual `UMonolithSettings` UPROPERTY identifiers i
 
 | File | Purpose |
 |------|---------|
-| `Templates/.mcp.json.example` | Minimal MCP config. Transport type varies by client: `"http"` for Claude Code, `"streamableHttp"` for Cursor/Cline. URL: `http://localhost:9316/mcp` |
+| `Templates/.mcp.json.example` | Minimal MCP config. Transport type varies by client: `"http"` for Claude Code, `"streamableHttp"` for Cursor/Cline. URL: `http://127.0.0.1:9316/mcp` |
 | `Templates/.mcp.json.proxy.example` | MCP config variant for clients that need the stdio↔HTTP proxy bridge (Cursor / Cline / Continue). Spawns `Scripts/monolith_proxy.py`. |
 
 **Note on AI project-instructions files:** As of v0.14.7 we no longer ship a `CLAUDE.md.example` template. Conventions across AI assistants (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, `.github/copilot-instructions.md`, etc.) drift faster than a static template can track — installers are pointed at their own assistant for the right shape. See README §Step 5.
@@ -403,7 +433,7 @@ YourProject/Plugins/Monolith/
   ATTRIBUTION.md                   (Credits: Codeturion concept, tumourlove originals)
   .gitignore
   Config/
-    MonolithSettings.ini
+    DefaultMonolith.ini
   Docs/
     plans/
       2026-03-06-monolith-design.md
@@ -587,7 +617,7 @@ See `TODO.md` for the full list. Key architectural constraints:
 
 > **Counts are intentionally approximate.** Exact per-namespace and grand-total integers drift on every action added and are no longer maintained to the unit. Treat the figures below as rough ballpark (`~`) values; for an authoritative live number query `monolith_discover()` (its `total_actions` field) at the moment you need it. The per-namespace rows are kept for structure, not precision.
 >
-> **Ballpark, current:** **~1,400+ actions across 26 in-tree namespaces** (query `monolith_discover()` for the live figure — see Action Count Discipline in `monolith-release.md`). v0.23.0 added two namespaces: `input` (13, from `MonolithGAS`) and `localization` (4, from `MonolithConfig`).
+> **Ballpark, current:** **~1,500+ actions across 27 in-tree namespaces** (query `monolith_discover()` for the live figure — see Action Count Discipline in `monolith-release.md`). v0.23.0 added two namespaces: `input` (13, from `MonolithGAS`) and `localization` (4, from `MonolithConfig`).
 
 Counts below were re-verified against the live `monolith_discover()` registry on 2026-05-11 (v0.14.11 [Unreleased] audit). Where a module's spec previously claimed a different number, those per-module SPEC files were corrected. Reflected: all v0.14.10 deltas (see [v0.14.10] in `CHANGELOG.md`) plus v0.14.11 [Unreleased] additions: **two new framework-level namespaces** `bulk_fill` (2 actions: `apply`, `list_namespaces`) and `describe` (2 actions: `schema`, `list_targets`) registered from `MonolithCore`, plus 12 per-namespace adapters (blueprint, gas, ui, ai, niagara, material, audio, mesh, animation, logicdriver, combograph, inventory) routed through `FMonolithBulkFillRegistry`. `blueprint` +2 (`set_cdo_properties`, `describe_cdo_schema` — Phase 1 adapter surface). `ui` +16 (Tier 1 fixes net +1 `create_bound_action_bar` `action_button_class` param is additive — counted by `dump_blueprint_compile_log` +1 Tier 2 action; Tier 2 +8: `rename_widget`, `add_widget_variable`, `audit_focus_chain`, `apply_token_binding`, `list_widget_property_enums`, `convert_textblock_to_common`, `set_action_bar_button_class`, `dump_blueprint_compile_log`; Tier 3 +4: `scaffold_main_menu`, `scaffold_settings_panel_with_tabs`, `scaffold_pause_menu`, `build_menu_from_spec`; Tier 4 polish docs-only). `animation` ergonomics: `add_anim_graph_node` accepts arbitrary loaded `UAnimGraphNode_Base` subclasses via `node_class` path/name (schema-only change, no count delta).
 
@@ -615,6 +645,7 @@ Counts below were re-verified against the live `monolith_discover()` registry on
 | MonolithLogicDriver | logicdriver | 66 | |
 | MonolithAudio | audio | 98 | 82 documented in the Action Categories table + 4 perception bind actions (`bind_sound_to_perception`, `unbind_sound_from_perception`, `get_sound_perception_binding`, `list_perception_bound_sounds`) + **12 v0.14.10 [Unreleased] MetaSound document introspection actions** (`list_metasounds`, `list_metasound_documents`, `get_metasound_document`, `get_metasound_summary`, `inspect_metasound_node_instance`, `get_metasound_document_connections`, `get_metasound_document_variables`, `get_metasound_user_parameters`, `search_metasound_document_nodes`, `get_metasound_info`, `get_metasound_dependencies`, `validate_metasound` — PR #18 by @alakangas, refactored into `audio_query` namespace; conditional on `WITH_METASOUND`) |
 | MonolithLevelSequence | level_sequence | 8 | `ping`, `list_directors`, `get_director_info`, `list_director_functions`, `list_director_variables`, `list_event_bindings`, `find_director_function_callers`, `list_bindings` (v0.14.8 PR #45 by @yashabogdanoff) |
+| MonolithGameplayTags | gameplay_tags | 14 | 7 read (`ping`, `find_references`, `get_asset_tags`, `list`, `get_tag_info`, `find_unused`, `find_broken`) + 7 write (`list_sources`, `add_source`, `add`, `update`, `remove`, `rename`, `move`). Gated by `bEnableGameplayTags`, independent of `bEnableGAS`. See [SPEC_MonolithGameplayTags.md](specs/SPEC_MonolithGameplayTags.md) |
 | MonolithBABridge | — | 0 (integration only) | |
 | MonolithCore | bulk_fill | 2 | `apply` + `list_namespaces`. Central JSON-tree write dispatcher routing on `target_namespace` to per-namespace adapters registered via `FMonolithBulkFillRegistry`. Framework primitives ship in `MonolithCore` (`FMonolithReflectionWalker`, `FBulkFillSpec`, `FDryRunReport`, `FSchemaDescriptor`, `FMonolithDryRunGuard`). [Unreleased] adds `FMonolithReflectionWalker::ResolvePath` — a dotted+bracket path resolver (`A.B[key].C`) that walks struct members / array indices / map keys to a single leaf `FProperty*`+value pointer for **surgical** in-place edits (vs. `WriteTree`'s whole-collection rebuild), plus a public `WriteLeaf` forwarder so callers reuse the walker's value coercion. Backs the `blueprint.set_property_at_path` action. v0.14.11 [Unreleased] landed 12 per-namespace adapters: `blueprint`, `material`, `animation`, `niagara`, `ui`, `mesh`, `gas` (`#if WITH_GBA` stub-pattern), `combograph` (`#if WITH_COMBOGRAPH` stub-pattern), `ai`, `logicdriver` (`#if WITH_LOGICDRIVER` stub-pattern), `audio` (MetaSound paths `#if WITH_METASOUND`), `inventory` (an optional sibling-plugin adapter, conditionally gated). Live `bulk_fill_query("list_namespaces")` reports `available: true` for all 12 when the corresponding compile-time gates are set. Per-adapter fill_kind catalogues live in each per-module SPEC's "Bulk Fill & Describe Surface" section. |
 | MonolithCore | describe | 3 | `schema` + `list_targets` + (2026-05-23, Phase 2) `action_schema`. `schema`/`list_targets` return rich `FSchemaDescriptor` trees (type names, ImportText forms, enum-value lists, clamp ranges, nested children) for the same 12 adapter namespaces as `bulk_fill`; `action_schema` returns a registered action's param schema (names, types, required, defaults, aliases, descriptions) by `(target_namespace, action)`. Companion read-only schema introspection. |
@@ -624,7 +655,7 @@ Counts below were re-verified against the live `monolith_discover()` registry on
 | MonolithReflectionIntel | network | 4 | `list_replicated_classes`, `list_rpc_functions`, `list_onrep_handlers`, `audit_unbalanced_onreps`. UE 5.7 replication inspection driven by a second UHT-artefact regex sweep (independent of Phase 3a's reader) focused on per-property `MetaData` blocks carrying `ReplicatedUsing` tags, cross-joined with Phase 3a's `reflect_ufunctions`. Writes into 1 new SQLite table on `EngineSource.db`: `reflect_replicated_properties`. All four carry `readOnlyHint + idempotentHint`; all four cursor-paginated. Known limitation: bare `UPROPERTY(Replicated)` without `ReplicatedUsing` not detected — signal lives in UHT's `PropPointers[]` block which Phase 4a does not parse. Phase 4a of Reflection Intelligence — v0.17.0 (`Plugins/Monolith/Docs/specs/SPEC_MonolithReflectionIntel.md` §6). Phase 4b bare-Replicated detection deferred — see §9. |
 | MonolithReflectionIntel | pipeline | 2 | `pr_review`, `release_readiness`. Read-only composer actions that fan out other registered Monolith actions serially on the game thread and aggregate results into a single payload. `pr_review` bundles `risk_query("get_hotspot_score")` + `risk_query("get_cochange_pairs")` + `decision_query("list_decisions")` + `source_query("audit_module_dep_reality")` + (optional) `blueprint_query("audit_cdo_drift")` per changed file. `release_readiness` bundles `monolith_status()` + `decision_query("list_stale")` + `risk_query("get_release_window_hotspots")` + the sentinel-list audit + CHANGELOG completeness audit from `.claude/rules/scoped/monolith-release.md`. Both carry `readOnlyHint + idempotentHint`. Phase 4a of Reflection Intelligence — v0.17.0 (`Plugins/Monolith/Docs/specs/SPEC_MonolithReflectionIntel.md` §8). |
 | MonolithReflectionIntel | reflect | 1 | `rebuild_reflection_index` (no params) — [Unreleased] network-completeness workstream. Project-only force-rebuild of the RI reflection tables (`reflect_uclasses` / `reflect_uproperties` / `reflect_ufunctions` / `reflect_uinterfaces` / `reflect_uinterface_impls` / `cpp_asset_edges` + `reflect_replicated_properties`). Re-runs the RI indexers over PROJECT UHT artefacts only (`bIncludeEnginePlugins=false` — engine excluded). Exists because after an indexer code change there's no other clean repopulation trigger — lazy bootstrap only fires on table-absence, `OnReloadComplete` only on Live Coding, and `source_query("trigger_reindex")` is the full engine reindex. It is a WRITE/maintenance action (not read-only), idempotent, non-destructive — regenerates the tables deterministically from the on-disk UHT artefacts. Phase 4a network-completeness follow-up — `Plugins/Monolith/Docs/specs/SPEC_MonolithReflectionIntel.md` §6. |
-| **Total** | | **~1,400+ actions across 25+ in-tree namespaces** (18 module namespaces — `animation` also owns the `WITH_CHOOSER`-gated `chooser` namespace — + 8 framework: `monolith` meta, `level_sequence`, `bulk_fill`, `describe`, plus the six Reflection Intel namespaces `decision` / `risk` / `cppreflect` / `network` / `pipeline` / `reflect`). The per-namespace rows above are authoritative for structure; exact integers are no longer tracked to the unit (see the approximate-count note at the top of this section) — query `monolith_discover()` (its `total_actions` field) for the live figure. **Conditional gating** (qualitative — no per-config counts): the `chooser` namespace is `WITH_CHOOSER`-gated and registers nothing without the Chooser plugin; CommonUI / GAS / MetaSound actions are gated by `WITH_COMMONUI` / `WITH_GBA` / `WITH_METASOUND` respectively and don't register without those plugins; ~45 procedural town-gen experimental actions are OFF by default (`bEnableProceduralTownGen`). The `ui` namespace re-exposes 4 aliased GAS actions, so distinct handler count is slightly below the registration total. Query `monolith_discover()` for the live figure in any given build configuration. | ~25+ in-tree namespaces — 18 module namespaces (incl. the `WITH_CHOOSER`-gated `chooser`, registered from `MonolithAnimation`) plus the framework namespaces (`monolith` meta, `level_sequence`, `bulk_fill`, `describe`, and the six Reflection Intel namespaces `decision` / `risk` / `cppreflect` / `network` / `pipeline` / `reflect`). The `monolith_guide` action stays inside the existing `monolith` meta-namespace. Query `monolith_discover()` for the live namespace set. |
+| **Total** | | **~1,500+ actions across 27 in-tree namespaces** (18 module namespaces — `animation` also owns the `WITH_CHOOSER`-gated `chooser` namespace — + 8 framework: `monolith` meta, `level_sequence`, `bulk_fill`, `describe`, plus the six Reflection Intel namespaces `decision` / `risk` / `cppreflect` / `network` / `pipeline` / `reflect`). The per-namespace rows above are authoritative for structure; exact integers are no longer tracked to the unit (see the approximate-count note at the top of this section) — query `monolith_discover()` (its `total_actions` field) for the live figure. **Conditional gating** (qualitative — no per-config counts): the `chooser` namespace is `WITH_CHOOSER`-gated and registers nothing without the Chooser plugin; CommonUI / GAS / MetaSound actions are gated by `WITH_COMMONUI` / `WITH_GBA` / `WITH_METASOUND` respectively and don't register without those plugins; ~45 procedural town-gen experimental actions are OFF by default (`bEnableProceduralTownGen`). The `ui` namespace re-exposes 4 aliased GAS actions, so distinct handler count is slightly below the registration total. Query `monolith_discover()` for the live figure in any given build configuration. | ~25+ in-tree namespaces — 18 module namespaces (incl. the `WITH_CHOOSER`-gated `chooser`, registered from `MonolithAnimation`) plus the framework namespaces (`monolith` meta, `level_sequence`, `bulk_fill`, `describe`, and the six Reflection Intel namespaces `decision` / `risk` / `cppreflect` / `network` / `pipeline` / `reflect`). The `monolith_guide` action stays inside the existing `monolith` meta-namespace. Query `monolith_discover()` for the live namespace set. |
 
 **2026-05-30 — [0.18.0] niagara +7 (issue #64 Tranche 2 search & discovery actions):** Tranche 2 of the Niagara Blueprint-Callable surface ([`specs/SPEC_MonolithNiagara.md` § Blueprint-Callable Surface](specs/SPEC_MonolithNiagara.md#blueprint-callable-surface-issue-64)) shipped 7 new read-only `niagara` dispatcher actions: `search_by_parameter`, `search_by_data_interface`, `query_niagara`, `find_similar_systems`, `search_by_material`, `find_niagara_references`, `list_system_data_interfaces`. Also in the same workstream (no action delta): the editor-only `UMonolithNiagaraQueryLibrary` Blueprint-Callable surface (issue #64 Tranche 1, +17 BP nodes wrapping existing read-only actions — zero new dispatcher actions, zero packaged-build cost). `niagara` row 120 → 127; in-tree total 1387 → 1394; distinct 1382 → 1389 (1427 → 1434 w/ town gen); live `monolith_discover()` 1610 → 1617. PR #65 (next note) then chains +2 → niagara 129, in-tree 1396, distinct 1391, live 1619. Namespace count unchanged at 25. Verify the live count at release time via `monolith_discover()` per Action Count Discipline.
 
